@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Negative controls for the trace validation: captures a workload (workload_sync.exs by
+# default; formal/trace/controls trace/workload_async.exs TRUE for async), then checks
+# three corrupted copies of its log, each breaking a rule the code follows, which must
+# be rejected: a commit without its ownership HEAD, a checkpoint without its seal, a
+# commit in a sealed epoch.
+set -uo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$here/.." && pwd)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/s3trace-controls.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+(cd "$repo" && MIX_ENV=test mix compile >/dev/null)
+paths=(); for p in "$repo"/_build/test/lib/*/ebin; do paths+=(-pa "$p"); done
+workload="${1:-trace/workload_sync.exs}"; async="${2:-FALSE}"
+prefix="$(cd "$repo" && SEDIMENT_S3_METER_DIR="$work/meter" SEDIMENT_S3_TRACE=1 elixir "${paths[@]}" "$here/$workload" | tail -1)"
+log="$(ls "$work"/meter/requests-*.log)"
+python3 - "$log" "$work" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+T = [l.split() for l in lines if l.startswith("T ")]
+def write(name, keep=lambda l: True, edit=lambda l: l):
+    open(f"{sys.argv[2]}/{name}.log", "w").write("\n".join(edit(l) for l in lines if keep(l)) + "\n")
+def without(ids):
+    return lambda l: not (l[:2] in ("T ", "A ") and l.split()[2] in ids)
+heads = [t[2] for t in T if t[3] == "HeadObject" and t[4].endswith("/manifest.json")]
+write("no-confirm", without({heads[1]}))
+write("no-seal", without({t[2] for t in T if t[-1] == "seal"}))
+epochs = sorted({t[4].split("/log/")[1].split("/")[0] for t in T if "/log/" in t[4] and t[3] == "PutObject"})
+old, new = epochs[0], epochs[1]
+moved = next(t[2] for t in T if f"/log/{new}/" in t[4] and t[3] == "PutObject")
+write("old-epoch", edit=lambda l: l.replace(f"/log/{new}/00000000000000000000", f"/log/{old}/00000000000000000999") if l.split()[:3] == ["T", l.split()[1], moved] else l)
+PY
+status=0
+for m in no-confirm no-seal old-epoch; do
+  out="$("$here/trace/check" "$work/$m.log" "$prefix" "$async" 2>/dev/null)"
+  if grep -q "^REJECTED" <<<"$out"; then echo "ok    $m: $(head -1 <<<"$out")"
+  else echo "FAIL  $m was accepted"; status=1; fi
+done
+exit $status

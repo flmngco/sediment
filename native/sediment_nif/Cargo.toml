@@ -1,0 +1,41 @@
+[package]
+name = "sediment_nif"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rustler = "0.38.0"
+psm = "0.1"
+stacker = "0.1"
+turso_core = "0.8.1"
+turso_parser = "0.8.1"
+# s3
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32c = "0.6"
+tracing = "0.1"
+zstd = "0.13"
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_128"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+# Real SQLite, to check that exports (Sediment.export_sqlite) are SQLite files.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[features]
+default = ["fts"]
+# Full-text search (CREATE INDEX ... USING fts). Pulls in tantivy.
+fts = ["turso_core/fts"]
+# turso_core's io_uring backend; only the write_bench example uses it.
+io_uring = ["turso_core/io_uring"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

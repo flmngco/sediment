@@ -1,0 +1,67 @@
+name: Release
+
+# Publishes to Hex when a GitHub release is published. HEX_API_KEY exists only
+# in the `hex` environment (tags v* only, a required reviewer); see RELEASING.md.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  # The full CI from a clean build: no caches.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      cache: false
+
+  publish:
+    name: Publish to Hex
+    needs: ci
+    runs-on: ubuntu-24.04
+    environment: hex
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "1.20.1"
+          otp-version: "29.0"
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      # The tag must be v<version in mix.exs>, the CHANGELOG must have that
+      # version's entry, and the tagged commit must be on main.
+      - name: Check the tag, the CHANGELOG and the branch
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n 's/^  @version "\(.*\)"$/\1/p' mix.exs)"
+          if [ -z "$version" ] || [ "$TAG" != "v$version" ]; then
+            echo "tag $TAG doesn't match mix.exs version $version"; exit 1
+          fi
+          if ! grep -qE "^## ${version//./\\.}( |$)" CHANGELOG.md; then
+            echo "CHANGELOG.md has no entry for $version"; exit 1
+          fi
+          if grep -qE "^## ${version//./\\.} \(unreleased\)" CHANGELOG.md; then
+            echo "CHANGELOG.md still marks $version as unreleased"; exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "the tagged commit is not on main"; exit 1
+          fi
+
+      - run: mix deps.get
+
+      - name: Publish
+        run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

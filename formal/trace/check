@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Trace validation: is a real writer's traced request log a behaviour of S3Fence?
+#   formal/trace/check <requests.log> <db prefix> [Async=TRUE|FALSE]
+# Converts the log (s3trace.py), then runs TraceS3Fence with TLC. On rejection, finds
+# the longest accepted prefix and prints the first event the model can't match.
+set -uo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+log="$1"; prefix="$2"; async="${3:-FALSE}"
+work="$(mktemp -d "${TMPDIR:-/tmp}/s3trace.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+python3 "$here/trace/s3trace.py" "$log" "$prefix" "$work" || exit 2
+cp "$here/tla/S3Fence.tla" "$here/trace/TraceS3Fence.tla" "$work/"
+sed "s/Async = FALSE/Async = $async/" "$here/trace/TraceS3Fence.cfg" > "$work/TraceS3Fence.cfg"
+cd "$work"
+accepts() {  # accepts <n>: is the trace's first n events a behaviour?
+  python3 - "$1" <<'PY'
+import re, sys
+n = int(sys.argv[1])
+src = open("TraceLog.tla").read()
+evs = re.findall(r"\[k \|-> .*?same \|-> (?:TRUE|FALSE)\]", src)
+open("TraceLog.tla.cut", "w").write("---- MODULE TraceLog ----\nTrace == <<\n    " + ",\n    ".join(evs[:n]) + "\n>>\n====\n")
+PY
+  cp TraceLog.tla TraceLog.full; mv TraceLog.tla.cut TraceLog.tla
+  "$here/bin/tlc" TraceS3Fence.tla -config TraceS3Fence.cfg > out.txt 2>&1
+  local ok=$?
+  mv TraceLog.full TraceLog.tla
+  grep -q "Invariant TraceNotDone is violated" out.txt
+}
+total="$(grep -c '\[k |->' TraceLog.tla)"
+if accepts "$total"; then
+  echo "ACCEPTED: all $total events are a behaviour of S3Fence"
+  exit 0
+fi
+lo=0; hi="$total"   # prefix lo accepted, prefix hi rejected
+while [ $((hi - lo)) -gt 1 ]; do
+  mid=$(((lo + hi) / 2))
+  if accepts "$mid"; then lo="$mid"; else hi="$mid"; fi
+done
+echo "REJECTED: the first $lo of $total events are a behaviour; event $hi is not:"
+grep '\[k |->' TraceLog.tla | sed -n "${hi}p"
+exit 1

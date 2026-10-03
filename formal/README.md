@@ -1,0 +1,275 @@
+# formal/
+
+A TLA+ model of the S3 durability ownership path (`native/sediment_nif/src/s3`),
+in the style of sqlite_replica's `ReplicaFence`.
+
+`tla/S3Fence.tla` models, at the grain of object-store requests: open (lease with any
+clock, manifest takeover, restore, fold into a fresh epoch), commit (create-only frame PUT,
+GET on error, manifest-etag ownership confirm), checkpoint and publication (seal, snapshot,
+manifest `If-Match`, GC keeping each old epoch's tail), and kills anywhere. Every write may
+succeed, be refused (412, only when its precondition is false), land with its answer lost,
+not land, or stay in flight and land later if its precondition still holds then. Lease
+checks never protect a stale host, so safety rests on the store alone.
+
+Properties:
+
+- `AckedDurable`: every acknowledged commit is in a restore of the current manifest.
+- `RestoreOK`: the current manifest always restores (no gap, no broken chain, snapshot present).
+- `SoleNeverFenced`: a single host never takes itself for another writer, whatever the
+  faults. It may still stop as *indeterminate*: a commit that reported failure reached S3.
+- `RestoreCommitted`: what a restore finds is a history some host committed, i.e. a prefix
+  of the commit order without holes or reordering.
+- `ManifestForward` (an action property): the manifest never moves to an older epoch or
+  version, so the database in S3 never rolls back. A provider ignoring `If-Match` on a late
+  manifest PUT breaks it (`NegIgnoreIfMatch`, 4,689 states; `RestoreOK` catches the same
+  provider later). Not added, because they hold by construction (every update
+  is a union or an append, so no negative control could break them without making the
+  model write something the code can't): `acked` and `committed` only grow, and a host's
+  durable history only extends.
+
+**Async durability** (`Async = TRUE`, `durability: :async`): a commit only extends the host's
+local history (`ldb`, visible to other connections); the uploader then PUTs the frames not yet
+durable in log order, through the same create-only upload and ownership confirm, retrying a
+failed upload with the same frame. `db` is the durable history; `acked` records what a
+`sync: true` commit or a flush may acknowledge (a confirmed upload), so `AckedDurable` becomes
+"sync-acknowledged commits are durable" and `RestoreCommitted` the prefix property. A
+checkpoint drains the queue first (`NoDrain` skips that and breaks `RestoreOK`: the snapshot
+holds the local history while the uploader appends older frames to the new epoch).
+Commits go on while the snapshot publication is pending (a failed snapshot upload is
+retried later); the snapshot is uploaded from the checkpoint's image of the DB file
+(`img`), which later commits and checkpoints don't change (`LiveSnapshot` uploads the live
+state instead and breaks `RestoreOK`). Backpressure (`max_lag_ms`, `max_pending_bytes`) bounds the lag and is not modelled; it only
+delays commits. Checked: `AsyncSole` 72,594 states, `AsyncSoleDelays` 150,536, `AsyncTakeover`
+15,047,654 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
+`RestoreCommitted` and `SoleNeverFenced`; the sync configs pass `RestoreCommitted` too.
+
+`Patches` switch on negative controls. Each must break a property; the table records it.
+
+| Config | Hosts | Patches | Expect |
+|---|---|---|---|
+| `Sole` | 1 | none | pass |
+| `SoleDelays` | 1 (late writes) | none | pass |
+| `Takeover` | 2 (late writes, 1 fault) | none | pass |
+| `TakeoverDeep` | 2 (late writes, 2 faults) | none | pass (long run) |
+| `NegNoConfirm` | 2 | `NoConfirm` | `AckedDurable` violated |
+| `NegListBeforeTakeover` | 2 | `ListBeforeTakeover` | `AckedDurable` violated |
+| `NegRewriteOrphan` | 2 | `RewriteOrphan`, `ContinueEpoch` | `RestoreOK` violated |
+| `NegOneOrphan` | 1 | `OneOrphan` | `SoleNeverFenced` violated |
+| `NegContinueEpoch` | 1 (late writes) | `ContinueEpoch` | `SoleNeverFenced` violated |
+| `AsyncSole` | 1, async | none | pass |
+| `AsyncSoleDelays` | 1 (late writes), async | none | pass |
+| `AsyncTakeover` | 2 (late writes, 1 fault), async | none | pass |
+| `NegNoDrain` | 1, async | `NoDrain` | `RestoreOK` violated |
+| `NegLiveSnapshot` | 1, async | `LiveSnapshot` (snapshot the live DB instead of the checkpoint's image) | `RestoreOK` violated |
+| `NegIgnoreIfMatch` | 1 (late writes) | `IgnoreIfMatch` (a provider ignoring `If-Match`) | `ManifestForward` violated |
+| `NegAsyncContinueEpoch` | 1 (late writes), async | `ContinueEpoch` | `AsyncSoleNeverPoisoned` violated |
+| `VacuityControl` | 1 | none | `_POSSIBLE` `LateLanding` never witnessed |
+| `NegRefuseLeftovers` | 1 | `RefuseLeftovers` (the earlier rule: any snapshot without a manifest refuses the open) | `_POSSIBLE` `BootstrapOverLeftover` never witnessed |
+| `NegDeleteLeftovers` | 1 (late writes) | `DeleteLeftovers` (delete an interrupted bootstrap's snapshot before bootstrapping) | `RestoreOK` violated |
+| `NegNoChecksum` | 1 | `NoChecksum` (a provider storing an empty object for a cut-off PUT) | `RestoreOK` violated |
+| `NegNoChecksumFence` | 1 | `NoChecksum` | `SoleNeverFenced` violated |
+| `LiveSole` | 1, liveness | none | pass (`EventuallyDurable`, `EventuallyRuns`) |
+| `LiveAsyncSole` | 1, async, liveness | none | pass |
+| `NegLiveStall` | 1, async, liveness | `StallOnFailure` | `EventuallyDurable` violated |
+| `NegLiveRefuseLeftovers` | 1, liveness | `RefuseLeftovers` | `EventuallyRuns` violated |
+| `LiveTakeover` | 2, liveness, `LeaseHolds` | none | pass |
+| `LiveAsyncTakeover` | 2, async, liveness, `LeaseHolds` | none | pass |
+| `NegLiveDuel` | 2, liveness, no lease assumption | none | `EventuallyRuns` violated (dueling takeovers) |
+
+### Bootstrap over leftovers
+
+Without a manifest, an open refuses to build over log objects or any snapshot except
+epoch-0 ones. Only a bootstrap writes those before its manifest, and without a manifest
+nothing was ever acknowledged. An interrupted first open therefore no longer locks the
+prefix. The model follows the code. `NegRefuseLeftovers` (the earlier rule, refusing any
+snapshot) never gets past such a leftover. `NegDeleteLeftovers` shows why leftovers are left
+for GC instead of deleted first: the interrupted incarnation's manifest create can still be
+in flight, land after the delete, and point the database at the deleted snapshot
+(`RestoreOK`). Whether an open eventually succeeds after an interruption is liveness (below).
+
+### Truncated uploads
+
+The model's store is the protocol's assumption about the provider, and one of them
+failed in practice: SeaweedFS stored an **empty object** when a PUT's connection broke
+right after its headers, even under `If-None-Match`. Every upload therefore carries
+`x-amz-checksum-sha256`, and a server rejects a body that doesn't match. In the model that
+is the existing `fail` outcome, so the positive configs don't change. `NoChecksum` adds the
+provider's old behaviour, a `trunc` outcome storing an empty manifest (restores nothing)
+or an empty log frame. It breaks `RestoreOK` (`NegNoChecksum`: an empty manifest or a gap in
+the log) and makes a sole writer fence itself on its own empty frame
+(`NegNoChecksumFence`: `SoleNeverFenced`), which is what the torture test hit.
+
+### Liveness
+
+`LiveSpec` adds weak fairness on each host's own steps (open, takeover, restore, compaction,
+upload, confirm, publication): a pool reopens, and the uploader and publication keep
+trying. Commits, checkpoints, kills and late landings get none. TLC's liveness checking is
+unsound with a state constraint or symmetry, so the `Live*` configs use neither and are
+bounded by their constants alone (faults are at most `MaxFaults`, so they stop).
+
+- `EventuallyDurable`: every local commit eventually becomes durable, unless its writer is
+  killed or poisoned. `NegLiveStall` (an uploader that stops after a failed upload while the
+  writer runs on, silently) breaks it.
+- `EventuallyRuns`: whenever no host runs (at the start, or after a kill), one eventually
+  does. `NegLiveRefuseLeftovers` (the earlier rule) breaks it: after an interrupted
+  first open, every later open refuses, forever. The invariants couldn't see this.
+
+With two hosts, liveness needs the lease to work. The model's lease accepts any clock (safety
+must not depend on it), so without that assumption two hosts can take over from each other
+until both give up. `NegLiveDuel` (2 hosts) breaks `EventuallyRuns` that way: each open fences
+the other's compaction. `LeaseHolds` is the assumption: no host opens while another holds the
+lease, from its open on, unless that one was poisoned. In the code, `Lease::acquire` refuses
+while another writer's lease is valid, so the duel needs clocks that disagree by more than
+the lease TTL. `LiveTakeover` (sync) and `LiveAsyncTakeover` (async) pass with it.
+
+Liveness configs are kept small (1 commit or 2, 1 checkpoint, 1 fault, 3 or 4 opens). Without
+a state constraint or symmetry the state space grows fast: the two-host async duel at 2 faults
+ran 16 minutes. `bin/tlc` aborts a run when free disk space drops under 12 GB
+(`TLC_MIN_FREE_GB`); shrink the constants rather than let a config run for hours.
+
+Not checked: that a flush returns. The code bounds every flush with its timeout, and in
+the model a flush waiting for durability is `EventuallyDurable`.
+
+### Reachability
+
+An invariant also holds when the situation it guards never happens. So each positive
+config lists, under TLC's `_POSSIBLE` (provisional in TLC 2026.09.22), situations it must
+reach, and TLC fails the run if one is never witnessed. `pass` in `bin/check` therefore
+means no violation and every listed situation reached.
+
+| Situation | Listed in |
+|---|---|
+| a commit acknowledged after a takeover (`AckAfterTakeover`) | every positive config |
+| a commit acknowledged after a checkpoint (`AckAfterCheckpoint`) | every positive config |
+| the database created next to an interrupted bootstrap's snapshot (`BootstrapOverLeftover`) | every positive config |
+| a writer poisoned (`Poisoned`) | `Sole`, `SoleDelays`, `Takeover`, `TakeoverDeep`, `AsyncTakeover` |
+| a late PUT landing (`LateLanding`) | configs with `Delays` |
+| async running 2+ commits ahead of S3 (`AsyncAhead`) | async configs |
+| async commits while a snapshot is pending (`CommitWhileSnapPending`) | async configs |
+
+`VacuityControl` (`Sole`, which has no late writes, asked for `LateLanding`) must fail
+with that predicate unwitnessed, which shows the check isn't silent.
+
+`Poisoned` is not listed for `AsyncSole` or `AsyncSoleDelays`: a sole async writer is never
+poisoned, checked as the invariant `AsyncSoleNeverPoisoned`. The uploader retries the
+same frame until it lands, so the sync-mode indeterminate case (a rolled-back commit
+whose frame later turns up at its offset) can't arise. `ContinueEpoch` (a restarted
+writer appending to the restored epoch) breaks it (`NegAsyncContinueEpoch`).
+
+GC deletes old epochs entirely. With `KeepTails` (the earlier behaviour: keep each old
+epoch's last object as a tombstone) the model passes too; the tombstones became redundant
+once acknowledgement required the ownership confirm (`Takeover` with GC deleting everything:
+4,643,392 states, pass).
+
+The model treats a snapshot as one object. Incremental snapshots (a full snapshot plus
+deltas, listed in the manifest) are outside it: GC keeps every snapshot object a retained
+epoch's chain references, a chain object is never rewritten (keys are per epoch), and a
+restore checks the rebuilt file against the last link's size and CRC32C. The crash-torture
+test (`test/sediment/s3_torture_test.exs`) exercises chains with kills and faults.
+
+`RewriteOrphan` alone does not break anything anymore: since every open moves to a fresh
+epoch, an orphan rewrite lands in an epoch nobody reads, and the rewriting writer's
+ownership confirm fails. Both rules stay (defense in depth).
+
+Model-found bugs so far, both fixed in the code, with a regression test each:
+
+- Only the last failed attempt at an offset was remembered. A landed frame whose confirm
+  failed, followed by a failed retry, made the writer fence itself
+  (`every_failed_attempt_at_an_offset_is_remembered`).
+- A killed incarnation's late PUT landed in the epoch its restarted successor was
+  appending to, and fenced the successor. Every open now moves to a fresh epoch.
+
+## Trace validation
+
+`trace/` checks that what the code really sends is a behaviour of the model. A workload
+runs against a real S3 server with the request meter's trace mode on
+(`SEDIMENT_S3_TRACE=1`: every request's key and condition, every answer's status and ETag).
+`trace/s3trace.py` turns one writer's log into S3Fence events: open, close, bootstrap,
+takeover, restore, compaction, frame PUT (epoch, ordinal offset, outcome), ownership
+HEAD (did it see our manifest), seal, snapshot, manifest, GC. Then
+`TraceS3Fence.tla` asks TLC for a behaviour that matches every event with its observed
+outcome; a checkpoint, the start of a publication and GC may happen in between (the
+store doesn't see them). On rejection, `trace/check` reports the first event the model
+can't match.
+
+Every request is classified, and one that fits no rule stops the converter. The report
+lists what is not in the model: the probe, lease renewals, reads that only feed the next
+event's decision, the snapshot upload's HEAD, and the compaction's snapshot upload (part
+of the compaction). Async commits are local steps of the trace spec. The uploader's segment
+PUTs are the frames, and a coalesced segment of several commits is one model frame (the
+trace doesn't check content). Known modelling gap: the code collects garbage at open, and the
+model's open doesn't. Its deletes are matched as observations.
+
+Mapping rules (each counted in the converter's report, none silent):
+
+- An attempt that got no answer, followed by an identical request on the same key, is
+  object_store's retry: one logical request with the last attempt's answer. A retry of a
+  create-only or `If-Match` PUT whose first attempt landed gets a 412, as the code sees it.
+- A frame or seal PUT without an answer takes its outcome from the code's resolving read of
+  the key: found means landed (the model's `lost`), otherwise failed.
+- Seal PUTs are tagged by the code (`TraceTag`, a request extension, never sent).
+- A failed lease acquisition is no `Open` (the model's `Open` is a successful acquisition).
+- Generations are numbered by incarnation (the k-th successful open is generation k). The
+  real counter skips when an acquisition landed without an answer.
+
+    formal/trace/run trace/workload_sync.exs          # SeaweedFS unless S3_TEST_* says otherwise
+    formal/trace/run trace/workload_async.exs TRUE    # async (the model's Async = TRUE)
+    formal/trace/controls [workload] [TRUE]           # the corrupted-log controls below
+
+| Trace (one writer) | Events | Result |
+|---|---|---|
+| `workload_sync.exs`: bootstrap, commits, checkpoint, close, reopen, commit | 24 | accepted |
+| `workload_sync_faults.exs`: a commit whose PUT never lands, one whose answer is lost after it landed, a publication whose manifest answer is lost, reopen | 30 | accepted |
+| `workload_sync_retries.exs`: random connection resets with the client's retries on (lost answers, 412 retries, a takeover whose own landed PUT fenced it, failed lease acquisitions), 6 runs | 101 to 107 | accepted |
+| `workload_async.exs`: the same, async (commits are local; the uploader's segments are the frames) | 24 | accepted |
+| `workload_async_faults.exs`: uploads failing while S3 is cut off (the same segment retried), a segment whose answer is lost after it landed, a lost manifest answer (re-seal, adopt), reopen | 29 | accepted |
+| `workload_async_retries.exs`: random connection resets with the client's retries on, 4 runs | 45 to 47 | accepted |
+| `workload_takeover.exs`: writer A (its own OS process, behind a proxy delaying requests up to 3 s) is killed with kill -9 while a frame PUT is in flight; writer B opens directly, takes over, commits. A's PUT lands after B's takeover (B's restore didn't find it and B's open collected A's epoch, yet it exists at the end): observed as `present`, which the model explains only by a late landing of A's in-flight PUT. 3 runs, all landed late | 20 to 21 | accepted |
+| `workload_import.exs`: `Sediment.S3.import/3` of an existing database with an AUTOINCREMENT table (copied into a new MVCC database, verified by a restore), then an open that takes over, commits, checkpoints and closes. The import is the model's bootstrap with a non-empty first snapshot (the model doesn't look at snapshot contents) | 15 | accepted |
+| the takeover log with a `present` object that was never PUT | 21 | rejected at it |
+| `controls` (sync and async logs): without one ownership HEAD / without the seal / with a frame moved into the sealed epoch | 23 / 23 / 24 | rejected at that event |
+
+Writers that follow one another (separate processes, e.g. after a kill -9) are one merged
+trace: their per-process logs ordered by time, which is exact when they don't overlap. A
+request the killed writer sent without getting an answer can be any outcome, including still
+in flight (the model's `late`, landing later). Not covered: two writers *overlapping* (a
+zombie still writing while another has taken over). The order of their concurrent requests
+can't be recovered from millisecond timestamps, and checking every order consistent with each
+request's sent-to-answered window is a different tool. That case is covered by the model
+check (`Takeover`, `AsyncTakeover`: 2 writers, late writes, 12.9M states) and by the crash
+torture's zombie kills (a paused writer resumed after another took over; prefix oracle).
+
+Found: the model's publication adopted a manifest of ours whose answer was lost *before*
+re-sealing the old epoch. The code re-seals first (an idempotent create-only PUT), then
+adopts. A trace with a lost manifest answer was rejected by the old model right
+after the re-seal. It is benign for safety (the re-seal succeeds only on our own seal and
+fences on anything else, correct in either order), and the model now follows the code
+(`Adopt` after `Seal`).
+
+## What the model does not cover
+
+The model checks the ownership protocol: which objects exist, which conditional writes
+succeed, and what a restore finds. It has logical time only, one abstract object per
+snapshot and per commit, and no costs. These properties are checked by tests instead:
+
+| Not in the model | Why | Covered by |
+|---|---|---|
+| Real time: checkpoint freezes, lock hold times, latencies | TLA+ has no real time | `a_checkpoint_does_not_wait_for_the_snapshot_upload`, `close_waits_for_a_slow_snapshot_upload_only_within_its_timeout`, "an S3 open stuck on the network doesn't hold up opens of other files", `busy_wait_test.exs`, `bench/` |
+| Clocks: lease expiry and point-in-time restore cutoffs | the lease accepts any clock (safety must not depend on it); `LeaseHolds` is only a liveness assumption | the S3 guide ("Clocks", point-in-time restore); "restore/3 rebuilds a past state"; the Tigris soak found a 227 s host skew this way |
+| Costs and request counts | not a behaviour property | the request meter and its independent check (`s3_meter_test.exs`), the soak's projection run (`scripts/s3_soak.exs --target local`) |
+| Bytes: incremental snapshot chains, compression, multipart and its part sizes, encryption | one abstract object per snapshot | CRC32C and size checks at every restore; `incremental.rs`, `incremental_snapshot_sizes_probe`; `a_snapshot_larger_than_its_parts_allow_at_8_mib_still_uploads`; the crash-torture test |
+| The encryption choice and the manifest's `encrypted` flag | checked before any write, or a manifest field the model abstracts: an open with the wrong choice is refused before the lease's first manifest write, the takeover keeps the flag as it was, and only the epoch advance after a successful restore records it | `an_s3_database_needs_a_key_or_an_explicit_opt_out`, `a_key_on_an_unencrypted_prefix_is_refused_and_writes_nothing`, `an_unrecorded_encryption_is_recorded_only_by_an_open_that_reads_the_database`, `a_second_open_of_a_database_open_here_needs_the_same_encryption`; S3 tests in `s3_test.exs` |
+| Import | the model's bootstrap with a non-empty first snapshot (the model doesn't look at snapshot contents); the same create-only manifest is the commit point | trace validation (`workload_import.exs`), `tests/import.rs` (failure paths, lost manifest race, re-runs) |
+| Group commit | a batch uses the same create-only upload and ownership confirm as one frame | `group_commit.rs`, incl. `failed_batch_upload_acknowledges_nothing_it_lost` (after a leader's failed batch, turso let a waiting commit sync the written prefix, so `sync` must keep failing once poisoned) |
+| Coalesced async segments | one model frame per upload; a segment is uploaded and retried as one object | `async_durability.rs`; crash torture (async, prefix oracle) |
+| Threads inside one writer (uploader, background publisher, lease renewer) | one writer's steps are serialized by one `pc`, like the writer-state lock in the code: the background publisher and a commit that finds a publication pending both publish under that lock, and no frame of the next epoch is uploaded before it (the model's `CommitPut` waits for `PublishBegin`) | `a_busy_writer_with_constant_checkpoints_never_fences_itself`, `a_checkpoint_does_not_wait_for_the_snapshot_upload`; crash torture |
+| Replica pools, point-in-time restore selection, export to SQLite | read-only paths outside the ownership protocol | `replica.rs`; "refresh/1 brings every connection of a replica pool up to date"; "restore/3 rebuilds a past state"; `tests/export.rs` (every export checked with SQLite) |
+| The provider itself | the store is an assumption: conditional writes enforced, checksummed bodies verified | the open's probe (refuses providers ignoring conditional PUTs), `NegIgnoreIfMatch` and `NegNoChecksum*`, "uploads cut off after their headers", suites on SeaweedFS, MinIO and Tigris |
+| Whether the code matches the model | a model can drift from the code (the bootstrap rule and the publication order did) | trace validation (below: one writer, sync and async, faults, sequential takeovers), regression tests for every model-found bug |
+
+Running (JDK from `mise.toml`, `tla2tools.jar` in `~/tools` or `$TLA_TOOLS`):
+
+```sh
+cd formal/tla && ../bin/tlc S3Fence.tla -config Sole.cfg
+formal/bin/check        # every config, compared with the table's expectation (~15 min)
+```

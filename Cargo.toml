@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+
+members = ["native/sediment_nif", "native/crc-fast-shim"]
+
+# See native/crc-fast-shim/Cargo.toml.
+[patch.crates-io]
+crc-fast = { path = "native/crc-fast-shim" }
