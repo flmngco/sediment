@@ -28,7 +28,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 # Real SQLite, to check that exports (Sediment.export_sqlite) are SQLite files.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [features]
 default = ["fts"]
