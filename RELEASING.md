@@ -30,13 +30,19 @@ downloads them from (`.../releases/download/v<version>`).
       caches);
    3. when all of that passed, attaches the NIF tarballs to the release.
       This is the only job with write access, and it checks nothing out;
-   4. waits for approval of the `hex` environment. Approve it, and it
-      downloads the NIFs from the release, writes the checksum file with
+   4. downloads the NIFs from the release, writes the checksum file with
       `mix rustler_precompiled.download Sediment.Native --all`, checks that
       it lists exactly the NIFs built in step 2 with the same SHA-256, and
-      runs `mix hex.publish`.
+      builds the Hex package and its docs. This job has no secrets;
+   5. waits for approval of the `hex` environment. Approve it only for a
+      release you just published yourself, after checking that the run's
+      commit is the `main` commit you tagged. The job then uploads the
+      finished package and docs through the Hex API. It is the only job
+      that sees `HEX_API_KEY`, and it checks nothing out and runs no code
+      from the repository.
 
-   If any target fails to build, nothing is uploaded or published. Fix it,
+   If any target fails to build, or a gnu NIF needs a glibc newer than
+   2.28, nothing is uploaded or published. Fix it,
    delete the release and its tag, and release again. If a run fails after
    the upload, delete the release's NIF assets before re-running it: the
    upload never replaces existing assets.
@@ -48,8 +54,10 @@ downloads them from (`.../releases/download/v<version>`).
 
 Linux gnu and musl (x86_64, aarch64), macOS (aarch64, x86_64) and Windows
 (x86_64 msvc), all NIF version 2.15, which loads on OTP 22 and later. The
-gnu builds run on Ubuntu 22.04 (glibc 2.35); the musl builds run in a
-pinned `rust:alpine` image on the native runner. Adding a target means a
+gnu builds run in a pinned `manylinux_2_28` image, and
+`scripts/check-nif-glibc.sh` fails the build if a NIF needs a glibc newer
+than 2.28 (the floor in the README). The musl builds run in a pinned
+`rust:alpine` image. Both run on native x86_64 and aarch64 runners. Adding a target means a
 matrix entry in `nif.yml` and the list in `lib/sediment/native.ex`, which
 must match.
 
@@ -64,6 +72,14 @@ repository is created, and again after changing who maintains it.
 - [ ] Environment `hex`: secret `HEX_API_KEY`; required reviewer: the
       maintainer; deployment branches and tags: tags matching `v*` only;
       administrators can't bypass the protection rules.
+- [ ] A tag ruleset on `refs/tags/v*`: only the maintainer can create
+      matching tags; updates and deletions are blocked; no bypass list. The
+      `hex` environment admits any `v*` tag, and a release runs the
+      workflow files of its tag, so without this rule anyone with write
+      access could tag a commit with a modified `release.yml`.
+- [ ] Immutable releases stay off: the release workflow attaches the NIFs
+      after the release is published. (To turn them on, the workflow would
+      have to upload to a draft release and publish it afterwards.)
 - [ ] No repository- or organization-level secret holds a Hex key.
 - [ ] Branch protection on `main`: pull request required, CI required (all
       `CI` jobs), no force pushes, no deletions, applies to administrators.

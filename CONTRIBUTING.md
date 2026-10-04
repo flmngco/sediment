@@ -6,11 +6,12 @@ change has to pass and what we expect from a pull request.
 ## Setup
 
 You need Elixir 1.18 or newer (OTP 27+), Rust 1.91 or newer and Docker for
-the S3 test server. A git checkout builds the NIF from source with
-Rustler; only users of the Hex package get the precompiled NIFs.
-`SEDIMENT_BUILD=0` makes a checkout use the precompiled NIFs of its version
-instead (the release workflow does this), and `SEDIMENT_BUILD=1` forces a
-source build anywhere.
+the S3 test server. A checkout builds the NIF from source with Rustler:
+only the Hex package has the checksum file
+(`checksum-Elixir.Sediment.Native.exs`) that the precompiled NIFs are
+checked against. `SEDIMENT_BUILD=1` forces a source build anywhere;
+`SEDIMENT_BUILD=0` forces the precompiled NIFs, which fails without that
+file (the release workflow generates it first).
 
 Sediment and its Ecto adapter are developed side by side:
 

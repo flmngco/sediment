@@ -42,7 +42,7 @@ defmodule Sediment.MixProject do
       {:db_connection, "~> 2.1"},
       {:telemetry, "~> 0.4 or ~> 1.0"},
       {:rustler_precompiled, "~> 0.10"},
-      {:rustler, "~> 0.38", optional: true, runtime: false},
+      {:rustler, "~> 0.38", runtime: false},
       {:table, "~> 0.1.0", optional: true},
       {:temp, "~> 0.4", only: [:dev, :test]},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},

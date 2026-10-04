@@ -2,8 +2,8 @@ name: Release
 
 # When a GitHub release is published: builds the precompiled NIFs, attaches
 # them to the release and publishes to Hex with their checksums. HEX_API_KEY
-# exists only in the `hex` environment (tags v* only, a required reviewer);
-# see RELEASING.md.
+# exists only in the `hex` environment (tags v* only, a required reviewer),
+# whose job runs no code from this repository; see RELEASING.md.
 on:
   release:
     types: [published]
@@ -17,6 +17,8 @@ jobs:
   verify:
     name: Check the tag, the CHANGELOG and the branch
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,6 +26,7 @@ jobs:
           persist-credentials: false
 
       - name: Check
+        id: check
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -41,6 +44,7 @@ jobs:
           if ! git merge-base --is-ancestor HEAD origin/main; then
             echo "the tagged commit is not on main"; exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   # The full CI from a clean build: no caches.
   ci:
@@ -76,16 +80,16 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: gh release upload "$TAG" nif-dist/*.tar.gz --repo "$GITHUB_REPOSITORY"
 
-  publish:
-    name: Publish to Hex
-    needs: upload
+  # Builds the Hex package and its docs. Building the docs compiles the
+  # project and fetches the NIF, so this job gets no secrets.
+  package:
+    name: Build the Hex package and docs
+    needs: [verify, upload]
     runs-on: ubuntu-24.04
-    environment: hex
-    permissions:
-      contents: read
     env:
       # Use the NIFs from the release, not a source build of the checkout.
       SEDIMENT_BUILD: "0"
+      VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -116,7 +120,48 @@ jobs:
       - name: Check the checksum file
         run: elixir scripts/check-nif-checksums.exs checksum-Elixir.Sediment.Native.exs nif-dist
 
-      - name: Publish
-        run: mix hex.publish --yes
+      # The docs tarball holds what `mix hex.publish` would upload: every
+      # file under doc/ except dotfiles, with paths relative to doc/.
+      - name: Build
+        run: |
+          mkdir hex
+          mix hex.build --output "hex/sediment-$VERSION.tar"
+          mix docs
+          (cd doc && find . -type f ! -path '*/.*' -printf '%P\n' | sort | tar -czf "../hex/sediment-$VERSION-docs.tar.gz" -T -)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hex
+          path: hex/
+          if-no-files-found: error
+
+  # Holds HEX_API_KEY. It checks nothing out and runs no code from this
+  # repository: it uploads the finished package and docs through the Hex API.
+  publish:
+    name: Publish to Hex
+    needs: [verify, package]
+    runs-on: ubuntu-24.04
+    environment: hex
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hex
+          path: hex
+
+      # The key goes to curl on stdin, not on its command line.
+      - name: Publish the package and the docs
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          upload() {
+            printf 'authorization: %s\n' "$HEX_API_KEY" |
+              curl --fail-with-body -sS -H @- -H 'content-type: application/octet-stream' \
+                -H 'accept: application/json' --data-binary "@$1" "$2"
+            echo
+          }
+          upload "hex/sediment-$VERSION.tar" "https://hex.pm/api/packages/sediment/releases?replace=false"
+          upload "hex/sediment-$VERSION-docs.tar.gz" "https://hex.pm/api/packages/sediment/releases/$VERSION/docs"

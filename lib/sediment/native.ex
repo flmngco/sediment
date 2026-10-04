@@ -7,14 +7,14 @@ defmodule Sediment.Native do
   version = Mix.Project.config()[:version]
 
   # Precompiled NIFs come from the GitHub release of this version, checked
-  # against the checksum file in the Hex package. SEDIMENT_BUILD=1 builds from
-  # source instead (it needs Rust and `{:rustler, "~> 0.38"}` in your deps), as
-  # does a git checkout of this repository unless SEDIMENT_BUILD=0.
+  # against the checksum file in the Hex package. Only the Hex package has that
+  # file, so any other source tree (a git checkout, a git or path dependency)
+  # builds from source. SEDIMENT_BUILD=1 or 0 overrides either way.
   force_build =
     case System.get_env("SEDIMENT_BUILD") do
       value when value in ["1", "true"] -> true
       value when value in ["0", "false"] -> false
-      _ -> File.exists?(Path.expand("../../.git", __DIR__))
+      _ -> not File.exists?(Path.expand("../../checksum-Elixir.Sediment.Native.exs", __DIR__))
     end
 
   use RustlerPrecompiled,

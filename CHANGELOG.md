@@ -6,10 +6,11 @@ First release.
 
 ### Installation
 
-* Precompiled NIFs (RustlerPrecompiled) for Linux gnu and musl (x86_64,
-  aarch64), macOS (aarch64, x86_64) and Windows (x86_64), checked against
-  the checksums in the Hex package. Rust is only needed for
-  `SEDIMENT_BUILD=1` source builds, or on other targets.
+* Precompiled NIFs (RustlerPrecompiled) for Linux gnu (glibc 2.28+) and
+  musl (x86_64, aarch64), macOS (aarch64, x86_64) and Windows (x86_64),
+  checked against the checksums in the Hex package. Rust is only needed for
+  `SEDIMENT_BUILD=1` source builds, other targets, and git or path
+  dependencies, which always build from source.
 
 ### Core API
 
