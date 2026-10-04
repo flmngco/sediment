@@ -3,6 +3,9 @@ name = "sediment_nif"
 version = "0.1.0"
 authors = []
 edition = "2021"
+license = "MIT"
+rust-version = "1.91"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

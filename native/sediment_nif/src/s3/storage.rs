@@ -1286,7 +1286,8 @@ fn next_batch(up: &Uploads) -> Vec<Queued> {
 fn uploaded(uploads: &(Mutex<Uploads>, Condvar), batch: &[Queued], epoch: Epoch) {
     let mut up = uploads.0.lock().unwrap();
     for queued in batch {
-        if let Some(done) = up.queue.pop_front_if(|q| q.seq == queued.seq) {
+        if up.queue.front().is_some_and(|q| q.seq == queued.seq) {
+            let done = up.queue.pop_front().expect("front exists");
             up.bytes -= done.frame.bytes.len() as u64;
         }
     }

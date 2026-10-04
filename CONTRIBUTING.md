@@ -5,7 +5,7 @@ change has to pass and what we expect from a pull request.
 
 ## Setup
 
-You need Elixir 1.18 or newer (OTP 27+), a stable Rust toolchain (the NIF is
+You need Elixir 1.18 or newer (OTP 27+), Rust 1.91 or newer (the NIF is
 compiled from source with Rustler) and Docker for the S3 test server.
 
 Sediment and its Ecto adapter are developed side by side:

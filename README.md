@@ -72,7 +72,7 @@ With Ecto, depend on the adapter instead; it brings `sediment` with it:
 {:ecto_sediment, "~> 0.1"}
 ```
 
-The NIF is compiled from source, so a Rust toolchain is required. Elixir
+The NIF is compiled from source, so Rust 1.91 or later is required. Elixir
 1.18 or later; the package is tested on Elixir 1.18 with OTP 27 and Elixir
 1.20 with OTP 29, on Linux. CI also type-checks the native code for Windows
 and macOS (`scripts/cross-check.sh`); those builds are not run there.
@@ -395,6 +395,10 @@ lazily, so it costs virtual address space rather than memory.
 
 MIT, see [LICENSE](https://github.com/flmngco/sediment/blob/main/LICENSE). It keeps exqlite's copyright notice for the
 ported code.
+
+`Cargo.lock` lists `webpki-root-certs` (CDLA-Permissive-2.0), which may trip license
+allow-lists that only cover code licenses. It is a wasm32-only dependency of
+`rustls-platform-verifier` and is not built into the NIF on any supported target.
 
 [exqlite]: https://github.com/elixir-sqlite/exqlite
 [rustler]: https://github.com/rusterlium/rustler
