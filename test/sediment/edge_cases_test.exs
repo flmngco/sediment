@@ -134,6 +134,41 @@ defmodule Sediment.EdgeCasesTest do
     assert {:ok, [[nil, 3], ["x", 1], ["z", nil]]} = Engine.fetch_all(conn, stmt)
   end
 
+  # turso_core 0.8.1; when the first drop starts working, drop the README
+  # caveat (and ecto_sediment's).
+  test "DROP COLUMN of a column with its own REFERENCES fails; a rebuild works", %{conn: conn} do
+    :ok =
+      Engine.execute(conn, """
+      create table parent (id text primary key);
+      create table child (id integer primary key, name text);
+      alter table child add column parent_id text references parent(id) on delete set null;
+      create table child2 (id integer primary key, parent_id text, foreign key (parent_id) references parent(id));
+      insert into parent values ('p');
+      insert into child values (1, 'a', 'p');
+      """)
+
+    assert {:error, "error in table child after drop column: unknown column \"parent_id\"" <> _} =
+             Engine.execute(conn, "alter table child drop column parent_id")
+
+    # Refused by SQLite too.
+    assert {:error, "error in table child2 after drop column" <> _} =
+             Engine.execute(conn, "alter table child2 drop column parent_id")
+
+    :ok =
+      Engine.execute(conn, """
+      begin;
+      create table child_new (id integer primary key, name text);
+      insert into child_new (id, name) select id, name from child;
+      drop table child;
+      alter table child_new rename to child;
+      commit;
+      """)
+
+    assert [["id"], ["name"]] = rows(conn, "select name from pragma_table_info('child')")
+
+    assert [[1, "a"]] = rows(conn, "select * from child")
+  end
+
   # turso compiles expressions recursively; on a dirty scheduler's own stack
   # a 50-term sum overflowed it and killed the VM. Depth 99 is the most turso
   # accepts.

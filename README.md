@@ -338,6 +338,14 @@ instead of faking it.
   `FULL OUTER JOIN requires an equality condition in the ON clause` when the
   right-hand table's join column has an index (a primary key, say). A unary
   plus avoids the index: `ON +p.id = c.parent_id`.
+* **Dropping a column that has its own `REFERENCES`.** turso_core 0.8.1
+  refuses `ALTER TABLE child DROP COLUMN parent_id` when `parent_id` was
+  declared with a column-level `REFERENCES` (`unknown column "parent_id" in
+  foreign key definition`); SQLite drops the constraint with the column.
+  This includes rolling back Ecto's `add :parent_id, references(:parents)`.
+  Rebuild the table instead: create it without the column, copy the rows,
+  drop the old table, rename the new one and recreate its indexes. A
+  table-level `FOREIGN KEY (parent_id)` is refused by both engines.
 * **Recursive triggers.** `PRAGMA recursive_triggers = on` is accepted, but
   turso_core 0.8.1 fires a trigger once instead of recursing.
 * **Infinite floats** (`SELECT 1e999`) are returned as `:inf` and `:"-inf"`,
