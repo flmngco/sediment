@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Runs a trace workload against S3 (SeaweedFS by default, S3_TEST_* to change) with the
+# request trace on, then checks the trace against S3Fence.
+#   formal/trace/run trace/workload_sync.exs [Async=TRUE|FALSE]
+set -euo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$here/.." && pwd)"
+meter="$(mktemp -d "${TMPDIR:-/tmp}/s3trace-run.XXXXXX")"
+trap 'rm -rf "$meter"' EXIT
+(cd "$repo" && MIX_ENV=test mix compile >/dev/null)
+paths=(); for p in "$repo"/_build/test/lib/*/ebin; do paths+=(-pa "$p"); done
+prefix="$(cd "$repo" && SEDIMENT_S3_METER_DIR="$meter" SEDIMENT_S3_TRACE=1 elixir "${paths[@]}" "$here/$1" 2> >(grep -E "LATE_LANDED|NOT_LANDED" >&2) | tail -1)"
+status=0
+logs=("$meter"/requests-*.log)
+# Writers that followed one another (separate processes): one merged trace.
+[ "${#logs[@]}" -gt 1 ] && logs=("$meter")
+for log in "${logs[@]}"; do
+  if ! "$here/trace/check" "$log" "$prefix" "${2:-FALSE}"; then
+    keep="${TMPDIR:-/tmp}/s3trace-rejected-$(date +%s)-$(basename "$log")"
+    cp -r "$log" "$keep"; echo "$prefix" > "$keep.prefix"
+    echo "kept the rejected log: $keep"
+    status=1
+  fi
+done
+exit $status

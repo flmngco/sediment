@@ -1,0 +1,16 @@
+# Stands in for the crc-fast crate (via [patch.crates-io] in the workspace
+# Cargo.toml). object_store's `aws` feature always depends on crc-fast, which
+# declares a cdylib crate type; Rustler copies every cdylib artifact of the
+# build into priv/native, racing other builds that share target/. This crate
+# provides the only API object_store uses (a CRC-64/NVME digest) as a plain
+# library.
+[package]
+name = "crc-fast"
+version = "1.10.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "crc_fast"
+path = "src/lib.rs"

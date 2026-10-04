@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Runs every S3Fence configuration and compares the outcome with its expectation:
+# "pass", or the name of the invariant that must be violated.
+set -uo pipefail
+here="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$here/tla"
+status=0
+while read -r cfg expect; do
+  [ -z "$cfg" ] && continue
+  out="$("$here/bin/tlc" S3Fence.tla -config "$cfg.cfg" 2>&1)"
+  if grep -qE "(Invariant|Action property) [A-Za-z]* is violated" <<<"$out"; then
+    got="$(grep -oE "(Invariant|Action property) [A-Za-z]* is violated" <<<"$out" | head -1 | awk '{print $(NF-2)}')"
+  elif grep -qE "Temporal property [A-Za-z]* was violated" <<<"$out"; then
+    got="$(grep -oE "Temporal property [A-Za-z]* was violated" <<<"$out" | head -1 | awk '{print $3}')"
+  elif grep -q "_POSSIBLE predicate [A-Za-z]* .*was never witnessed" <<<"$out"; then
+    got="unwitnessed:$(grep -o "_POSSIBLE predicate [A-Za-z]*" <<<"$out" | head -1 | awk '{print $3}')"
+  elif grep -q "No error has been found" <<<"$out"; then
+    got=pass
+  else
+    got=error
+  fi
+  states="$(grep -o "[0-9,]* distinct states found" <<<"$out" | tail -1)"
+  # _POSSIBLE witness counts, e.g. [AckAfterTakeover |-> 12, ...]
+  witnessed="$(grep -o '^\[[A-Za-z]* |->.*\]$' <<<"$out" | tail -1)"
+  if [ "$got" = "$expect" ] || { [ "$expect" = violated ] && [ "$got" != pass ] && [ "$got" != error ]; }; then
+    printf 'ok    %-24s %-18s %s %s\n' "$cfg" "$got" "$states" "$witnessed"
+  else
+    printf 'FAIL  %-24s got %s, expected %s\n' "$cfg" "$got" "$expect"
+    status=1
+  fi
+done <<'LIST'
+Sole pass
+SoleDelays pass
+NegNoConfirm AckedDurable
+NegListBeforeTakeover AckedDurable
+NegRewriteOrphan RestoreOK
+NegOneOrphan SoleNeverFenced
+NegContinueEpoch SoleNeverFenced
+Takeover pass
+AsyncSole pass
+AsyncSoleDelays pass
+NegNoDrain RestoreOK
+NegLiveSnapshot RestoreOK
+NegIgnoreIfMatch ManifestForward
+NegAsyncContinueEpoch AsyncSoleNeverPoisoned
+VacuityControl unwitnessed:LateLanding
+NegRefuseLeftovers unwitnessed:BootstrapOverLeftover
+NegDeleteLeftovers RestoreOK
+NegNoChecksum RestoreOK
+NegNoChecksumFence SoleNeverFenced
+LiveSole pass
+LiveAsyncSole pass
+NegLiveStall EventuallyDurable
+NegLiveRefuseLeftovers EventuallyRuns
+LiveTakeover pass
+LiveAsyncTakeover pass
+NegLiveDuel EventuallyRuns
+AsyncTakeover pass
+ReadTakeover pass
+NegReadNoRecheck ShownDurable
+NegReadRecheckGeneration ShownDurable
+NegReadRecheckSeal ShownDurable
+NegNoTakeoverSeal ShownDurable
+NegReadTransitional ShownDurable
+LIST
+
+exit $status

@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Never pull_request_target: pull requests (forks included) run with a
+  # read-only token and no secrets.
+  pull_request:
+  # The release workflow runs the full CI from a clean build first.
+  workflow_call:
+    inputs:
+      cache:
+        description: Restore and save the dependency and build caches
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# S3 tests use SeaweedFS on 127.0.0.1:8333. The image's default command
+# (`weed mini`) runs master, volume, filer and the S3 gateway in one
+# container, with conditional writes, so no custom command is needed. The
+# tag is pinned (the version the suites were run against locally), so a new
+# release can't change the server under the tests.
+
+jobs:
+  elixir:
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported versions run the test suites.
+          - elixir: "1.18.4"
+            otp: "27.3"
+          # The newest also run the linters and the docs build (`mix ci`).
+          - elixir: "1.20.1"
+            otp: "29.0"
+            lint: true
+    services:
+      seaweedfs:
+        image: chrislusf/seaweedfs:4.48
+        ports:
+          - 8333:8333
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ inputs.cache != false }}
+        with:
+          path: |
+            deps
+            _build
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
+
+      - run: mix deps.get
+
+      - name: Wait for SeaweedFS
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT http://127.0.0.1:8333/ci-probe || true)
+            [ "$code" = "200" ] && exit 0
+            sleep 1
+          done
+          echo "SeaweedFS did not come up"; exit 1
+
+      - name: mix ci (compile, format, tests, credo, ex_dna, reach, docs)
+        if: matrix.lint
+        run: mix ci
+
+      - name: mix test
+        if: ${{ !matrix.lint }}
+        run: MIX_ENV=test mix test
+
+      - name: S3 tests
+        run: MIX_ENV=test mix test --only s3
+
+      - name: Slow tests (cancellation, long fuzz run)
+        run: MIX_ENV=test mix test --only slow_test
+
+  rust:
+    name: Rust (fmt, clippy, cargo test)
+    runs-on: ubuntu-24.04
+    services:
+      seaweedfs:
+        image: chrislusf/seaweedfs:4.48
+        ports:
+          - 8333:8333
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ inputs.cache != false }}
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - run: cargo fmt --all -- --check
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Wait for SeaweedFS
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT http://127.0.0.1:8333/ci-probe || true)
+            [ "$code" = "200" ] && exit 0
+            sleep 1
+          done
+          echo "SeaweedFS did not come up"; exit 1
+
+      # The S3 tests include end-to-end runs against SeaweedFS; the ignored
+      # ones are benchmarks and a crash test driven from a separate process.
+      - run: cargo test --workspace --release
+
+  cross-check:
+    name: Cross-check ${{ matrix.target }} (cargo check)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-gnu, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # zig is the C cross compiler for zstd-sys and aws-lc-sys.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - run: ./scripts/cross-check.sh "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
