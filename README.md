@@ -72,10 +72,31 @@ With Ecto, depend on the adapter instead; it brings `sediment` with it:
 {:ecto_sediment, "~> 0.1"}
 ```
 
-The NIF is compiled from source, so Rust 1.91 or later is required. Elixir
-1.18 or later; the package is tested on Elixir 1.18 with OTP 27 and Elixir
-1.20 with OTP 29, on Linux. CI also type-checks the native code for Windows
-and macOS (`scripts/cross-check.sh`); those builds are not run there.
+Elixir 1.18 or later; the package is tested on Elixir 1.18 with OTP 27 and
+Elixir 1.20 with OTP 29, on Linux.
+
+The NIF comes precompiled (via [RustlerPrecompiled][rustler_precompiled])
+for these targets, so no Rust toolchain is needed:
+
+| OS | Targets |
+|---|---|
+| Linux, glibc 2.35+ | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
+| Linux, musl (Alpine) | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` |
+| macOS | `aarch64-apple-darwin`, `x86_64-apple-darwin` |
+| Windows | `x86_64-pc-windows-msvc` |
+
+The download is checked against the checksums in the Hex package. On Alpine
+the NIF links `libgcc_s`: install `libgcc` if your image doesn't have it.
+The test suites run on Linux only; the other targets are built in the
+release, not tested.
+
+To build from source instead (any other target, or by policy), set
+`SEDIMENT_BUILD=1` when compiling, install a Rust toolchain (1.91 or later)
+and add Rustler to your dependencies:
+
+```elixir
+{:rustler, "~> 0.38", runtime: false}
+```
 
 ## Caveats
 
@@ -410,4 +431,5 @@ allow-lists that only cover code licenses. It is a wasm32-only dependency of
 
 [exqlite]: https://github.com/elixir-sqlite/exqlite
 [rustler]: https://github.com/rusterlium/rustler
+[rustler_precompiled]: https://github.com/philss/rustler_precompiled
 [db_connection]: https://github.com/elixir-ecto/db_connection

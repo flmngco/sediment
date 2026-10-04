@@ -41,7 +41,8 @@ defmodule Sediment.MixProject do
     [
       {:db_connection, "~> 2.1"},
       {:telemetry, "~> 0.4 or ~> 1.0"},
-      {:rustler, "~> 0.38", runtime: false},
+      {:rustler_precompiled, "~> 0.10"},
+      {:rustler, "~> 0.38", optional: true, runtime: false},
       {:table, "~> 0.1.0", optional: true},
       {:temp, "~> 0.4", only: [:dev, :test]},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
@@ -64,8 +65,10 @@ defmodule Sediment.MixProject do
         native/sediment_nif/Cargo.toml
         native/crc-fast-shim/src
         native/crc-fast-shim/Cargo.toml
+        .cargo/config.toml
         Cargo.toml
         Cargo.lock
+        checksum-Elixir.Sediment.Native.exs
         guides
         docs
         .formatter.exs

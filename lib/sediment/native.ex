@@ -4,7 +4,35 @@ defmodule Sediment.Native do
   should be avoided unless you are aware of what you are doing.
   """
 
-  use Rustler, otp_app: :sediment, crate: "sediment_nif"
+  version = Mix.Project.config()[:version]
+
+  # Precompiled NIFs come from the GitHub release of this version, checked
+  # against the checksum file in the Hex package. SEDIMENT_BUILD=1 builds from
+  # source instead (it needs Rust and `{:rustler, "~> 0.38"}` in your deps), as
+  # does a git checkout of this repository unless SEDIMENT_BUILD=0.
+  force_build =
+    case System.get_env("SEDIMENT_BUILD") do
+      value when value in ["1", "true"] -> true
+      value when value in ["0", "false"] -> false
+      _ -> File.exists?(Path.expand("../../.git", __DIR__))
+    end
+
+  use RustlerPrecompiled,
+    otp_app: :sediment,
+    crate: "sediment_nif",
+    base_url: "https://github.com/flmngco/sediment/releases/download/v#{version}",
+    force_build: force_build,
+    version: version,
+    nif_versions: ["2.15"],
+    targets: ~w(
+      aarch64-apple-darwin
+      x86_64-apple-darwin
+      aarch64-unknown-linux-gnu
+      x86_64-unknown-linux-gnu
+      aarch64-unknown-linux-musl
+      x86_64-unknown-linux-musl
+      x86_64-pc-windows-msvc
+    )
 
   @type db() :: reference()
   @type statement() :: reference()

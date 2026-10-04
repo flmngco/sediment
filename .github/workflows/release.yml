@@ -1,7 +1,9 @@
 name: Release
 
-# Publishes to Hex when a GitHub release is published. HEX_API_KEY exists only
-# in the `hex` environment (tags v* only, a required reviewer); see RELEASING.md.
+# When a GitHub release is published: builds the precompiled NIFs, attaches
+# them to the release and publishes to Hex with their checksums. HEX_API_KEY
+# exists only in the `hex` environment (tags v* only, a required reviewer);
+# see RELEASING.md.
 on:
   release:
     types: [published]
@@ -10,37 +12,18 @@ permissions:
   contents: read
 
 jobs:
-  # The full CI from a clean build: no caches.
-  ci:
-    uses: ./.github/workflows/ci.yml
-    with:
-      cache: false
-
-  publish:
-    name: Publish to Hex
-    needs: ci
+  # The tag must be v<version in mix.exs>, the CHANGELOG must have that
+  # version's entry, and the tagged commit must be on main.
+  verify:
+    name: Check the tag, the CHANGELOG and the branch
     runs-on: ubuntu-24.04
-    environment: hex
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
-        with:
-          elixir-version: "1.20.1"
-          otp-version: "29.0"
-
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-        with:
-          toolchain: stable
-
-      # The tag must be v<version in mix.exs>, the CHANGELOG must have that
-      # version's entry, and the tagged commit must be on main.
-      - name: Check the tag, the CHANGELOG and the branch
+      - name: Check
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -59,7 +42,79 @@ jobs:
             echo "the tagged commit is not on main"; exit 1
           fi
 
+  # The full CI from a clean build: no caches.
+  ci:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+    with:
+      cache: false
+
+  # The precompiled NIFs for every target, as workflow artifacts.
+  nif:
+    needs: verify
+    uses: ./.github/workflows/nif.yml
+
+  # The only job that can write to the repository: it attaches the NIFs to
+  # the release. It checks nothing out and runs no repository code.
+  upload:
+    name: Upload the NIFs to the release
+    needs: [ci, nif]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: nif-*
+          merge-multiple: true
+          path: nif-dist
+
+      # No --clobber: assets of a published release are never replaced.
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" nif-dist/*.tar.gz --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    name: Publish to Hex
+    needs: upload
+    runs-on: ubuntu-24.04
+    environment: hex
+    permissions:
+      contents: read
+    env:
+      # Use the NIFs from the release, not a source build of the checkout.
+      SEDIMENT_BUILD: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "1.20.1"
+          otp-version: "29.0"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: nif-*
+          merge-multiple: true
+          path: nif-dist
+
       - run: mix deps.get
+
+      # Sediment.Native can't compile before its checksum file exists, but the
+      # attempt writes the metadata the download task reads. The task fails
+      # if any target's NIF is missing from the release.
+      - name: Generate the checksum file from the release
+        run: |
+          mix compile || true
+          mix rustler_precompiled.download Sediment.Native --all --print --no-config
+
+      # The release assets must be exactly the NIFs built above.
+      - name: Check the checksum file
+        run: elixir scripts/check-nif-checksums.exs checksum-Elixir.Sediment.Native.exs nif-dist
 
       - name: Publish
         run: mix hex.publish --yes

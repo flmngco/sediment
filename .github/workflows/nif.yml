@@ -1,0 +1,76 @@
+name: NIF
+
+# Builds the precompiled NIFs (NIF version 2.15, for OTP 22+) as workflow
+# artifacts, one per target. The release workflow calls it before uploading
+# them to the GitHub release. Run it by hand for a dry run of those builds:
+# nothing is uploaded to a release or published.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Linux gnu builds run on Ubuntu 22.04, so the NIFs need glibc 2.35 or newer.
+# The musl builds run in an Alpine container on the native runner. No caches:
+# every build starts clean.
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            alpine: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            alpine: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+    env:
+      TARGET: ${{ matrix.target }}
+      # Never link an AWS-LC that happens to be installed on the runner.
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      # Windows: AWS-LC's assembly from the crate's prebuilt NASM objects.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        if: ${{ !matrix.alpine }}
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        if: ${{ !matrix.alpine }}
+        shell: bash
+        run: scripts/build-nif.sh "$TARGET"
+
+      # rust:1.96-alpine3.22 (multi-arch index)
+      - name: Build in Alpine
+        if: ${{ matrix.alpine }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e TARGET -e AWS_LC_SYS_USE_SYSTEM \
+            rust@sha256:fa16d058a94f0f1cf86cbbbd181a2ea2a0001e1fba1e93c366821a58f3e6c8a1 \
+            sh -c 'apk add --no-cache musl-dev gcc g++ make perl && scripts/build-nif.sh "$TARGET"'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nif-${{ matrix.target }}
+          path: nif-dist/*.tar.gz
+          if-no-files-found: error

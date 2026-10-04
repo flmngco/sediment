@@ -31,3 +31,6 @@ sediment-*.tar
 /priv/native/
 /bench/_build/
 /bench/deps/
+
+# Generated at release time from the GitHub release assets.
+/checksum-Elixir.Sediment.Native.exs

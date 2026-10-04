@@ -25,7 +25,8 @@ defmodule Sediment.SpecTest do
   end
 
   defp generated?(name) do
-    name in [:rustler_init] or String.starts_with?(Atom.to_string(name), "__")
+    name in [:rustler_init, :load_rustler_precompiled] or
+      String.starts_with?(Atom.to_string(name), "__")
   end
 
   defp specified?(module, name, arity) do

@@ -4,6 +4,13 @@
 
 First release.
 
+### Installation
+
+* Precompiled NIFs (RustlerPrecompiled) for Linux gnu and musl (x86_64,
+  aarch64), macOS (aarch64, x86_64) and Windows (x86_64), checked against
+  the checksums in the Hex package. Rust is only needed for
+  `SEDIMENT_BUILD=1` source builds, or on other targets.
+
 ### Core API
 
 * `Sediment.Engine` / `Sediment.Native`: the `Exqlite.Sqlite3` API over

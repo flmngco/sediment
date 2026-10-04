@@ -15,8 +15,12 @@ def deps do
 end
 ```
 
-The native part is compiled from source with Rustler, so you need a Rust
-toolchain (`rustup`). The first build takes a few minutes.
+The NIF is downloaded precompiled for Linux (glibc and musl, x86_64 and
+aarch64), macOS (Apple silicon and Intel) and Windows (x86_64), and checked
+against the checksums in the Hex package. On other targets, or to build from
+source anyway, set `SEDIMENT_BUILD=1`, install a Rust toolchain (1.91 or
+later) and add `{:rustler, "~> 0.38", runtime: false}` to your dependencies.
+A source build takes a few minutes.
 
 For Ecto, depend on the `ecto_sediment` adapter instead, which brings this
 package with it: `{:ecto_sediment, "~> 0.1"}`.
