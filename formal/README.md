@@ -44,7 +44,7 @@ retried later); the snapshot is uploaded from the checkpoint's image of the DB f
 (`img`), which later commits and checkpoints don't change (`LiveSnapshot` uploads the live
 state instead and breaks `RestoreOK`). Backpressure (`max_lag_ms`, `max_pending_bytes`) bounds the lag and is not modelled; it only
 delays commits. Checked: `AsyncSole` 74,596 states, `AsyncSoleDelays` 155,710, `AsyncTakeover`
-9,782,967 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
+9,804,204 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
 `RestoreCommitted` and `SoleNeverFenced`; the sync configs pass `RestoreCommitted` too.
 
 `Patches` switch on negative controls. Each must break a property; the table records it.
@@ -85,14 +85,14 @@ delays commits. Checked: `AsyncSole` 74,596 states, `AsyncSoleDelays` 155,710, `
 | `NegReadRecheckSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `RecheckSeal` (a log that ended at its seal passes the second read even if the epoch moved on) | `ShownDurable` violated |
 | `NegNoTakeoverSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `NoTakeoverSeal` | `ShownDurable` violated |
 | `NegReadTransitional` | 2 (late writes, 1 fault), 2 reads, retain 1 | `ReadTransitional`, `NoTakeoverSeal` (use a takeover's manifest before its seal) | `ShownDurable` violated |
-| `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (4,954,786 states) |
-| `AsyncDestroy` | as `Destroy`, async | none | pass (8,926,692 states) |
-| `ReadDestroy` | as `Destroy`, no kill, 2 reads | none | pass |
+| `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (6,665,600 states) |
+| `AsyncDestroy` | as `Destroy`, async | none | pass (11,978,600 states) |
+| `ReadDestroy` | as `Destroy`, no fault or kill, 2 reads | none | pass (1,624,582 states) |
 | `NegDestroyDeletes` | 1 (late writes), 1 destroy | `DestroyDeletes` (delete the manifest instead of a tombstone) | `NewAfterDestroy` violated |
 | `NegPurgeAll` | 2 (late writes, 1 fault), 1 destroy each | `PurgeAll` (purge ignoring the generation) | `RestoreOK` violated |
 | `NegTakeAnyGeneration` | 2 (late writes, 1 fault), 1 destroy each | `TakeAnyGeneration` (an open builds on a manifest or tombstone of a newer lease) | `NewAfterDestroy` violated |
 | `NegSeqFromZero` | as `Destroy` | `SeqFromZero` (a database over a tombstone starts at epoch 0), `GCAnyGeneration` | `RestoreOK` violated |
-| `DestroyManifestLoss` | as `Destroy`, 2 checkpoints, no kill, `manifest.json` deleted once | none | pass |
+| `DestroyManifestLoss` | as `Destroy`, 2 checkpoints, no kill, `manifest.json` deleted once | none | pass (6,492,822 states) |
 | `NegSeqFromManifest` | as `DestroyManifestLoss` | `SeqFromManifest` (the tombstone's sequence number from the manifest only, 0 without one), `GCAnyGeneration` | `RestoreOK` violated |
 | `NegGCAnyGeneration` | as `DestroyManifestLoss` | `GCAnyGeneration` (GC collects epochs of newer lease generations too) | `RestoreOK` violated |
 | `NegTrustRefused` | as `Destroy` | `TrustRefused` (a tombstone PUT reported refused is taken as refused) | `RefusedMeansIntact` violated |
@@ -251,7 +251,8 @@ so a read of a collected past epoch fails at the snapshot download; in the code 
 epoch's delta chain can keep that snapshot (the model has no chains), so the code checks
 past epochs too.
 
-Checked: `ReadTakeover` 35,635,932 states. Run the reader configs with `JAVA_TOOL_OPTIONS=-Xmx3g` on a machine
+Checked: `ReadTakeover` 38,435,435 states. On a machine short of disk, pass `-checkpoint 0`
+to `bin/tlc` (TLC's periodic checkpoint copies its state to disk). Run the reader configs with `JAVA_TOOL_OPTIONS=-Xmx3g` on a machine
 with less than 24 GB (`ReadTakeover` keeps millions of states queued).
 
 ### Reachability
