@@ -141,6 +141,11 @@ pub struct Manifest {
     /// without one) that succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<bool>,
+    /// Random, chosen when the database is created and kept by every later
+    /// manifest: which database this is, whatever its epochs. `None` in
+    /// manifests written by older versions (or a takeover by one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<String>,
 }
 
 impl EpochRecord {
@@ -250,6 +255,7 @@ impl Manifest {
             started_at_ms: now,
             history,
             encrypted: self.encrypted,
+            database_id: self.database_id.clone(),
         }
     }
 

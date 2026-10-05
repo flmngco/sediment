@@ -78,7 +78,7 @@ empty between checkpoints. So the full state is always
 
 ```
 lease.json                           {owner, generation, expires_at_ms}
-manifest.json                        {version, generation, epoch, epoch_id, snapshot, ...}
+manifest.json                        {version, generation, epoch, epoch_id, snapshot, database_id, ...}
                                      or, after a destroy: {version: 3, destroyed: true, generation, seq, ...}
 snapshots/<epoch_id>.db              DB file at the start of the epoch (zstd)
 snapshots/<epoch_id>.delta           or: its changed 64 KiB segments (zstd)
@@ -284,11 +284,16 @@ tombstone after a database had come and its manifest had been deleted again
 
 Replica connections of one process share restored generations: a refresh or
 a new connection adopts the one another connection restored instead of
-downloading it again, but only after one manifest read shows a database that
-still retains that epoch (`replica::still_usable`); otherwise the generation is
-forgotten and the connection restores (or finds no database). Without that,
-they served a destroyed database, and after the prefix was reused, the old
-database instead of the new one (`NegAdoptUnchecked`).
+downloading it again, so the connections of a pool read one state until a
+refresh, also while the writer checkpoints. It does so only after one manifest
+read shows the same database: the manifest's `database_id` (random, written
+when the database is created and kept by every later manifest) must be the
+one the generation was restored from (`replica::still_usable`); manifests
+without an id (written by an older version) need the epoch to be still
+retained. Otherwise the generation is forgotten and the connection restores
+(or finds no database). Without that check, replicas served a destroyed
+database, and after the prefix was reused, the old database instead of the new
+one (`NegAdoptUnchecked`).
 
 A new lease starts above the generation of the manifest (or tombstone) too, so
 a `lease.json` that was lost or rolled back (a restored backup) doesn't make

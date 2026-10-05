@@ -19,6 +19,8 @@ const ATTEMPTS: usize = 3;
 /// What a replica was restored from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaState {
+    /// The database it is a state of (`Manifest::database_id`).
+    pub database_id: Option<String>,
     pub epoch: String,
     pub snapshot: String,
     pub log_bytes: u64,
@@ -27,13 +29,23 @@ pub struct ReplicaState {
 }
 
 /// Whether a generation another connection of this process restored may
-/// still be handed out: the manifest is a database's (not destroyed, and not
-/// a new one in its place) that still retains that epoch.
+/// still be handed out: the prefix holds the same database (not destroyed,
+/// and not a new one in its place). The connections of a replica keep one
+/// state until a refresh, also while the writer moves on. Without an id on
+/// either side (a manifest of an older version), the epoch must still be
+/// retained.
 pub fn still_usable(cfg: &S3Config, state: &ReplicaState) -> Result<bool> {
+    let Some(manifest) = restore::read_manifest(&cfg.remote()?)? else {
+        return Ok(false);
+    };
+    if let (Some(current), Some(cached)) = (&manifest.database_id, &state.database_id) {
+        return Ok(current == cached);
+    }
     let Some(epoch) = super::layout::Epoch::parse(&state.epoch) else {
         return Ok(false);
     };
-    restore::still_retained(&cfg.remote()?, epoch)
+    let retained = manifest.retained().any(|record| record.epoch == epoch);
+    Ok(retained)
 }
 
 /// A restore downloaded next to the database, ready to be moved in place.
@@ -299,6 +311,7 @@ fn staging_path(db_path: &Path) -> PathBuf {
 
 fn replica_state(manifest: &Manifest, log: LogState) -> ReplicaState {
     ReplicaState {
+        database_id: manifest.database_id.clone(),
         epoch: manifest.epoch.to_string(),
         snapshot: manifest.snapshot.clone(),
         log_bytes: log.len,

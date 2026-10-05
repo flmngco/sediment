@@ -641,6 +641,7 @@ fn create_database(
         started_at_ms: now_ms(),
         history: Vec::new(),
         encrypted: Some(cfg.encryption.is_some()),
+        database_id: Some(format!("{:016x}{:016x}", rand_u64(), rand_u64())),
     };
     let version = remote.put(MANIFEST_KEY, manifest.encode(), mode)?;
     Ok((manifest, version, published))

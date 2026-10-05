@@ -149,6 +149,38 @@ defmodule Sediment.S3Test do
     for db <- [r1, r2, r4, r5, recreated], do: Engine.close(db)
   end
 
+  test "a replica's connections keep one state across writer checkpoints until a refresh", %{
+    s3: s3,
+    dir: dir
+  } do
+    rows = fn db ->
+      {:ok, stmt} = Engine.prepare(db, "SELECT x FROM t ORDER BY x")
+      {:ok, rows} = Engine.fetch_all(db, stmt)
+      :ok = Engine.release(db, stmt)
+      rows
+    end
+
+    {:ok, w} = Engine.open(Path.join(dir, "w.db"), s3: s3)
+    :ok = Engine.execute(w, "CREATE TABLE t(x); INSERT INTO t VALUES ('a')")
+    rpath = Path.join(dir, "r.db")
+    replica = Keyword.put(s3, :mode, :replica)
+    {:ok, r1} = Engine.open(rpath, s3: replica)
+    :ok = Engine.execute(w, "INSERT INTO t VALUES ('b')")
+    :ok = S3.snapshot(w)
+    :ok = Engine.execute(w, "INSERT INTO t VALUES ('c')")
+
+    # A new connection of the same replica joins the state the others read.
+    {:ok, r2} = Engine.open(rpath, s3: replica)
+    assert rows.(r1) == [["a"]]
+    assert rows.(r2) == [["a"]]
+    assert {:ok, _} = S3.refresh(r2)
+    assert rows.(r2) == [["a"], ["b"], ["c"]]
+    # r1 adopts what r2 published, without a download of its own.
+    assert {:ok, _} = S3.refresh(r1)
+    assert rows.(r1) == [["a"], ["b"], ["c"]]
+    for db <- [r1, r2, w], do: Engine.close(db)
+  end
+
   test "exists?/1 and must_exist: true", %{s3: s3, dir: dir} do
     refute S3.exists?(s3)
     strict = Keyword.put(s3, :must_exist, true)

@@ -43,8 +43,8 @@ Commits go on while the snapshot publication is pending (a failed snapshot uploa
 retried later); the snapshot is uploaded from the checkpoint's image of the DB file
 (`img`), which later commits and checkpoints don't change (`LiveSnapshot` uploads the live
 state instead and breaks `RestoreOK`). Backpressure (`max_lag_ms`, `max_pending_bytes`) bounds the lag and is not modelled; it only
-delays commits. Checked: `AsyncSole` 74,596 states, `AsyncSoleDelays` 155,710, `AsyncTakeover`
-9,804,204 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
+delays commits. Checked: `AsyncSole` 74,823 states, `AsyncSoleDelays` 155,958, `AsyncTakeover`
+9,977,074 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
 `RestoreCommitted` and `SoleNeverFenced`; the sync configs pass `RestoreCommitted` too.
 
 `Patches` switch on negative controls. Each must break a property; the table records it.
@@ -85,14 +85,14 @@ delays commits. Checked: `AsyncSole` 74,596 states, `AsyncSoleDelays` 155,710, `
 | `NegReadRecheckSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `RecheckSeal` (a log that ended at its seal passes the second read even if the epoch moved on) | `ShownDurable` violated |
 | `NegNoTakeoverSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `NoTakeoverSeal` | `ShownDurable` violated |
 | `NegReadTransitional` | 2 (late writes, 1 fault), 2 reads, retain 1 | `ReadTransitional`, `NoTakeoverSeal` (use a takeover's manifest before its seal) | `ShownDurable` violated |
-| `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (6,665,600 states) |
-| `AsyncDestroy` | as `Destroy`, async | none | pass (11,978,600 states) |
-| `ReadDestroy` | as `Destroy`, no fault or kill, 2 reads | none | pass (1,624,582 states) |
+| `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (6,704,792 states) |
+| `AsyncDestroy` | as `Destroy`, async | none | pass (12,054,213 states) |
+| `ReadDestroy` | as `Destroy`, no fault or kill, 2 reads | none | pass (1,586,375 states) |
 | `NegDestroyDeletes` | 1 (late writes), 1 destroy | `DestroyDeletes` (delete the manifest instead of a tombstone) | `NewAfterDestroy` violated |
 | `NegPurgeAll` | 2 (late writes, 1 fault), 1 destroy each | `PurgeAll` (purge ignoring the generation) | `RestoreOK` violated |
 | `NegTakeAnyGeneration` | 2 (late writes, 1 fault), 1 destroy each | `TakeAnyGeneration` (an open builds on a manifest or tombstone of a newer lease) | `NewAfterDestroy` violated |
 | `NegSeqFromZero` | as `Destroy` | `SeqFromZero` (a database over a tombstone starts at epoch 0), `GCAnyGeneration` | `RestoreOK` violated |
-| `DestroyManifestLoss` | as `Destroy`, 2 checkpoints, no kill, `manifest.json` deleted once | none | pass (6,492,822 states) |
+| `DestroyManifestLoss` | as `Destroy`, 2 checkpoints, no kill, `manifest.json` deleted once | none | pass (6,815,519 states) |
 | `NegSeqFromManifest` | as `DestroyManifestLoss` | `SeqFromManifest` (the tombstone's sequence number from the manifest only, 0 without one), `GCAnyGeneration` | `RestoreOK` violated |
 | `NegGCAnyGeneration` | as `DestroyManifestLoss` | `GCAnyGeneration` (GC collects epochs of newer lease generations too) | `RestoreOK` violated |
 | `NegTrustRefused` | as `Destroy` | `TrustRefused` (a tombstone PUT reported refused is taken as refused) | `RefusedMeansIntact` violated |
@@ -140,7 +140,11 @@ Three more environment and reader details came from the reviews of the destroy:
   delete the next database's snapshot (`NegGCAnyGeneration`). The sequence controls
   switch both protections off.
 - Replica connections of one process share a restored generation (`rd.g`), which a refresh
-  or a new connection adopts after one manifest read (`ReadAdopt`). `ReadsAfterDestroy` (an
+  or a new connection adopts after one manifest read shows the same database
+  (`ReadAdopt`): manifests carry an identity, the lease generation that created the
+  database (`Manifest::database_id`, unique per creation), kept by every later manifest.
+  The shared generation may outlive its epoch (`CacheOutlivesEpoch`, a witness in
+  `ReadDestroy`): a pool keeps one state until a refresh. `ReadsAfterDestroy` (an
   action property: no read that returns after a tombstone returns an epoch it ended) checks
   it; `ShownDurable` can't, as it only applies while there is a database
   (`NegAdoptUnchecked`).
@@ -251,8 +255,8 @@ so a read of a collected past epoch fails at the snapshot download; in the code 
 epoch's delta chain can keep that snapshot (the model has no chains), so the code checks
 past epochs too.
 
-Checked: `ReadTakeover` 38,435,435 states. On a machine short of disk, pass `-checkpoint 0`
-to `bin/tlc` (TLC's periodic checkpoint copies its state to disk). Run the reader configs with `JAVA_TOOL_OPTIONS=-Xmx3g` on a machine
+Checked: `ReadTakeover` 38,480,211 states. `bin/tlc` runs without TLC's periodic
+checkpoints, which copy the state to disk. Run the reader configs with `JAVA_TOOL_OPTIONS=-Xmx3g` on a machine
 with less than 24 GB (`ReadTakeover` keeps millions of states queued).
 
 ### Reachability

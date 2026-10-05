@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run TLC on S3Fence with 3 workers; scratch (the metadir) outside the repo, deleted
-# after the run. Aborts the run if free disk space drops under TLC_MIN_FREE_GB (12):
+# after the run, no periodic checkpoints (they copy the state to disk). Aborts the run if
+# free disk space drops under TLC_MIN_FREE_GB (12):
 # liveness checking can grow the metadir fast.
 #   formal/bin/tlc tla/S3Fence.tla -config tla/Sole.cfg [flags]
 set -euo pipefail
@@ -9,7 +10,7 @@ min_free_kb=$(( ${TLC_MIN_FREE_GB:-12} * 1024 * 1024 ))
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/s3fence-tlc.XXXXXX")"
 java_home="$(cd "$(dirname "$0")/.." && mise where java 2>/dev/null || true)"
 "${java_home:+$java_home/bin/}java" -XX:+UseParallelGC -cp "$tools/tla2tools.jar:$tools/CommunityModules-deps.jar" \
-  tlc2.TLC -workers 3 -metadir "$scratch" -noGenerateSpecTE "$@" &
+  tlc2.TLC -workers 3 -metadir "$scratch" -noGenerateSpecTE -checkpoint 0 "$@" &
 tlc=$!
 trap 'kill $tlc 2>/dev/null || true; rm -rf "$scratch"' EXIT INT TERM
 while kill -0 "$tlc" 2>/dev/null; do

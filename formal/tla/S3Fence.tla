@@ -64,7 +64,7 @@ NoFrame == [e |-> [s |-> 0, g |-> 0], o |-> 0, kind |-> "none", hist |-> <<>>, g
 \* tomb: a destroy's tombstone (layout.rs Tombstone): no database; every object of an
 \* epoch whose generation is at most gen is dead.
 NoMan == [present |-> FALSE, e |-> [s |-> 0, g |-> 0], gen |-> 0, ret |-> <<>>, body |-> 0, ver |-> 0,
-          tomb |-> FALSE]
+          tomb |-> FALSE, id |-> 0]
 
 \* db: the durable history (confirmed in S3); ldb: the local one, which is db
 \* in sync mode and runs ahead of it in async mode.
@@ -125,19 +125,21 @@ Charge(out) == faults' = IF out \in {"lost", "fail", "late", "trunc"} THEN fault
 
 \* What a truncated upload leaves: an empty manifest (restores nothing) or frame.
 EmptyMan == [present |-> TRUE, e |-> [s |-> 0, g |-> 0], gen |-> 0, ret |-> <<>>, body |-> 0,
-             ver |-> ctr + 1, tomb |-> FALSE]
+             ver |-> ctr + 1, tomb |-> FALSE, id |-> 0]
 Empty(f) == [f EXCEPT !.hist = <<>>]
 
 \* gen: the lease generation of the writer that wrote it (Manifest::generation); ret: the
 \* past epochs it retains, newest first (Manifest::history, at most Retain).
-NewMan(e, g, ret, body) ==
+\* id: which database it is (Manifest::database_id): the lease generation that created
+\* it (unique per creation), kept by every later manifest.
+NewMan(e, g, ret, body, id) ==
     [present |-> TRUE, e |-> e, gen |-> g, ret |-> ret, body |-> body, ver |-> ctr + 1,
-     tomb |-> FALSE]
+     tomb |-> FALSE, id |-> id]
 \* A tombstone keeps the epoch sequence number of what it replaced (e.s): the next
 \* database starts after it ("SeqFromZero": at 0, as a bootstrap without a manifest).
 TombMan(g, sq, body) ==
     [present |-> TRUE, e |-> [s |-> sq, g |-> 0], gen |-> g, ret |-> <<>>, body |-> body,
-     ver |-> ctr + 1, tomb |-> TRUE]
+     ver |-> ctr + 1, tomb |-> TRUE, id |-> 0]
 FirstSeq(m) == IF m.tomb /\ ~Patch("SeqFromZero") THEN m.e.s + 1 ELSE 0
 
 \* A database: a manifest that is there and isn't a tombstone.
@@ -204,11 +206,11 @@ Take(n) ==
             /\ \E out \in Outcomes(TRUE) :
                  /\ Charge(out)
                  /\ ctr' = ctr + 1
-                 /\ man' = IF out \in {"ok", "lost"} THEN NewMan(e, R[n].gen, <<>>, ctr + 1)
+                 /\ man' = IF out \in {"ok", "lost"} THEN NewMan(e, R[n].gen, <<>>, ctr + 1, R[n].gen)
                         ELSE IF out = "trunc" THEN EmptyMan ELSE man
                  /\ inflight' = IF out = "late"
                                 THEN inflight \cup {[k |-> "man", cond |-> 0,
-                                                     rec |-> NewMan(e, R[n].gen, <<>>, ctr + 1)]}
+                                                     rec |-> NewMan(e, R[n].gen, <<>>, ctr + 1, R[n].gen)]}
                                 ELSE inflight
                  /\ R' = IF out = "ok"
                          THEN [R EXCEPT ![n].pc = "run", ![n].e = e, ![n].o = 1,
@@ -221,7 +223,7 @@ Take(n) ==
             LET ob == {x \in objs : ~Dead(man.gen, x)}
                 sn == {x \in snaps : ~Dead(man.gen, x)}
                 e == [s |-> FirstSeq(man), g |-> R[n].gen]
-                rec == NewMan(e, R[n].gen, <<>>, ctr + 1)
+                rec == NewMan(e, R[n].gen, <<>>, ctr + 1, R[n].gen)
             IN
             /\ objs' = ob
             /\ IF ob # {} \/ {x \in sn : x.e.s # e.s} # {}
@@ -248,11 +250,11 @@ Take(n) ==
        ELSE /\ \E out \in Outcomes(TRUE) :
                  /\ Charge(out)
                  /\ ctr' = ctr + 1
-                 /\ man' = IF out \in {"ok", "lost"} THEN NewMan(man.e, R[n].gen, man.ret, ctr + 1)
+                 /\ man' = IF out \in {"ok", "lost"} THEN NewMan(man.e, R[n].gen, man.ret, ctr + 1, man.id)
                         ELSE IF out = "trunc" THEN EmptyMan ELSE man
                  /\ inflight' = IF out = "late"
                                 THEN inflight \cup {[k |-> "man", cond |-> man.ver,
-                                                     rec |-> NewMan(man.e, R[n].gen, man.ret, ctr + 1)]}
+                                                     rec |-> NewMan(man.e, R[n].gen, man.ret, ctr + 1, man.id)]}
                                 ELSE inflight
                  /\ R' = IF out = "ok"
                          THEN [R EXCEPT ![n].pc = "restore", ![n].e = man.e,
@@ -304,11 +306,11 @@ LateTake(n) ==
     /\ \E out \in Outcomes(man.ver = R[n].mver) :
          /\ Charge(out)
          /\ ctr' = ctr + 1
-         /\ man' = IF out \in {"ok", "lost"} THEN NewMan(man.e, R[n].gen, man.ret, ctr + 1)
+         /\ man' = IF out \in {"ok", "lost"} THEN NewMan(man.e, R[n].gen, man.ret, ctr + 1, man.id)
                         ELSE IF out = "trunc" THEN EmptyMan ELSE man
          /\ inflight' = IF out = "late"
                         THEN inflight \cup {[k |-> "man", cond |-> R[n].mver,
-                                             rec |-> NewMan(man.e, R[n].gen, man.ret, ctr + 1)]}
+                                             rec |-> NewMan(man.e, R[n].gen, man.ret, ctr + 1, man.id)]}
                         ELSE inflight
          /\ R' = IF out = "ok" THEN [R EXCEPT ![n].pc = "compact", ![n].mver = ctr + 1]
                  ELSE [R EXCEPT ![n].pc = "off"]
@@ -322,11 +324,11 @@ Compact(n) ==
        /\ \E out \in Outcomes(man.ver = R[n].mver) :
             /\ Charge(out)
             /\ ctr' = ctr + 1
-            /\ man' = IF out \in {"ok", "lost"} THEN NewMan(e, R[n].gen, Advanced(man, e), ctr + 1)
+            /\ man' = IF out \in {"ok", "lost"} THEN NewMan(e, R[n].gen, Advanced(man, e), ctr + 1, man.id)
                         ELSE IF out = "trunc" THEN EmptyMan ELSE man
             /\ inflight' = IF out = "late"
                            THEN inflight \cup {[k |-> "man", cond |-> R[n].mver,
-                                                rec |-> NewMan(e, R[n].gen, Advanced(man, e), ctr + 1)]}
+                                                rec |-> NewMan(e, R[n].gen, Advanced(man, e), ctr + 1, man.id)]}
                            ELSE inflight
             /\ R' = IF out = "ok"
                     THEN [R EXCEPT ![n].pc = "run", ![n].e = e, ![n].o = 1,
@@ -506,7 +508,7 @@ Snap(n) ==
 \* Manifest PUT, If-Match the version we hold.
 Man(n) ==
     /\ R[n].pc = "man"
-    /\ LET rec == NewMan(R[n].e, R[n].gen, Advanced(man, R[n].e), ctr + 1) IN
+    /\ LET rec == NewMan(R[n].e, R[n].gen, Advanced(man, R[n].e), ctr + 1, man.id) IN
        \E out \in Outcomes(man.ver = R[n].mver) :
          /\ Charge(out)
          /\ ctr' = ctr + 1
@@ -554,7 +556,7 @@ NoCache == [on |-> FALSE, e |-> NoEpoch, o |-> 0, h |-> <<>>]
 \* g: the generation the replica's connections in this process share (the last state a
 \* read of the current epoch returned), which other connections adopt (replica.rs).
 \* ret: how many reads returned, and the epoch the last one returned.
-NoGen == [on |-> FALSE, e |-> NoEpoch, h |-> <<>>]
+NoGen == [on |-> FALSE, e |-> NoEpoch, h |-> <<>>, id |-> 0]
 RD0 == [pc |-> "idle", m |-> NoMan, t |-> NoEpoch, h |-> <<>>, n |-> 0, sealed |-> FALSE,
         c |-> NoCache, k |-> 0, keys |-> {}, inc |-> FALSE, g |-> NoGen,
         ret |-> [n |-> 0, e |-> NoEpoch]]
@@ -632,19 +634,20 @@ ReadCheck ==
                                 !.c = IF rd.t = rd.m.e
                                       THEN [on |-> TRUE, e |-> rd.t, o |-> rd.n + 1, h |-> rd.h]
                                       ELSE rd.c,
-                                !.g = IF rd.t = rd.m.e THEN [on |-> TRUE, e |-> rd.t, h |-> rd.h]
+                                !.g = IF rd.t = rd.m.e
+                                      THEN [on |-> TRUE, e |-> rd.t, h |-> rd.h, id |-> rd.m.id]
                                       ELSE rd.g,
                                 !.ret = [n |-> rd.ret.n + 1, e |-> rd.t]]
        ELSE /\ rd' = [rd EXCEPT !.pc = "idle"]
             /\ UNCHANGED shown
 
 \* Another connection adopts the shared generation (a refresh, or a new connection),
-\* without restoring: only if one manifest read shows it still retained by a database
-\* (replica::still_usable); otherwise it is forgotten and the connection restores.
-\* "AdoptUnchecked": adopt it without looking.
+\* without restoring: only if one manifest read shows the same database (its id), also
+\* after the writer moved on (replica::still_usable); otherwise it is forgotten and the
+\* connection restores. "AdoptUnchecked": adopt it without looking.
 ReadAdopt ==
     /\ rd.pc = "idle" /\ rd.g.on /\ rd.k < Readers
-    /\ IF Patch("AdoptUnchecked") \/ (Live(man) /\ rd.g.e \in Retained(man))
+    /\ IF Patch("AdoptUnchecked") \/ (Live(man) /\ man.id = rd.g.id)
        THEN /\ shown' = shown \cup {rd.g.h}
             /\ rd' = [rd EXCEPT !.k = rd.k + 1, !.ret = [n |-> rd.ret.n + 1, e |-> rd.g.e]]
        ELSE /\ rd' = [rd EXCEPT !.k = rd.k + 1, !.g = NoGen]
@@ -887,6 +890,9 @@ RefusedMeansIntact ==
 \* Witnesses: a database created over a tombstone, and a commit acknowledged in it.
 OpenOverTomb == tomb > 0 /\ Live(man)
 AckAfterDestroy == tomb > 0 /\ acked # {}
+\* A replica's shared generation of a live database outlived its epoch (the writer
+\* checkpointed or took over): connections still adopt it, so a pool keeps one state.
+CacheOutlivesEpoch == rd.g.on /\ Live(man) /\ man.id = rd.g.id /\ rd.g.e \notin Retained(man)
 \* A replica's shared generation outlived a destroy (so adopting it is tried).
 CachedAtDestroy == tomb > 0 /\ rd.g.on
 \* A destroy took effect after manifest.json had been deleted from outside.

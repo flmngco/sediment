@@ -427,3 +427,26 @@ fn garbage_collection_leaves_newer_generations_alone() {
     assert!(keys(&store, "snapshots/").contains(&newer.snapshot_key()));
     assert!(segments(&store).contains(&newer.segment_key(0)));
 }
+
+#[test]
+fn a_database_keeps_its_id_and_a_new_one_gets_another() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let id = |store: &Arc<FaultyStore>| match state(store) {
+        ManifestState::Database(manifest) => manifest.database_id.expect("an id"),
+        ManifestState::Destroyed(_) => panic!("expected a database"),
+    };
+    let a = open_db(&config(&store, "a"), &dir.db("a.db")).unwrap();
+    a.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    let first = id(&store);
+    a.checkpoint();
+    assert_eq!(id(&store), first);
+    drop(a);
+    // A takeover keeps it.
+    drop(open_db(&config(&store, "b"), &dir.db("b.db")).unwrap());
+    assert_eq!(id(&store), first);
+
+    destroy(&config(&store, "d"), false).unwrap();
+    drop(open_db(&config(&store, "c"), &dir.db("c.db")).unwrap());
+    assert_ne!(id(&store), first);
+}
