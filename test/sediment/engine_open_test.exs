@@ -185,4 +185,75 @@ defmodule Sediment.EngineOpenTest do
       end
     end
   end
+
+  # turso locks a database file (and an MVCC database's log) while a process
+  # has it open. Another OS process holding the lock: python3 takes the same
+  # fcntl lock.
+  describe "a database open in another OS process" do
+    @python3 System.find_executable("python3")
+    @hold """
+    import fcntl, sys, time
+    f = open(sys.argv[1], "r+b")
+    fcntl.lockf(f, fcntl.LOCK_EX)
+    print("locked", flush=True)
+    sys.stdin.read()
+    """
+
+    defp hold_lock(path) do
+      port =
+        Port.open({:spawn_executable, @python3}, [:binary, args: ["-c", @hold, path]])
+
+      assert_receive {^port, {:data, "locked\n"}}, 5_000
+      port
+    end
+
+    # Closing stdin ends the script; the lock goes with the process.
+    defp release(port) do
+      {:os_pid, pid} = Port.info(port, :os_pid)
+      Port.close(port)
+      wait_for_exit(pid, 50)
+    end
+
+    defp wait_for_exit(pid, attempts) do
+      if attempts > 0 and
+           match?({_, 0}, System.cmd("kill", ["-0", "#{pid}"], stderr_to_stdout: true)) do
+        Process.sleep(20)
+        wait_for_exit(pid, attempts - 1)
+      end
+    end
+
+    @tag skip: if(!@python3, do: "python3 isn't installed")
+    test "says so instead of only that the file is locked" do
+      path = Temp.path!()
+      {:ok, conn} = Engine.open(path, journal_mode: :wal)
+      :ok = Engine.execute(conn, "create table t (x)")
+      :ok = Engine.close(conn)
+
+      port = hold_lock(path)
+      assert {:error, message} = Engine.open(path)
+      assert message =~ "the database is open in another OS process"
+      assert message =~ "File is locked by another process"
+      release(port)
+
+      {:ok, conn} = Engine.open(path)
+      :ok = Engine.close(conn)
+    end
+
+    @tag skip: if(!@python3, do: "python3 isn't installed")
+    test "says so when the MVCC log is the locked file" do
+      dir = Path.join(System.tmp_dir!(), "locked-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "app.db")
+      {:ok, conn} = Engine.open(path, journal_mode: :mvcc)
+      :ok = Engine.execute(conn, "create table t (x)")
+      :ok = Engine.close(conn)
+
+      port = hold_lock(Path.join(dir, "app.db-log"))
+      assert {:error, message} = Engine.open(path)
+      assert message =~ "the database is open in another OS process"
+      assert message =~ "app.db-log"
+      release(port)
+      File.rm_rf!(dir)
+    end
+  end
 end

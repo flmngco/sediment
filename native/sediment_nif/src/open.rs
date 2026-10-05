@@ -216,7 +216,8 @@ impl<'a> OpenConfig<'a> {
         options = options.durable_storage(s3.clone().map(|s| s as Arc<dyn DurableStorage>));
 
         let db = Database::open(io.clone(), &self.path, options).map_err(|e| {
-            crate::log_guard::explain_open_error(Path::new(&self.path), e.to_string())
+            let message = crate::error::locked_elsewhere(&e).unwrap_or_else(|| e.to_string());
+            crate::log_guard::explain_open_error(Path::new(&self.path), message)
         })?;
         if let Some(claim) = log_claim {
             claim.keep_while(&db);

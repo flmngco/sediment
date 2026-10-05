@@ -11,6 +11,10 @@
   MVCC, S3 restores, imports and exports now refuse a database file whose
   log another database file in its directory (or one open in the VM) maps
   to, and say which.
+* Opening a database that another OS process has open failed with only
+  turso's "Failed locking file ... File is locked by another process". The
+  error now says the database is open in another OS process (turso_core
+  allows one process per database file).
 
 ## 0.1.0-beta.1 (2026-10-04)
 

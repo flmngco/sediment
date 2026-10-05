@@ -62,7 +62,7 @@ impl From<std::io::Error> for S3Error {
 
 impl From<turso_core::LimboError> for S3Error {
     fn from(err: turso_core::LimboError) -> Self {
-        S3Error::Turso(err.to_string())
+        S3Error::Turso(crate::error::locked_elsewhere(&err).unwrap_or_else(|| err.to_string()))
     }
 }
 

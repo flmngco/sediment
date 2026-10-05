@@ -6,6 +6,9 @@ const QUERY_ONLY: &str = "Cannot execute write statement in query_only mode";
 /// differs only cosmetically, e.g. `no such table: t` instead of
 /// `Parse error: no such table: t`.
 pub fn message(err: &LimboError) -> String {
+    if let Some(message) = locked_elsewhere(err) {
+        return message;
+    }
     match err {
         LimboError::Busy => "database is locked".to_string(),
         LimboError::Interrupt => "interrupted".to_string(),
@@ -24,6 +27,23 @@ pub fn message(err: &LimboError) -> String {
                 _ => msg,
             }
         }
+    }
+}
+
+/// turso holds a database file (and its MVCC log) locked for as long as a
+/// process has it open, and its message only says the file is locked: say
+/// why instead of sending users looking for a stale lock.
+pub fn locked_elsewhere(err: &LimboError) -> Option<String> {
+    match err {
+        LimboError::LockingError(msg) if msg.contains("locked by another process") => {
+            Some(format!(
+                "the database is open in another OS process: turso_core lets one process at a \
+             time open a database file (connections within one VM share it). Close it \
+             there, or use one VM; S3 databases can be read elsewhere with \
+             s3: [mode: :replica] ({msg})"
+            ))
+        }
+        _ => None,
     }
 }
 
