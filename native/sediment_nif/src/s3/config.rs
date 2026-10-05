@@ -280,6 +280,14 @@ impl S3Config {
     }
 
     /// Identifies the store for caching the conditional-write probe.
+    /// Where the database is: the store and the prefix.
+    pub(crate) fn place(&self) -> String {
+        match &self.store {
+            Some(store) => format!("{:p}|{}", Arc::as_ptr(store) as *const (), self.prefix),
+            None => format!("{}|{}", self.store_identity(), self.prefix),
+        }
+    }
+
     pub(crate) fn store_identity(&self) -> String {
         format!(
             "{}|{}|{}",

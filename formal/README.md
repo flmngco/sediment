@@ -85,6 +85,39 @@ delays commits. Checked: `AsyncSole` 72,594 states, `AsyncSoleDelays` 150,536, `
 | `NegReadRecheckSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `RecheckSeal` (a log that ended at its seal passes the second read even if the epoch moved on) | `ShownDurable` violated |
 | `NegNoTakeoverSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `NoTakeoverSeal` | `ShownDurable` violated |
 | `NegReadTransitional` | 2 (late writes, 1 fault), 2 reads, retain 1 | `ReadTransitional`, `NoTakeoverSeal` (use a takeover's manifest before its seal) | `ShownDurable` violated |
+| `Destroy` | 2 (late writes, 1 fault), 1 destroy each | none | pass |
+| `AsyncDestroy` | 2 (late writes, 1 fault), async, 1 destroy each | none | pass |
+| `NegDestroyDeletes` | 1 (late writes), 1 destroy | `DestroyDeletes` (delete the manifest instead of a tombstone) | `NewAfterDestroy` violated |
+| `NegPurgeAll` | 2 (late writes, 1 fault), 1 destroy each | `PurgeAll` (purge ignoring the generation) | `RestoreOK` violated |
+| `NegTakeAnyGeneration` | 2 (late writes, 1 fault), 1 destroy each | `TakeAnyGeneration` (an open builds on a manifest or tombstone of a newer lease) | `NewAfterDestroy` violated |
+| `NegSeqFromZero` | 2 (late writes, 1 fault), 1 destroy each | `SeqFromZero` (a database over a tombstone starts at epoch 0) | `RestoreOK` violated |
+
+### Destroy
+
+`Destroys = n` lets each host run `destroy.rs` up to n times: take the lease (any clock,
+so a running writer may be taken over, which is what `force` does), read the manifest,
+PUT a tombstone `If-Match` on what it read (every outcome, including a late landing), then
+delete the dead objects (log objects and snapshots of epochs whose generation is at most the
+tombstone's) one at a time in any order, stopping at any point. An open over a tombstone
+deletes the dead objects, refuses if anything else but its own first snapshot is there,
+and bootstraps with `If-Match` on the tombstone, its first epoch after the tombstone's
+sequence number. Readers treat a tombstone as no database.
+
+When a tombstone lands (also late), the ghosts restart: `acked`, `committed` and `shown`
+are emptied, since the destroyed data is meant to go. The properties then catch any history
+from before the destroy coming back. `NewAfterDestroy` adds that a database after a destroy
+is one started after it: its epoch's generation is above the last tombstone's.
+`ManifestForward` holds across destroys (the tombstone keeps the sequence number).
+
+The negative controls are the designs this replaced, or the rules it needs. Deleting the
+manifest instead lets an interrupted bootstrap's late create-only manifest land after the
+destroy (`NegDestroyDeletes`). A purge must keep to the tombstone's generations
+(`NegPurgeAll`). An open whose lease is older than the manifest or tombstone it reads must
+refuse: otherwise a stale opener bootstraps over the tombstone in a generation the purge
+deletes (`NegTakeAnyGeneration`). And a database over a tombstone must not restart at epoch
+0: a stale writer of the destroyed database, collecting the epochs older than its own,
+deletes the new database's first snapshot (`NegSeqFromZero`). The last two were found by
+the model while the destroy was designed.
 
 ### Bootstrap over leftovers
 

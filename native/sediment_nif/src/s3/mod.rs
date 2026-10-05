@@ -6,6 +6,7 @@
 //! `OpenOptions::durable_storage`.
 
 mod config;
+mod destroy;
 mod error;
 pub(crate) mod import;
 mod layout;
@@ -30,6 +31,7 @@ use turso_core::mvcc::persistent_storage::Storage;
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
 pub use config::S3Config;
+pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
 pub use restore::Target;
@@ -37,7 +39,7 @@ use snapshot::Digests;
 pub use storage::Loss;
 pub use storage::{take_last_enqueued, S3DurableStorage, S3Info};
 
-use layout::{now_ms, Epoch, Manifest, MANIFEST_KEY, MANIFEST_VERSION};
+use layout::{now_ms, Epoch, Manifest, ManifestState, Tombstone, MANIFEST_KEY, MANIFEST_VERSION};
 use lease::Lease;
 use remote::Put;
 
@@ -66,6 +68,10 @@ pub fn prepare_with_io(
     local_path: &Path,
     io: Arc<dyn IO>,
 ) -> Result<Arc<S3DurableStorage>> {
+    prepare_at(cfg, local_path, io).map_err(|err| err.at(local_path))
+}
+
+fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Arc<S3DurableStorage>> {
     cfg.validate()?;
     let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let key = canonical_key(local_path)?;
@@ -158,6 +164,15 @@ pub fn live_storage(local_path: &Path) -> Option<Arc<S3DurableStorage>> {
     live.get(&key).and_then(Weak::upgrade)
 }
 
+/// Whether a database at `place` (see `S3Config::place`) is open in
+/// this process.
+fn open_at(place: &str) -> bool {
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.values()
+        .filter_map(Weak::upgrade)
+        .any(|storage| storage.place() == place)
+}
+
 fn prepare_fresh(
     cfg: &S3Config,
     local_path: &Path,
@@ -173,12 +188,18 @@ fn prepare_fresh(
     let lease = Lease::acquire(remote.clone(), owner.clone(), cfg.lease_ttl)?;
     let generation = lease.generation();
 
-    let (manifest, version, published) = match remote.get(MANIFEST_KEY)? {
-        Some(object) => {
+    let current = match remote.get(MANIFEST_KEY)? {
+        Some(object) => Some((ManifestState::decode(&object.bytes)?, object.version)),
+        None => None,
+    };
+    if let Some((state, _)) = &current {
+        refuse_newer(state.generation(), generation)?;
+    }
+    let (manifest, version, published) = match current {
+        Some((ManifestState::Database(decoded), object_version)) => {
             // Take the manifest over before reading the log: from here on no
             // stale writer can publish, or acknowledge a commit (see
             // `S3DurableStorage::confirm_ownership`).
-            let decoded = Manifest::decode(&object.bytes)?;
             check_encryption(&decoded, cfg)?;
             let manifest = Manifest {
                 generation,
@@ -190,7 +211,7 @@ fn prepare_fresh(
                 ..decoded
             };
             let version = remote
-                .put(MANIFEST_KEY, manifest.encode(), Put::Update(object.version))
+                .put(MANIFEST_KEY, manifest.encode(), Put::Update(object_version))
                 .map_err(fenced_on_conflict)?;
             restore::restore_and_seal(
                 &remote,
@@ -233,11 +254,22 @@ fn prepare_fresh(
                 .map_err(fenced_on_conflict)?;
             (fresh, version, published)
         }
-        None => {
-            check_no_old_objects(&remote)?;
+        // A destroyed database: finish its purge (a destroy may have been
+        // interrupted), then start a new one in its place.
+        Some((ManifestState::Destroyed(tombstone), object_version)) => {
+            purge(&remote, &tombstone)?;
+            check_no_old_objects(&remote, Some(&tombstone))?;
             refuse_to_replace_local_data(local_path, cfg)?;
             bootstrap_local(local_path, cfg.encryption.as_ref())?;
-            create_database(&remote, cfg, generation, owner, local_path)
+            let over = Some((&tombstone, object_version));
+            create_database(&remote, cfg, generation, owner, local_path, over)
+                .map_err(fenced_on_conflict)?
+        }
+        None => {
+            check_no_old_objects(&remote, None)?;
+            refuse_to_replace_local_data(local_path, cfg)?;
+            bootstrap_local(local_path, cfg.encryption.as_ref())?;
+            create_database(&remote, cfg, generation, owner, local_path, None)
                 .map_err(fenced_on_conflict)?
         }
     };
@@ -303,6 +335,10 @@ pub struct Restored {
 /// manifest retains (`retain_epochs`). The result is folded into one file
 /// that plain turso (or `Sediment.Engine.open/2` without `:s3`) opens.
 pub fn restore_to(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Restored> {
+    restore_into(cfg, local_path, target).map_err(|err| err.at(local_path))
+}
+
+fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Restored> {
     cfg.validate()?;
     let _log = crate::log_guard::claim(local_path).map_err(S3Error::Config)?;
     let remote = cfg.remote()?;
@@ -472,8 +508,10 @@ fn wrong_key(err: turso_core::LimboError) -> S3Error {
 }
 
 /// A prefix without a manifest must not hold anything a database could have
-/// written, except what a first open that failed before its manifest leaves.
-fn check_no_old_objects(remote: &remote::Remote) -> Result<()> {
+/// written, except what a first open that failed before its manifest leaves
+/// (a full snapshot of the first epoch), and what a destroy ended
+/// (`tombstone`).
+fn check_no_old_objects(remote: &remote::Remote, tombstone: Option<&Tombstone>) -> Result<()> {
     // Objects without a manifest: someone deleted it (and maybe the
     // lease, restarting generations). Don't build over them, except
     // what a first open that failed before its manifest leaves: its
@@ -482,8 +520,11 @@ fn check_no_old_objects(remote: &remote::Remote) -> Result<()> {
     // acknowledged). This bootstrap uses an epoch of its own (its
     // lease generation), and garbage collection removes the leftover
     // once the database moves past epoch 0.
+    let first = tombstone.map_or(0, Tombstone::next_seq);
     let leftover = |key: &str| {
-        key.ends_with(".db") && layout::parse_snapshot_key(key).is_some_and(|epoch| epoch.seq == 0)
+        tombstone.is_some_and(|tombstone| tombstone.covers(key))
+            || key.ends_with(".db")
+                && layout::parse_snapshot_key(key).is_some_and(|epoch| epoch.seq == first)
     };
     let mut objects = remote.list(layout::LOG_DIR)?;
     objects.extend(remote.list(layout::SNAPSHOT_DIR)?);
@@ -497,17 +538,50 @@ fn check_no_old_objects(remote: &remote::Remote) -> Result<()> {
     Ok(())
 }
 
-/// Publishes the file at `local_path` as epoch 0 of a new database and
-/// creates the manifest (create-only: `S3Error::Conflict` if another writer
-/// created one meanwhile).
+/// A manifest or tombstone written under a lease generation at least ours:
+/// someone took the lease after us, so this lease is stale. Building on it
+/// could write keys a destroy considers dead (see `Tombstone::covers`).
+pub(crate) fn refuse_newer(written_by: u64, generation: u64) -> Result<()> {
+    if written_by >= generation {
+        return Err(S3Error::Fenced(format!(
+            "the prefix was written under lease generation {written_by} after this one \
+             took the lease (generation {generation}); try again"
+        )));
+    }
+    Ok(())
+}
+
+/// Deletes every object of the database `tombstone` ended. Returns how many.
+pub(crate) fn purge(remote: &remote::Remote, tombstone: &Tombstone) -> Result<usize> {
+    let mut objects = remote.list(layout::LOG_DIR)?;
+    objects.extend(remote.list(layout::SNAPSHOT_DIR)?);
+    let dead: Vec<String> = objects
+        .into_iter()
+        .map(|object| object.key)
+        .filter(|key| tombstone.covers(key))
+        .collect();
+    let count = dead.len();
+    remote.delete_many(dead)?;
+    Ok(count)
+}
+
+/// Publishes the file at `local_path` as the first epoch of a new database
+/// and creates the manifest: create-only (epoch 0), or `over` a destroy's
+/// tombstone with `If-Match`, after its epochs (`S3Error::Conflict` if
+/// another writer got there first).
 fn create_database(
     remote: &remote::Remote,
     cfg: &S3Config,
     generation: u64,
     owner: String,
     local_path: &Path,
+    over: Option<(&Tombstone, object_store::UpdateVersion)>,
 ) -> Result<(Manifest, object_store::UpdateVersion, snapshot::Published)> {
-    let epoch = Epoch { seq: 0, generation };
+    let (seq, mode) = match over {
+        Some((tombstone, version)) => (tombstone.next_seq(), Put::Update(version)),
+        None => (0, Put::Create),
+    };
+    let epoch = Epoch { seq, generation };
     let published = snapshot::publish(remote, epoch, local_path, None)?;
     let snapshot = &published.snapshot;
     let manifest = Manifest {
@@ -526,7 +600,7 @@ fn create_database(
         history: Vec::new(),
         encrypted: Some(cfg.encryption.is_some()),
     };
-    let version = remote.put(MANIFEST_KEY, manifest.encode(), Put::Create)?;
+    let version = remote.put(MANIFEST_KEY, manifest.encode(), mode)?;
     Ok((manifest, version, published))
 }
 

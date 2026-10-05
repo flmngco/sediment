@@ -101,6 +101,7 @@ pub struct S3DurableStorage {
     db_path: PathBuf,
     location: (String, String),
     settings: String,
+    place: String,
     /// The key it was opened with: another open must give the same.
     encryption: Option<turso_core::EncryptionOpts>,
     retain_epochs: usize,
@@ -160,6 +161,7 @@ impl S3DurableStorage {
             db_path,
             location: (cfg.bucket.clone(), cfg.prefix.clone()),
             settings: cfg.settings(),
+            place: cfg.place(),
             encryption: cfg.encryption.clone(),
             retain_epochs: cfg.retain_epochs,
             group_commit: cfg.group_commit,
@@ -243,6 +245,11 @@ impl S3DurableStorage {
     }
 
     /// `(bucket, prefix)` this storage writes to.
+    /// See `S3Config::place`.
+    pub fn place(&self) -> &str {
+        &self.place
+    }
+
     pub fn settings(&self) -> &str {
         &self.settings
     }
@@ -390,7 +397,8 @@ impl S3DurableStorage {
         std::fs::copy(&self.db_path, &image).map_err(|err| {
             let _ = std::fs::remove_file(&image);
             LimboError::InternalError(format!(
-                "s3: copying the checkpoint for its snapshot: {err}"
+                "s3: copying the checkpoint of {} for its snapshot: {err}",
+                self.db_path.display()
             ))
         })?;
         Ok(image)

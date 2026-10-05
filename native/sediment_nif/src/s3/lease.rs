@@ -34,6 +34,29 @@ impl Lease {
     /// Takes the lease, or fails with `LeaseHeld` while another owner's lease
     /// is unexpired. Starts a background renewal thread.
     pub fn acquire(remote: Remote, owner: String, ttl: Duration) -> Result<Arc<Lease>> {
+        let ours = owner.clone();
+        Self::acquire_unless_held(remote, owner, ttl, move |current| current.owner != ours)
+    }
+
+    /// Takes the lease for a destroy: unlike an open, it refuses any
+    /// unexpired lease, this owner's too (that may be a writer of this
+    /// database still running), unless `force`.
+    pub fn acquire_to_destroy(
+        remote: Remote,
+        owner: String,
+        ttl: Duration,
+        force: bool,
+    ) -> Result<Arc<Lease>> {
+        Self::acquire_unless_held(remote, owner, ttl, move |_| !force)
+    }
+
+    /// `held`: whether an unexpired lease keeps this one out.
+    fn acquire_unless_held(
+        remote: Remote,
+        owner: String,
+        ttl: Duration,
+        held: impl Fn(&LeaseRecord) -> bool,
+    ) -> Result<Arc<Lease>> {
         let ttl_ms = ttl.as_millis() as u64;
         let mut attempts = 0;
         let (generation, version, expires_at_ms) = loop {
@@ -42,7 +65,7 @@ impl Lease {
                 None => (1, Put::Create),
                 Some(object) => {
                     let current: LeaseRecord = serde_json::from_slice(&object.bytes)?;
-                    if current.owner != owner && current.expires_at_ms > now_ms() {
+                    if current.expires_at_ms > now_ms() && held(&current) {
                         return Err(S3Error::LeaseHeld {
                             owner: current.owner,
                             expires_at_ms: current.expires_at_ms,

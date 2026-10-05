@@ -1,4 +1,5 @@
 mod async_durability;
+mod destroy;
 mod export;
 mod faulty;
 mod group_commit;
@@ -186,7 +187,7 @@ fn segments(store: &Arc<FaultyStore>) -> Vec<String> {
     keys(store, "log/")
 }
 
-fn assert_err_contains<T>(result: turso_core::Result<T>, needle: &str) {
+pub(crate) fn assert_err_contains<T>(result: turso_core::Result<T>, needle: &str) {
     match result {
         Ok(_) => panic!("expected an error containing {needle:?}"),
         Err(err) => assert!(
@@ -194,6 +195,15 @@ fn assert_err_contains<T>(result: turso_core::Result<T>, needle: &str) {
             "error {err} does not contain {needle:?}"
         ),
     }
+}
+
+#[test]
+fn local_errors_name_the_database() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("gone/a.db");
+    let err = open_db(&config(&store, "a"), &path).err().unwrap();
+    assert!(err.to_string().contains(path.to_str().unwrap()), "{err}");
 }
 
 #[test]

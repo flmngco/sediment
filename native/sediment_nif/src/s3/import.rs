@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use turso_core::{Connection, EncryptionOpts, Value};
 
-use super::layout::{Manifest, MANIFEST_KEY};
+use super::layout::{ManifestState, MANIFEST_KEY};
 use super::lease::Lease;
 use super::{
-    check_no_old_objects, create_database, default_owner, live_storage, open_local, probe,
-    require_encryption_choice, restore, snapshot::Digests, with_local_connection, Result, S3Config,
-    S3Error,
+    check_no_old_objects, create_database, default_owner, live_storage, open_local, probe, purge,
+    refuse_newer, require_encryption_choice, restore, snapshot::Digests, with_local_connection,
+    Result, S3Config, S3Error,
 };
 
 /// What [`import`] checks once the database is in S3.
@@ -113,6 +113,10 @@ fn autoincrement_batch_rows() -> u64 {
 /// that PUT leaves nothing an open would use; a re-run then works. The
 /// temporary files are deleted on every path.
 pub fn import(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Imported> {
+    import_from(cfg, source, opts).map_err(|err| err.at(source))
+}
+
+fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Imported> {
     cfg.validate()?;
     if cfg.replica {
         return Err(S3Error::Config(
@@ -147,18 +151,34 @@ pub fn import(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Imp
     let owner = cfg.owner.clone().unwrap_or_else(default_owner);
     let lease = Lease::acquire(remote.clone(), owner.clone(), cfg.lease_ttl)?;
     let generation = lease.generation();
-    if remote.get(MANIFEST_KEY)?.is_some() {
-        return Err(already_holds(cfg));
-    }
-    check_no_old_objects(&remote)?;
-    let manifest = match create_database(&remote, cfg, generation, owner, &work.db) {
+    // An empty prefix, or one a destroy emptied (its objects purged first).
+    let over = match remote.get(MANIFEST_KEY)? {
+        None => None,
+        Some(object) => match ManifestState::decode(&object.bytes)? {
+            ManifestState::Destroyed(tombstone) => {
+                refuse_newer(tombstone.generation, generation)?;
+                purge(&remote, &tombstone)?;
+                Some((tombstone, object.version))
+            }
+            ManifestState::Database(_) => return Err(already_holds(cfg)),
+        },
+    };
+    let tombstone = over.as_ref().map(|(tombstone, _)| tombstone);
+    check_no_old_objects(&remote, tombstone)?;
+    let first = tombstone.map_or(0, |tombstone| tombstone.next_seq());
+    let over = over
+        .as_ref()
+        .map(|(tombstone, version)| (tombstone, version.clone()));
+    let manifest = match create_database(&remote, cfg, generation, owner, &work.db, over) {
         Ok((manifest, _, _)) => manifest,
         Err(S3Error::Conflict(_)) => return Err(already_holds(cfg)),
         // The answer to the manifest PUT may be what got lost: the manifest
         // carries this lease's generation if the PUT landed.
         Err(err) => match remote.get(MANIFEST_KEY) {
-            Ok(Some(object)) => match Manifest::decode(&object.bytes) {
-                Ok(manifest) if manifest.generation == generation && manifest.epoch.seq == 0 => {
+            Ok(Some(object)) => match ManifestState::decode(&object.bytes).map(|s| s.database()) {
+                Ok(Some(manifest))
+                    if manifest.generation == generation && manifest.epoch.seq == first =>
+                {
                     manifest
                 }
                 _ => return Err(already_holds(cfg)),

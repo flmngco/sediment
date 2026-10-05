@@ -7,7 +7,8 @@ use bytes::Bytes;
 
 use super::error::{Result, S3Error};
 use super::layout::{
-    parse_segment_key, seal_body, Epoch, EpochRecord, Manifest, MANIFEST_KEY, SEAL_MAGIC,
+    parse_segment_key, seal_body, Epoch, EpochRecord, Manifest, ManifestState, MANIFEST_KEY,
+    SEAL_MAGIC,
 };
 use super::logfmt::{verify_segments_from, LogState};
 use super::remote::{Put, Remote};
@@ -24,12 +25,13 @@ pub fn wal_path(db_path: &Path) -> PathBuf {
 }
 
 /// Reads the manifest for a restore that doesn't hold the lease. `None`: no
-/// database.
+/// database (none yet, or destroyed).
 pub fn read_manifest(remote: &Remote) -> Result<Option<Manifest>> {
-    remote
+    Ok(remote
         .get(MANIFEST_KEY)?
-        .map(|object| Manifest::decode(&object.bytes))
-        .transpose()
+        .map(|object| ManifestState::decode(&object.bytes))
+        .transpose()?
+        .and_then(ManifestState::database))
 }
 
 /// Whether a reader may use `log`, the current epoch's log as it just listed
@@ -64,9 +66,8 @@ pub fn taking_over(manifest: &Manifest) -> S3Error {
 /// there (another writer's, this writer's own of a commit that failed, even a
 /// stale writer's seal).
 pub fn still_retained(remote: &Remote, epoch: Epoch) -> Result<bool> {
-    let current = match remote.get(MANIFEST_KEY)? {
-        Some(object) => Manifest::decode(&object.bytes)?,
-        None => return Ok(false),
+    let Some(current) = read_manifest(remote)? else {
+        return Ok(false);
     };
     let retained = current.retained().any(|record| record.epoch == epoch);
     Ok(retained)

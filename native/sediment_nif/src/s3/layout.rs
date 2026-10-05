@@ -15,6 +15,9 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// Version of manifests whose snapshot is a delta chain (`snapshot_base`):
 /// older drivers refuse them instead of reading a delta as a database file.
 pub const MANIFEST_VERSION_CHAIN: u32 = 2;
+/// Version of the manifest a destroy leaves: no database. Older drivers
+/// refuse it rather than read it as one.
+pub const MANIFEST_VERSION_DESTROYED: u32 = 3;
 /// Prefix of a seal object: written create-only at an epoch's end offset
 /// when the epoch is closed, so no stale writer can append after it.
 /// A format identifier persisted in S3, not a product name: never change it.
@@ -270,6 +273,101 @@ impl Manifest {
         serde_json::to_vec_pretty(self)
             .expect("manifest serializes")
             .into()
+    }
+}
+
+/// What `Sediment.S3.destroy/2` leaves in place of the manifest: the
+/// database is gone, and every object of an epoch whose generation is at
+/// most `generation` is garbage (any later database uses a newer one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub version: u32,
+    pub destroyed: bool,
+    pub generation: u64,
+    /// The epoch sequence number of the manifest it replaced. The next
+    /// database starts after it, so epochs never go back: a stale writer of
+    /// the destroyed database, collecting epochs older than its own, never
+    /// collects the new database's.
+    pub seq: u64,
+    pub writer: String,
+    pub updated_at_ms: u64,
+}
+
+impl Tombstone {
+    pub fn new(generation: u64, seq: u64, writer: &str) -> Self {
+        Self {
+            version: MANIFEST_VERSION_DESTROYED,
+            destroyed: true,
+            generation,
+            seq,
+            writer: writer.to_string(),
+            updated_at_ms: now_ms(),
+        }
+    }
+
+    pub fn encode(&self) -> bytes::Bytes {
+        serde_json::to_vec_pretty(self)
+            .expect("tombstone serializes")
+            .into()
+    }
+
+    /// The first epoch's sequence number of a database created over it.
+    pub fn next_seq(&self) -> u64 {
+        self.seq + 1
+    }
+
+    /// Whether an object key belongs to a database the tombstone ended.
+    pub fn covers(&self, key: &str) -> bool {
+        parse_segment_key(key)
+            .map(|(epoch, _)| epoch)
+            .or_else(|| parse_snapshot_key(key))
+            .is_some_and(|epoch| epoch.generation <= self.generation)
+    }
+}
+
+/// What `manifest.json` holds.
+#[derive(Debug, Clone)]
+pub enum ManifestState {
+    Database(Manifest),
+    Destroyed(Tombstone),
+}
+
+impl ManifestState {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Probe {
+            #[serde(default)]
+            destroyed: bool,
+        }
+        if serde_json::from_slice::<Probe>(bytes)?.destroyed {
+            Ok(Self::Destroyed(serde_json::from_slice(bytes)?))
+        } else {
+            Ok(Self::Database(Manifest::decode(bytes)?))
+        }
+    }
+
+    /// The epoch sequence number it ends at.
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Database(manifest) => manifest.epoch.seq,
+            Self::Destroyed(tombstone) => tombstone.seq,
+        }
+    }
+
+    /// The lease generation it was written under.
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Database(manifest) => manifest.generation,
+            Self::Destroyed(tombstone) => tombstone.generation,
+        }
+    }
+
+    /// The database, or `None` after a destroy.
+    pub fn database(self) -> Option<Manifest> {
+        match self {
+            Self::Database(manifest) => Some(manifest),
+            Self::Destroyed(_) => None,
+        }
     }
 }
 

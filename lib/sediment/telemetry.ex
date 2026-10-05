@@ -47,7 +47,7 @@ defmodule Sediment.Telemetry do
   ## S3
 
   `[:sediment, :s3, operation, :start | :stop | :exception]` for
-  `operation` in `:refresh`, `:snapshot`, `:restore`, `:import` and `:flush`
+  `operation` in `:refresh`, `:snapshot`, `:restore`, `:import`, `:destroy` and `:flush`
   (`Sediment.S3`), including the automatic refreshes of replica pools and
   the waits of `sync: true` commits (`:flush`, metadata `:timeout`; `:result`
   is `:ok` or `{:error, reason}`).

@@ -78,6 +78,54 @@ defmodule Sediment.S3Test do
     :ok = Engine.close(restored)
   end
 
+  test "destroy/2 deletes the database: a later open starts empty", %{
+    prefix: prefix,
+    s3: s3,
+    dir: dir
+  } do
+    {:ok, db} = Engine.open(Path.join(dir, "a.db"), s3: s3)
+    :ok = Engine.execute(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    :ok = Engine.execute(db, "INSERT INTO t VALUES (1)")
+
+    assert {:error, "s3 config: the database at " <> open} = S3.destroy(s3)
+    assert open =~ "is open in this VM"
+    :ok = Engine.close(db)
+
+    # A writer that was closed released its lease.
+    {:ok, b} = Engine.open(Path.join(dir, "b.db"), s3: s3_opts(prefix, "writer-b"))
+    :ok = Engine.close(b)
+    assert {:ok, %{objects: objects}} = S3.destroy(s3)
+    assert objects > 0
+
+    File.rm_rf!(dir)
+    File.mkdir_p!(dir)
+    assert {:error, "s3 config: no database" <> _} = S3.restore(Path.join(dir, "r.db"), s3)
+    {:ok, fresh} = Engine.open(Path.join(dir, "a.db"), s3: s3)
+    {:ok, stmt} = Engine.prepare(fresh, "SELECT count(*) FROM sqlite_schema WHERE name = 't'")
+    assert {:ok, [[0]]} = Engine.fetch_all(fresh, stmt)
+    :ok = Engine.release(fresh, stmt)
+    :ok = Engine.execute(fresh, "CREATE TABLE u (id INTEGER PRIMARY KEY)")
+    :ok = Engine.close(fresh)
+    assert {:ok, _} = S3.destroy(s3, force: true)
+  end
+
+  test "destroy/2 refuses a writer's unexpired lease unless forced", %{
+    prefix: prefix,
+    dir: dir
+  } do
+    # The same server under another name: as far as this destroy can tell,
+    # the writer runs in another process.
+    alias_endpoint = String.replace(endpoint(), "127.0.0.1", "localhost")
+    if alias_endpoint == endpoint(), do: flunk("needs an endpoint on 127.0.0.1")
+    {:ok, a} = Engine.open(Path.join(dir, "a.db"), s3: s3_opts(prefix, "writer-a"))
+    other = Keyword.put(s3_opts(prefix, "writer-a"), :endpoint, alias_endpoint)
+    assert {:error, "s3 lease held by writer-a" <> _} = S3.destroy(other)
+    assert {:ok, _} = S3.destroy(other, force: true)
+    assert {:error, reason} = Engine.execute(a, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    assert reason =~ "fenced"
+    :ok = Engine.close(a)
+  end
+
   test "S3 databases are encrypted unless encryption: false says otherwise", %{
     s3: s3,
     prefix: prefix,
@@ -844,7 +892,8 @@ defmodule Sediment.S3Test do
 
     dest = Path.join(dir, "restored.db")
     File.ln_s!("/dev/full", dest <> ".s3-restore")
-    assert {:error, "s3 local io: No space left" <> _} = S3.restore(dest, s3)
+    assert {:error, "s3 local io: " <> message} = S3.restore(dest, s3)
+    assert message =~ "#{dest}: No space left"
     refute File.exists?(dest)
 
     File.rm(dest <> ".s3-restore")

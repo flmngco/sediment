@@ -361,3 +361,28 @@ fn s3_import<'a>(
         Err(err) => error_tuple(env, describe(&err)),
     }
 }
+
+/// Destroys the database at the prefix (see `s3::destroy`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_destroy<'a>(env: Env<'a>, opts: Term<'a>, force: bool) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match s3::destroy(&config, force) {
+        Ok(destroyed) => {
+            let map = Term::map_from_pairs(
+                env,
+                &[(
+                    Atom::from_str(env, "objects").unwrap().encode(env),
+                    destroyed.objects.encode(env),
+                )],
+            );
+            match map {
+                Ok(map) => ok_tuple(env, map),
+                Err(_) => error_tuple(env, "could not build result"),
+            }
+        }
+        Err(err) => error_tuple(env, describe(&err)),
+    }
+}

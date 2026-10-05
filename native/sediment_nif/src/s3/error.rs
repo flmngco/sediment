@@ -29,6 +29,21 @@ pub enum S3Error {
 
 pub type Result<T> = std::result::Result<T, S3Error>;
 
+impl S3Error {
+    /// Names the local file a local error is about: on a node with many
+    /// databases, "No such file or directory" alone doesn't say whose.
+    pub fn at(self, path: &std::path::Path) -> Self {
+        match self {
+            S3Error::Io(err) => S3Error::Io(std::io::Error::new(
+                err.kind(),
+                format!("{}: {err}", path.display()),
+            )),
+            S3Error::Turso(msg) => S3Error::Turso(format!("{}: {msg}", path.display())),
+            other => other,
+        }
+    }
+}
+
 impl fmt::Display for S3Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

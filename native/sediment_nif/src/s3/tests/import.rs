@@ -278,6 +278,21 @@ fn a_prefix_that_holds_a_database_is_refused() {
 }
 
 #[test]
+fn a_destroyed_prefix_takes_an_import() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = source(&dir);
+    let db = open_db(&config(&store, "a"), &dir.db("other.db")).unwrap();
+    db.exec("CREATE TABLE gone(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    db.exec("INSERT INTO gone VALUES (1)").unwrap();
+    drop(db);
+    crate::s3::destroy(&config(&store, "d"), false).unwrap();
+    import(&config(&store, "importer"), &path, &checksum()).unwrap();
+    check_restored(&store, &dir, "restored.db");
+}
+
+#[test]
 fn a_failed_upload_leaves_nothing_an_open_uses_and_a_rerun_works() {
     let store = FaultyStore::new();
     let dir = TempDir::new();

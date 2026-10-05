@@ -79,6 +79,7 @@ empty between checkpoints. So the full state is always
 ```
 lease.json                           {owner, generation, expires_at_ms}
 manifest.json                        {version, generation, epoch, epoch_id, snapshot, ...}
+                                     or, after a destroy: {version: 3, destroyed: true, generation, seq, ...}
 snapshots/<epoch_id>.db              DB file at the start of the epoch (zstd)
 snapshots/<epoch_id>.delta           or: its changed 64 KiB segments (zstd)
 log/<epoch_id>/<offset:020>          one object per committed frame
@@ -197,8 +198,13 @@ Cost: one PUT plus one HEAD per commit.
    ignores the conditions is refused: fencing depends on them. See
    `guides/s3_providers.md`.
 1. Acquire the lease (below).
-2. GET `manifest.json`. If present, take it over right away (`If-Match`,
+2. GET `manifest.json`. If it was written under a lease generation at
+   least ours, someone took the lease after us: fail (fenced) without
+   writing. If present, take it over right away (`If-Match`,
    generation := our lease generation), before reading anything else.
+   - A destroy's tombstone: delete the objects it ended (see "Destroy"),
+     then bootstrap as below, with the first epoch after the tombstone's
+     `seq`, creating the manifest with `If-Match` on the tombstone.
    - Missing: bootstrap. Create the local DB with a plain turso open plus
      `PRAGMA journal_mode = 'mvcc'`, close it, upload it as the epoch-0
      snapshot, then create the manifest with `If-None-Match: *`.
@@ -225,6 +231,48 @@ Cost: one PUT plus one HEAD per commit.
    found by the TLA+ model; the cost is one snapshot upload per open.
 5. Return `S3DurableStorage`. The caller opens with it and turso's MVCC
    recovery replays the log.
+
+## Destroy
+
+`destroy.rs` (`Sediment.S3.destroy/2`) ends a database:
+
+1. Refuse if this VM has it open. Take the lease like an open, but refuse
+   any unexpired lease, our own owner's too, unless `force` (a forced
+   takeover is the any-clock takeover the model already allows).
+2. GET `manifest.json`; refuse if it was written under a generation at least
+   ours. PUT a tombstone `{version: 3, destroyed: true, generation: G, seq}`
+   (`seq`: the epoch sequence number of what it replaces) with
+   `If-Match` on what was read (create-only if there was none, so a prefix
+   with objects but no manifest is cleared too). A 412 means another writer
+   opened the database: fail, nothing deleted. A lost answer is checked
+   with a GET.
+3. Delete (DeleteObjects batches) every `log/` and `snapshots/` key whose
+   epoch generation is at most G, then release the lease.
+
+From the tombstone on, no writer acknowledges a commit (its ownership HEAD
+sees a foreign etag), no late manifest PUT lands (`If-Match` on an older
+etag, or create-only over an existing object), and no reader uses the old
+objects: `still_retained` is false for a tombstone, and replicas and
+`restore_to` treat it as no database. So an interrupted destroy never looks
+like an older database. Every database created later is created over the
+tombstone by a writer whose generation is above G (the generation rule in
+step 2 of "Open / restore"), so its keys are never in the range a destroy,
+or an open finishing one, deletes. Without that rule a stale opener could
+bootstrap over the tombstone, or take over the next database, and write
+epochs a running purge deletes (model: `NegTakeAnyGeneration`). Its first
+epoch is `seq + 1`, not 0: epochs never go back, so a stale writer of the
+destroyed database collecting "epochs older than its own" (which it
+published before the tombstone, so at most `seq`) leaves the new database
+alone (`NegSeqFromZero`: the new database's first snapshot collected), and
+the new database's own GC collects whatever a stale writer recreated in the
+old epochs.
+
+Why not delete `manifest.json`: deletes are unconditional, so a destroy that
+stalled past its lease could delete a newer writer's manifest, and without a
+manifest a stale writer's create-only bootstrap manifest can still land and
+bring an older database back (`NegDestroyDeletes`). The tombstone and
+`lease.json` stay for good: the lease keeps generations growing, so no later
+database reuses a key a late write of the destroyed one could recreate.
 
 ## Single writer (lease)
 

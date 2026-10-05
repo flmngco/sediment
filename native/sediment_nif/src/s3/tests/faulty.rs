@@ -17,6 +17,7 @@ pub enum Op {
     Put,
     Get,
     List,
+    Delete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +45,7 @@ struct Rule {
 #[derive(Debug, Default)]
 pub struct FaultyStore {
     inner: Arc<InMemory>,
-    rules: Mutex<Vec<Rule>>,
+    rules: Arc<Mutex<Vec<Rule>>>,
     puts: Mutex<Vec<String>>,
     /// Keys of all attempted GETs, in order.
     gets: Mutex<Vec<String>>,
@@ -127,13 +128,17 @@ impl FaultyStore {
     }
 
     fn fault(&self, op: Op, path: &Path) -> Option<Fault> {
-        let mut rules = self.rules.lock().unwrap();
-        let rule = rules
-            .iter_mut()
-            .find(|r| r.op == op && r.remaining > 0 && path.as_ref().contains(&r.key_contains))?;
-        rule.remaining -= 1;
-        Some(rule.fault)
+        take_fault(&self.rules, op, path)
     }
+}
+
+fn take_fault(rules: &Mutex<Vec<Rule>>, op: Op, path: &Path) -> Option<Fault> {
+    let mut rules = rules.lock().unwrap();
+    let rule = rules
+        .iter_mut()
+        .find(|r| r.op == op && r.remaining > 0 && path.as_ref().contains(&r.key_contains))?;
+    rule.remaining -= 1;
+    Some(rule.fault)
 }
 
 fn injected(path: &Path) -> object_store::Error {
@@ -231,7 +236,16 @@ impl ObjectStore for FaultyStore {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        self.inner.delete_stream(locations)
+        // Any fault on a delete fails it without touching the store.
+        use futures::StreamExt;
+        let rules = self.rules.clone();
+        let checked = locations
+            .map(move |location| match location {
+                Ok(path) if take_fault(&rules, Op::Delete, &path).is_some() => Err(injected(&path)),
+                other => other,
+            })
+            .boxed();
+        self.inner.delete_stream(checked)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {

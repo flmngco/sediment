@@ -58,6 +58,12 @@ NegLiveDuel EventuallyRuns
 AsyncTakeover pass
 ReadTakeover pass
 NegReadNoRecheck ShownDurable
+Destroy pass
+AsyncDestroy pass
+NegDestroyDeletes NewAfterDestroy
+NegPurgeAll RestoreOK
+NegTakeAnyGeneration NewAfterDestroy
+NegSeqFromZero RestoreOK
 NegReadRecheckGeneration ShownDurable
 NegReadRecheckSeal ShownDurable
 NegNoTakeoverSeal ShownDurable

@@ -307,6 +307,10 @@ fn replica_state(manifest: &Manifest, log: LogState) -> ReplicaState {
 /// the takeover's seal ([`restore::usable`]), and no takeover may have begun
 /// while it was read ([`restore::still_retained`]).
 pub fn stage(cfg: &S3Config, db_path: &Path) -> Result<Staged> {
+    stage_at(cfg, db_path).map_err(|err| err.at(db_path))
+}
+
+fn stage_at(cfg: &S3Config, db_path: &Path) -> Result<Staged> {
     let remote = cfg.remote()?;
     let staging = staging_path(db_path);
     let scope = format!("{}|{}", cfg.store_identity(), cfg.prefix);

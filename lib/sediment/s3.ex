@@ -265,6 +265,47 @@ defmodule Sediment.S3 do
   end
 
   @doc """
+  Destroys the database stored at the S3 location in `s3_opts`: afterwards
+  no open, replica or restore finds it, and its snapshots and log are
+  deleted. Opening the location again creates a new, empty database.
+
+  Stop every writer of the database first: like an open, destroy takes the
+  writer lease, and it returns `{:error, "s3 lease held by ..."}` while a
+  writer holds it (also one with this VM's owner name), or an error while
+  the database is open in this VM. A writer that was closed released the
+  lease; one that crashed holds it until `lease_ttl_ms` has passed.
+
+  The database is gone as soon as destroy replaces `manifest.json` with a
+  marker that there is no database, before it deletes anything: a destroy
+  that fails or is interrupted after that leaves objects behind, never an
+  older state of the database. Run it again to delete them (an open does
+  too). Two small objects stay at the prefix, holding no data: the marker
+  and `lease.json`. They keep a later database at this location apart from
+  any delayed write of the destroyed one, so don't delete them while a
+  writer of the old database may still be running.
+
+  The local files of writers and replicas are not touched; delete them
+  yourself. An open that finds a local copy with tables over a destroyed
+  database fails rather than replace it with the new, empty one.
+
+  ## Options
+
+    * `:force` - take the lease even while a writer holds it. That writer
+      is fenced: it acknowledges no further commit, and commits it has not
+      uploaded yet are lost with the database. Use it for a writer that
+      can't be stopped, not instead of waiting for a crashed one's lease.
+
+  Returns `{:ok, %{objects: n}}` with the number of objects deleted, or
+  `{:error, message}`.
+  """
+  @spec destroy(keyword() | map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def destroy(s3_opts, opts \\ []) do
+    Telemetry.span([:s3, :destroy], %{}, fn ->
+      Native.s3_destroy(s3_opts, Keyword.get(opts, :force, false))
+    end)
+  end
+
+  @doc """
   Imports the existing database file at `path` (written by SQLite or
   Sediment) into the empty S3 location in `s3_opts`, as a new database.
   Afterwards, opening any path with these `s3_opts` restores it.

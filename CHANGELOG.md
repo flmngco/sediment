@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### S3 durability
+
+* `Sediment.S3.destroy/2` deletes a database from S3 (tenant deletion,
+  erasure requests): it takes the writer lease (refusing a running writer
+  unless `force: true`), replaces the manifest with a marker that there is
+  no database, then deletes the snapshots and the log. A destroy that stops
+  half way never leaves an older state of the database behind; opening the
+  location again creates a new, empty database. 0.1.0-beta.1 refuses to
+  open a destroyed prefix.
+* An open, import or destroy that finds the prefix written under a newer
+  writer lease than its own fails as fenced instead of building on it.
+* Local I/O errors of S3 opens, restores, imports and replica refreshes
+  name the database file (`"s3 local io: /data/t1.db: No such file or
+  directory"`).
+
 ### Fixed
 
 * Distinct database files could share one MVCC log: turso_core names it
