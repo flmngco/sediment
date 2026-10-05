@@ -60,6 +60,7 @@ ReadTakeover pass
 NegReadNoRecheck ShownDurable
 Destroy pass
 AsyncDestroy pass
+ReadDestroy pass
 NegDestroyDeletes NewAfterDestroy
 NegPurgeAll RestoreOK
 NegTakeAnyGeneration NewAfterDestroy

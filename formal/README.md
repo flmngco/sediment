@@ -43,8 +43,8 @@ Commits go on while the snapshot publication is pending (a failed snapshot uploa
 retried later); the snapshot is uploaded from the checkpoint's image of the DB file
 (`img`), which later commits and checkpoints don't change (`LiveSnapshot` uploads the live
 state instead and breaks `RestoreOK`). Backpressure (`max_lag_ms`, `max_pending_bytes`) bounds the lag and is not modelled; it only
-delays commits. Checked: `AsyncSole` 72,594 states, `AsyncSoleDelays` 150,536, `AsyncTakeover`
-19,743,264 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
+delays commits. Checked: `AsyncSole` 74,596 states, `AsyncSoleDelays` 155,710, `AsyncTakeover`
+9,782,967 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
 `RestoreCommitted` and `SoleNeverFenced`; the sync configs pass `RestoreCommitted` too.
 
 `Patches` switch on negative controls. Each must break a property; the table records it.
@@ -85,8 +85,9 @@ delays commits. Checked: `AsyncSole` 72,594 states, `AsyncSoleDelays` 150,536, `
 | `NegReadRecheckSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `RecheckSeal` (a log that ended at its seal passes the second read even if the epoch moved on) | `ShownDurable` violated |
 | `NegNoTakeoverSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `NoTakeoverSeal` | `ShownDurable` violated |
 | `NegReadTransitional` | 2 (late writes, 1 fault), 2 reads, retain 1 | `ReadTransitional`, `NoTakeoverSeal` (use a takeover's manifest before its seal) | `ShownDurable` violated |
-| `Destroy` | 2 (late writes, 1 fault), 1 destroy each | none | pass |
-| `AsyncDestroy` | 2 (late writes, 1 fault), async, 1 destroy each | none | pass |
+| `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (4,954,786 states) |
+| `AsyncDestroy` | as `Destroy`, async | none | pass (8,926,692 states) |
+| `ReadDestroy` | as `Destroy`, no kill, 1 read | none | pass (5,858,315 states) |
 | `NegDestroyDeletes` | 1 (late writes), 1 destroy | `DestroyDeletes` (delete the manifest instead of a tombstone) | `NewAfterDestroy` violated |
 | `NegPurgeAll` | 2 (late writes, 1 fault), 1 destroy each | `PurgeAll` (purge ignoring the generation) | `RestoreOK` violated |
 | `NegTakeAnyGeneration` | 2 (late writes, 1 fault), 1 destroy each | `TakeAnyGeneration` (an open builds on a manifest or tombstone of a newer lease) | `NewAfterDestroy` violated |
@@ -103,11 +104,19 @@ deletes the dead objects, refuses if anything else but its own first snapshot is
 and bootstraps with `If-Match` on the tombstone, its first epoch after the tombstone's
 sequence number. Readers treat a tombstone as no database.
 
+The destroy configs are small (one commit and one open per host): the purge's deletes in
+any order multiply the states, and a version with two of each did not finish in the disk
+space available (over 80M states).
+
 When a tombstone lands (also late), the ghosts restart: `acked`, `committed` and `shown`
 are emptied, since the destroyed data is meant to go. The properties then catch any history
 from before the destroy coming back. `NewAfterDestroy` adds that a database after a destroy
 is one started after it: its epoch's generation is above the last tombstone's.
 `ManifestForward` holds across destroys (the tombstone keeps the sequence number).
+
+The generation rule also applies without destroys: an open whose lease is older than the
+manifest it reads refuses. That only removes behaviours (stale opens), which is why the
+two-writer configs have fewer states than before it.
 
 The negative controls are the designs this replaced, or the rules it needs. Deleting the
 manifest instead lets an interrupted bootstrap's late create-only manifest land after the
@@ -215,7 +224,7 @@ so a read of a collected past epoch fails at the snapshot download; in the code 
 epoch's delta chain can keep that snapshot (the model has no chains), so the code checks
 past epochs too.
 
-Checked: `ReadTakeover` 51,829,188 states, about 46 minutes. Run the reader configs with `JAVA_TOOL_OPTIONS=-Xmx3g` on a machine
+Checked: `ReadTakeover` 35,635,932 states. Run the reader configs with `JAVA_TOOL_OPTIONS=-Xmx3g` on a machine
 with less than 24 GB (`ReadTakeover` keeps millions of states queued).
 
 ### Reachability
