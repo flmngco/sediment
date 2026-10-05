@@ -1973,6 +1973,18 @@ defmodule Sediment.S3Test do
       refute File.exists?(Path.join(dir, "rest.db-log"))
     end
 
+    test "a writer restarts with an export of its database next to it", %{s3: s3, dir: dir} do
+      path = Path.join(dir, "exported.db")
+      {:ok, db} = Engine.open(path, s3: s3, encryption: false)
+      :ok = Engine.execute(db, "CREATE TABLE t (v); INSERT INTO t VALUES (1)")
+      :ok = Engine.close(db)
+      {:ok, _} = Sediment.export_sqlite(path, Path.join(dir, "exported.sqlite"))
+
+      {:ok, db} = Engine.open(path, s3: s3, encryption: false)
+      assert count(db, "t") == 1
+      :ok = Engine.close(db)
+    end
+
     test "import refuses a source whose log belongs to another file", %{s3: s3, dir: dir} do
       File.cp!(Path.join(dir, "app.1"), Path.join(dir, "app.2"))
 

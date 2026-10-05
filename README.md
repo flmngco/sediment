@@ -369,10 +369,12 @@ instead of faking it.
   table-level `FOREIGN KEY (parent_id)` is refused by both engines.
 * **MVCC log names.** turso_core names a database's MVCC log after the file
   without its extension, so `app.1` and `app.2` (or `app.db` and
-  `app.sqlite`) would share `app.db-log`. MVCC and S3 opens, switches to
-  MVCC, S3 restores, imports and exports refuse a database file whose log
-  another database file in the directory maps to; give database files
-  distinct names before the last dot (`app-1.db`, `app-2.db`).
+  `app.sqlite`) would share `app.db-log`. Opening an MVCC database is
+  refused while another MVCC database file maps to its log, and creating or
+  switching to one while any other database file does (an export or backup
+  next to an existing database is fine). Give database files distinct names
+  before the last dot (`app-1.db`, `app-2.db`); see the Turso extensions
+  guide for symlinks, `ATTACH` and hard links.
 * **Recursive triggers.** `PRAGMA recursive_triggers = on` is accepted, but
   turso_core 0.8.1 fires a trigger once instead of recursing.
 * **Infinite floats** (`SELECT 1e999`) are returned as `:inf` and `:"-inf"`,

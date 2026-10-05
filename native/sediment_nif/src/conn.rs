@@ -410,6 +410,7 @@ fn run_script_resumable(
                 let parsed = stmt::guarded(res, || conn.consume_stmt(remaining))?;
                 match parsed {
                     Ok(Some((statement, consumed))) => {
+                        crate::mvcc_guard::check_attach(res, conn, &remaining[..consumed])?;
                         let switches = crate::mvcc_guard::requests_mvcc(&remaining[..consumed]);
                         remaining = &remaining[consumed..];
                         res.note_start(conn, stmt::writes(&statement));

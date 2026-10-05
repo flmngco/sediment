@@ -26,9 +26,12 @@
   after the file without its extension, so `app.1` and `app.2` both used
   `app.db-log`, replaying and truncating each other's commits, and an S3
   bootstrap of one deleted the other's log. MVCC and S3 opens, switches to
-  MVCC, S3 restores, imports and exports now refuse a database file whose
-  log another database file in its directory (or one open in the VM) maps
-  to, and say which.
+  MVCC, S3 restores, imports, exports and `ATTACH` now refuse a database
+  file whose log another database file in its directory (or one open in
+  the VM) maps to, and say which. An existing MVCC database is only refused
+  for another MVCC file (not for an export or backup next to it). Log names
+  are compared ignoring case, and a symlinked database is checked next to
+  the file it points to. `ATTACH` needs a literal file name.
 * Opening a database that another OS process has open failed with only
   turso's "Failed locking file ... File is locked by another process". The
   error now says the database is open in another OS process (turso_core

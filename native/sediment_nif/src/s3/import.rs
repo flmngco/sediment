@@ -127,7 +127,7 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     require_encryption_choice(cfg, &remote)?;
     // The source's log is copied with it: it must be the source's own.
     let _log = crate::log_guard::is_mvcc_file(source)
-        .then(|| crate::log_guard::claim(source))
+        .then(|| crate::log_guard::claim(source, crate::log_guard::Use::Existing))
         .transpose()
         .map_err(S3Error::Config)?;
     let size = check_source(source)?;

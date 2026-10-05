@@ -455,6 +455,9 @@ fn prepare<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, sql: String) -> Term<'a>
     let Some(handle) = guard.as_ref() else {
         return closed(env);
     };
+    if let Err(step) = crate::mvcc_guard::check_attach(&res, &handle.conn, &sql) {
+        return step.into_error(env);
+    }
     if crate::mvcc_guard::requests_mvcc(&sql) {
         if let Err(step) = crate::mvcc_guard::check_switch(&res, &handle.conn) {
             return step.into_error(env);

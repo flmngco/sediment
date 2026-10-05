@@ -60,13 +60,32 @@ In MVCC mode Turso keeps a logical log next to the database, named by
 replacing the file extension with `.db-log`. Database files in one directory
 that differ only after their last dot (`app.db` and `app.sqlite`, or `app.1`
 and `app.2`) would share `app.db-log`, and each would replay, checkpoint and
-truncate the other's commits. Sediment refuses that: an MVCC open of such a
-file, a switch to MVCC, an S3 open or restore at such a path, and an export
-or S3 import of such a source fail with `"... would share its MVCC log ..."`
-while another database file with the same name before the last dot exists,
-or while one is open in the VM. Give each database file its own base name
-(`app-1.db`, `app-2.db`). A log is not empty after a clean close, so rename
-a database together with its `.db-log` file, and only while it is closed.
+truncate the other's commits. Sediment refuses that with
+`"... would share its MVCC log ..."`:
+
+* Opening an existing MVCC database (also an S3 database's local copy, an
+  `ATTACH`, or the source of an export or S3 import) fails while another MVCC
+  database file with the same name before the last dot exists (a copy of
+  it, say), or while a database open in the VM under another name uses the
+  log. WAL and legacy files with that name, such as an export or a backup,
+  don't count: they never read the log.
+* Creating, restoring or switching a database to MVCC there also fails while
+  any other database file has that name, since that file couldn't be opened
+  next to the new log anymore.
+
+Give each database file its own base name (`app-1.db`, `app-2.db`). Names
+are compared ignoring case, as on macOS and Windows volumes. For a symlink,
+the log is next to the file it points to, and that is where the check looks.
+`ATTACH` needs its file name as a literal (`ATTACH 'app.db' AS app`), so
+the check can find the file.
+
+A log is not empty after a clean close, so rename a database together with
+its `.db-log` file, and only while it is closed. Two names for one file
+are not covered: a hard link (`ln app.db other.db`) is one database with two
+log names, and commits in one log aren't seen through the other name. Two
+OS processes creating clashing MVCC databases at the same moment aren't
+covered either (the check runs per process); once one exists, the other is
+refused.
 
 ## Encryption
 

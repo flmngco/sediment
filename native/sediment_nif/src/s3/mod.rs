@@ -348,7 +348,8 @@ pub fn restore_to(cfg: &S3Config, local_path: &Path, target: Target) -> Result<R
 
 fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Restored> {
     cfg.validate()?;
-    let _log = crate::log_guard::claim(local_path).map_err(S3Error::Config)?;
+    let _log =
+        crate::log_guard::claim(local_path, crate::log_guard::Use::New).map_err(S3Error::Config)?;
     let remote = cfg.remote()?;
     // Like a replica's refresh (see replica::stage): only a log the writer
     // still owned after it was listed.

@@ -163,10 +163,16 @@ impl<'a> OpenConfig<'a> {
             .encryption(self.encryption.clone());
 
         // Before an S3 restore writes the MVCC log or turso replays it.
-        let log_claim = if !self.is_memory()
-            && (self.s3.is_some() || crate::log_guard::is_mvcc_file(Path::new(&self.path)))
-        {
-            Some(crate::log_guard::claim(Path::new(&self.path))?)
+        let path = Path::new(&self.path);
+        let log_claim = if self.is_memory() {
+            None
+        } else if crate::log_guard::is_mvcc_file(path) {
+            Some(crate::log_guard::claim(
+                path,
+                crate::log_guard::Use::Existing,
+            )?)
+        } else if self.s3.is_some() {
+            Some(crate::log_guard::claim(path, crate::log_guard::Use::New)?)
         } else {
             None
         };

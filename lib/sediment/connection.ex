@@ -97,8 +97,10 @@ defmodule Sediment.Connection do
       mode (and with `:s3`) the database's log is named after the file
       without its extension (`app.db` uses `app.db-log`), so database files
       in one directory need distinct names before the last dot: `app.1` and
-      `app.2`, or `app.db` and `app.sqlite`, would share a log, and opening
-      one of them in MVCC mode is refused while the other exists.
+      `app.2`, or `app.db` and `app.sqlite`, would share a log. Opening an
+      MVCC database is refused while another MVCC database file maps to its
+      log, and creating or switching to one while any other database file
+      does (see the Turso extensions guide).
     * `:default_transaction_mode` - one of `deferred` (default), `immediate`,
       `exclusive` or `concurrent`. If a mode is not specified in a call to
       `Repo.transaction/2`, this will be the default transaction mode.

@@ -128,4 +128,70 @@ defmodule Sediment.MvccLogTest do
     assert File.exists?(Path.join(dir, "app-1.db-log"))
     assert File.exists?(Path.join(dir, "app-2.db-log"))
   end
+
+  test "an export or backup next to an MVCC database doesn't lock it out", %{dir: dir} do
+    first = mvcc_db(Path.join(dir, "app.db"))
+    {:ok, _} = Sediment.export_sqlite(first, Path.join(dir, "app.sqlite"))
+    File.cp!(Path.join(dir, "app.sqlite"), Path.join(dir, "app.bak"))
+
+    assert_intact(first)
+
+    # A new MVCC database there would: the export couldn't be opened next to
+    # its log anymore.
+    Enum.each([first, first <> "-wal", Path.join(dir, "app.db-log")], &File.rm/1)
+    assert {:error, message} = Engine.open(first, journal_mode: :mvcc)
+    assert message =~ "would share its MVCC log"
+  end
+
+  test "a symlink to an MVCC database is checked where its log is", %{dir: dir} do
+    releases = Path.join(dir, "releases")
+    File.mkdir_p!(releases)
+    first = mvcc_db(Path.join(releases, "app.1"))
+    File.ln_s!(first, Path.join(dir, "one.db"))
+    {:ok, one} = Engine.open(Path.join(dir, "one.db"))
+    :ok = Engine.execute(one, "insert into t values ('c')")
+
+    File.cp!(first, Path.join(releases, "app.2"))
+    File.ln_s!(Path.join(releases, "app.2"), Path.join(dir, "two.db"))
+    assert {:error, message} = Engine.open(Path.join(dir, "two.db"))
+    assert message =~ "would share its MVCC log #{Path.join(releases, "app.db-log")}"
+
+    :ok = Engine.close(one)
+    File.rm!(Path.join(releases, "app.2"))
+    {:ok, conn} = Engine.open(first)
+    assert [["a"], ["b"], ["c"]] = query(conn, "select v from t order by v")
+    :ok = Engine.close(conn)
+  end
+
+  describe "ATTACH" do
+    setup %{dir: dir} do
+      {:ok, main} =
+        Engine.open(Path.join(dir, "main.db"), journal_mode: :mvcc, experimental: [:attach])
+
+      on_exit(fn -> Engine.close(main) end)
+      %{main: main}
+    end
+
+    test "of a file whose log another database uses is refused", %{dir: dir, main: main} do
+      first = mvcc_db(Path.join(dir, "app.1"))
+      :ok = Engine.execute(main, "ATTACH '#{first}' AS a")
+      :ok = Engine.execute(main, "insert into a.t values ('c')")
+      File.cp!(first, Path.join(dir, "app.2"))
+
+      assert {:error, message} = Engine.execute(main, "ATTACH '#{Path.join(dir, "app.2")}' AS b")
+      assert message =~ shared_log_error(dir, "app.2", "app.1")
+      {:ok, stmt} = Engine.prepare(main, "select 1")
+      :ok = Engine.release(main, stmt)
+      assert {:error, ^message} = Engine.prepare(main, "ATTACH '#{Path.join(dir, "app.2")}' AS b")
+    end
+
+    test "needs a literal file name", %{dir: dir, main: main} do
+      assert {:error, "ATTACH needs its file name as a string literal" <> _} =
+               Engine.prepare(main, "ATTACH ? AS a")
+
+      mvcc_db(Path.join(dir, "ok.db"))
+      :ok = Engine.execute(main, "ATTACH 'file:#{Path.join(dir, "ok.db")}' AS ok")
+      assert [["a"], ["b"]] = query(main, "select v from ok.t order by v")
+    end
+  end
 end
