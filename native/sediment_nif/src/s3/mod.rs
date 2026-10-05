@@ -72,6 +72,7 @@ pub fn prepare_with_io(
 }
 
 fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Arc<S3DurableStorage>> {
+    refuse_symlink(local_path)?;
     cfg.validate()?;
     let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let key = canonical_key(local_path)?;
@@ -342,11 +343,29 @@ pub struct Restored {
 /// [`Target::Epoch`] this is point-in-time restore over the epochs the
 /// manifest retains (`retain_epochs`). The result is folded into one file
 /// that plain turso (or `Sediment.Engine.open/2` without `:s3`) opens.
+/// A restore renames a new file over the local path. Over a symlink, that
+/// replaces the link and leaves the file it pointed to behind, with the MVCC
+/// log next to it that the restored database would use too.
+fn refuse_symlink(path: &Path) -> Result<()> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(S3Error::Config(format!(
+            "{} is a symlink: an S3 database's local path must be the file itself, since \
+             a restore replaces it. Use the path the link points to",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub fn restore_to(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Restored> {
     restore_into(cfg, local_path, target).map_err(|err| err.at(local_path))
 }
 
 fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Restored> {
+    refuse_symlink(local_path)?;
     cfg.validate()?;
     let _log =
         crate::log_guard::claim(local_path, crate::log_guard::Use::New).map_err(S3Error::Config)?;

@@ -156,6 +156,22 @@ impl<'a> OpenConfig<'a> {
         } else {
             Arc::new(PlatformIO::new().map_err(|e| e.to_string())?)
         };
+        // See log_guard: a database that can ATTACH is never MVCC.
+        let attach = self.experimental.iter().any(|feature| feature == "attach");
+        let io: Arc<dyn IO> = if attach {
+            let mvcc = self.s3.is_some()
+                || self
+                    .journal_mode
+                    .as_ref()
+                    .is_some_and(|m| m.contains("mvcc"))
+                || crate::log_guard::is_mvcc_file(Path::new(&self.path));
+            if mvcc {
+                return Err(crate::log_guard::ATTACH_WITHOUT_MVCC.into());
+            }
+            Arc::new(crate::log_guard::NoMvccLogs(io))
+        } else {
+            io
+        };
 
         let mut options = OpenOptions::new(Arc::new(SqliteDialect))
             .flags(self.flags())

@@ -83,6 +83,9 @@ pub struct ConnRes {
     /// A file database (not in memory, not a replica): its path as opened
     /// and the database, so a switch to MVCC can claim the log.
     pub file: Option<(String, Weak<Database>)>,
+    /// The database was opened with `experimental: [:attach]`, so it may not
+    /// switch to MVCC (see `log_guard`).
+    pub attach: bool,
 }
 
 /// See `ConnRes::commit_mark`.
@@ -184,6 +187,7 @@ impl ConnRes {
             pending_script: Mutex::new(None),
             commit_mark: Mutex::new(CommitMark::default()),
             file: None,
+            attach: false,
         }
     }
 
@@ -410,7 +414,6 @@ fn run_script_resumable(
                 let parsed = stmt::guarded(res, || conn.consume_stmt(remaining))?;
                 match parsed {
                     Ok(Some((statement, consumed))) => {
-                        crate::mvcc_guard::check_attach(res, conn, &remaining[..consumed])?;
                         let switches = crate::mvcc_guard::requests_mvcc(&remaining[..consumed]);
                         remaining = &remaining[consumed..];
                         res.note_start(conn, stmt::writes(&statement));
@@ -604,6 +607,7 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
         commit_mark: Mutex::new(CommitMark::default()),
         file: (!config.is_memory() && opened.replica.is_none())
             .then(|| (config.path.clone(), Arc::downgrade(&opened.db))),
+        attach: opened.db.experimental_attach_enabled(),
     };
 
     if let Some(mode) = &config.journal_mode {

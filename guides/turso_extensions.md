@@ -63,8 +63,8 @@ and `app.2`) would share `app.db-log`, and each would replay, checkpoint and
 truncate the other's commits. Sediment refuses that with
 `"... would share its MVCC log ..."`:
 
-* Opening an existing MVCC database (also an S3 database's local copy, an
-  `ATTACH`, or the source of an export or S3 import) fails while another MVCC
+* Opening an existing MVCC database (also an S3 database's local copy, or
+  the source of an export or S3 import) fails while another MVCC
   database file with the same name before the last dot exists (a copy of
   it, say), or while a database open in the VM under another name uses the
   log. WAL and legacy files with that name, such as an export or a backup,
@@ -76,8 +76,16 @@ truncate the other's commits. Sediment refuses that with
 Give each database file its own base name (`app-1.db`, `app-2.db`). Names
 are compared ignoring case, as on macOS and Windows volumes. For a symlink,
 the log is next to the file it points to, and that is where the check looks.
-`ATTACH` needs its file name as a literal (`ATTACH 'app.db' AS app`), so
-the check can find the file.
+An S3 writer's or `Sediment.S3.restore/3`'s local path can't be a symlink:
+a restore replaces the file at that path, which would turn the link into a
+second database next to the file it pointed to.
+
+`ATTACH` (`experimental: [:attach]`) opens the attached file's log the same
+way, so MVCC and `:attach` don't mix: a database opened with `:attach`
+can't be in MVCC mode (`journal_mode: :mvcc`, an MVCC file, `:s3`, or a
+later `PRAGMA journal_mode = 'mvcc'` are refused), and attaching an MVCC
+database fails, however the statement names the file. WAL databases attach
+as before.
 
 A log is not empty after a clean close, so rename a database together with
 its `.db-log` file, and only while it is closed. Two names for one file
@@ -187,5 +195,6 @@ costs, and `Sediment.S3` for the helpers.
 `:generated_columns`, `:without_rowid`, `:index_method`, `:custom_types`,
 `:encryption` and `:mvcc_passive_checkpoint`. These map to turso_core's
 `DatabaseOpts`. Turso shares one database instance per file within the VM,
-so the flags of the first open of a file apply to later opens.
+so the flags of the first open of a file apply to later opens. `:attach`
+can't be combined with MVCC (see "MVCC" above).
 

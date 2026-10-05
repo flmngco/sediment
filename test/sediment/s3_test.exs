@@ -1985,6 +1985,31 @@ defmodule Sediment.S3Test do
       :ok = Engine.close(db)
     end
 
+    test "a symlinked local path is refused before a restore replaces the link", %{
+      s3: s3,
+      dir: dir,
+      log: log
+    } do
+      {:ok, db} = Engine.open(Path.join(dir, "remote.db"), s3: s3, encryption: false)
+      :ok = Engine.execute(db, "CREATE TABLE t (v); INSERT INTO t VALUES (1), (2)")
+      :ok = Engine.close(db)
+      File.ln_s!(Path.join(dir, "app.1"), Path.join(dir, "app.2"))
+      bytes = File.read!(log)
+
+      assert {:error, message} = Engine.open(Path.join(dir, "app.2"), s3: s3, encryption: false)
+      assert message =~ "is a symlink"
+      # A dangling link isn't an existing file to S3.restore/3, but a restore
+      # would still replace it.
+      File.ln_s!(Path.join(dir, "missing.db"), Path.join(dir, "dangling.db"))
+      assert {:error, message} = S3.restore(Path.join(dir, "dangling.db"), s3, encryption: false)
+      assert message =~ "is a symlink"
+      refute File.exists?(Path.join(dir, "missing.db"))
+
+      assert {:ok, %File.Stat{type: :symlink}} = File.lstat(Path.join(dir, "app.2"))
+      assert File.read!(log) == bytes
+      assert_first_intact(dir)
+    end
+
     test "import refuses a source whose log belongs to another file", %{s3: s3, dir: dir} do
       File.cp!(Path.join(dir, "app.1"), Path.join(dir, "app.2"))
 

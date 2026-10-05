@@ -125,6 +125,8 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     }
     let remote = cfg.remote()?;
     require_encryption_choice(cfg, &remote)?;
+    // turso keeps a symlinked database's log next to the file it points to.
+    let source = &std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     // The source's log is copied with it: it must be the source's own.
     let _log = crate::log_guard::is_mvcc_file(source)
         .then(|| crate::log_guard::claim(source, crate::log_guard::Use::Existing))

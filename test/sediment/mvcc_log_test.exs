@@ -163,35 +163,77 @@ defmodule Sediment.MvccLogTest do
     :ok = Engine.close(conn)
   end
 
-  describe "ATTACH" do
-    setup %{dir: dir} do
-      {:ok, main} =
-        Engine.open(Path.join(dir, "main.db"), journal_mode: :mvcc, experimental: [:attach])
+  test "a symlink isn't refused for the log its own name maps to", %{dir: dir} do
+    # app.1 -> elsewhere/one.db keeps its log at elsewhere/one.db-log.
+    elsewhere = Path.join(dir, "elsewhere")
+    File.mkdir_p!(elsewhere)
+    mvcc_db(Path.join(elsewhere, "one.db"))
+    second = mvcc_db(Path.join(dir, "app.2"))
+    File.ln_s!(Path.join(elsewhere, "one.db"), Path.join(dir, "app.1"))
 
-      on_exit(fn -> Engine.close(main) end)
-      %{main: main}
+    {:ok, one} = Engine.open(Path.join(dir, "app.1"))
+    {:ok, two} = Engine.open(second)
+    :ok = Engine.close(one)
+    :ok = Engine.close(two)
+  end
+
+  # ATTACH names an attached database's log like any other: a database that
+  # can ATTACH (experimental) is never MVCC and attaches no MVCC database.
+  describe "experimental :attach" do
+    test "can't be combined with MVCC", %{dir: dir} do
+      opts = [experimental: [:attach]]
+      path = Path.join(dir, "main.db")
+
+      assert {:error, "experimental :attach can't be combined with MVCC" <> _} =
+               Engine.open(path, [journal_mode: :mvcc] ++ opts)
+
+      mvcc_db(Path.join(dir, "m.db"))
+
+      assert {:error, "experimental :attach can't be combined with MVCC" <> _} =
+               Engine.open(Path.join(dir, "m.db"), opts)
+
+      {:ok, main} = Engine.open(path, opts)
+
+      assert {:error, "experimental :attach can't be combined with MVCC" <> _} =
+               Engine.execute(main, "PRAGMA journal_mode = 'mvcc'")
+
+      assert [["wal"]] = query(main, "PRAGMA journal_mode")
+      :ok = Engine.close(main)
     end
 
-    test "of a file whose log another database uses is refused", %{dir: dir, main: main} do
+    test "attaches no MVCC database, however the SQL names it", %{dir: dir} do
       first = mvcc_db(Path.join(dir, "app.1"))
-      :ok = Engine.execute(main, "ATTACH '#{first}' AS a")
-      :ok = Engine.execute(main, "insert into a.t values ('c')")
       File.cp!(first, Path.join(dir, "app.2"))
+      second = Path.join(dir, "app.2")
+      {:ok, main} = Engine.open(Path.join(dir, "main.db"), experimental: [:attach])
+      {:ok, prepared} = Engine.prepare(main, "ATTACH '#{Path.join(dir, "later.db")}' AS l")
 
-      assert {:error, message} = Engine.execute(main, "ATTACH '#{Path.join(dir, "app.2")}' AS b")
-      assert message =~ shared_log_error(dir, "app.2", "app.1")
-      {:ok, stmt} = Engine.prepare(main, "select 1")
-      :ok = Engine.release(main, stmt)
-      assert {:error, ^message} = Engine.prepare(main, "ATTACH '#{Path.join(dir, "app.2")}' AS b")
-    end
+      for sql <- [
+            "ATTACH '#{second}' AS b",
+            "; ATTACH '#{second}' AS b",
+            "ATTACH 'file:#{String.replace(second, ".2", "%2E2")}' AS b",
+            "ATTACH 'file://localhost#{second}' AS b"
+          ] do
+        assert {:error, message} = Engine.execute(main, sql)
+        assert message =~ "experimental :attach can't be combined with MVCC", sql
+      end
 
-    test "needs a literal file name", %{dir: dir, main: main} do
-      assert {:error, "ATTACH needs its file name as a string literal" <> _} =
-               Engine.prepare(main, "ATTACH ? AS a")
+      # Prepared while later.db didn't exist; an MVCC file by the time it runs.
+      File.cp!(first, Path.join(dir, "later.db"))
+      assert {:error, message} = Engine.step(main, prepared)
+      assert message =~ "experimental :attach can't be combined with MVCC"
 
-      mvcc_db(Path.join(dir, "ok.db"))
-      :ok = Engine.execute(main, "ATTACH 'file:#{Path.join(dir, "ok.db")}' AS ok")
-      assert [["a"], ["b"]] = query(main, "select v from ok.t order by v")
+      wal = Path.join(dir, "wal.db")
+      {:ok, conn} = Engine.open(wal, journal_mode: :wal)
+      :ok = Engine.execute(conn, "create table w (v text); insert into w values ('w')")
+      :ok = Engine.close(conn)
+      :ok = Engine.execute(main, "ATTACH '#{wal}' AS w")
+      assert [["w"]] = query(main, "select v from w.w")
+      :ok = Engine.close(main)
+
+      File.rm!(second)
+      File.rm!(Path.join(dir, "later.db"))
+      assert_intact(first)
     end
   end
 end

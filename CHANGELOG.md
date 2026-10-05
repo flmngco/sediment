@@ -26,12 +26,18 @@
   after the file without its extension, so `app.1` and `app.2` both used
   `app.db-log`, replaying and truncating each other's commits, and an S3
   bootstrap of one deleted the other's log. MVCC and S3 opens, switches to
-  MVCC, S3 restores, imports, exports and `ATTACH` now refuse a database
-  file whose log another database file in its directory (or one open in
-  the VM) maps to, and say which. An existing MVCC database is only refused
-  for another MVCC file (not for an export or backup next to it). Log names
-  are compared ignoring case, and a symlinked database is checked next to
-  the file it points to. `ATTACH` needs a literal file name.
+  MVCC, S3 restores, imports and exports now refuse a database file whose
+  log another database file in its directory (or one open in the VM) maps
+  to, and say which. An existing MVCC database is only refused for another
+  MVCC file (not for an export or backup next to it). Log names are
+  compared ignoring case, and a symlinked database is checked next to the
+  file it points to.
+* `experimental: [:attach]` can't be combined with MVCC: such a database
+  can't be or become MVCC, and attaching an MVCC database fails (turso
+  names an attached database's log the same way).
+* An S3 writer's or `Sediment.S3.restore/3`'s local path can't be a
+  symlink: the restore replaced the link with a file, leaving the file it
+  pointed to as a second database on the same log.
 * Opening a database that another OS process has open failed with only
   turso's "Failed locking file ... File is locked by another process". The
   error now says the database is open in another OS process (turso_core

@@ -8,14 +8,24 @@
 //! when another database file maps to it, or when a database open in this VM
 //! under another name already uses it.
 //!
-//! turso puts the log next to the file a symlink points to; sediment's S3
-//! storage next to the path it was given. Both are claimed. Names are
-//! compared ignoring case, as on macOS and Windows volumes.
+//! turso puts the log next to the file a symlink points to (S3 databases
+//! refuse symlinked paths), so that is the log claimed. Names are compared
+//! ignoring case, as on macOS and Windows volumes.
+//!
+//! ATTACH opens the attached file through the main database's IO, and names
+//! its log the same way. A database opened with `experimental: [:attach]` is
+//! never MVCC, and its IO ([`NoMvccLogs`]) opens no MVCC log, so no attached
+//! file uses one, whatever SQL attached it.
 
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, Weak};
 
-use turso_core::Database;
+use turso_core::io::FileId;
+use turso_core::{
+    Clock, Completion, Database, File, LimboError, MemoryIO, MonotonicInstant, OpenFlags,
+    WallClockInstant, IO,
+};
 
 use crate::s3::restore::log_path;
 
@@ -46,39 +56,24 @@ impl Log {
             name: fold(&log_path(Path::new(db.file_name()?))),
         })
     }
-
-    fn path(&self, db: &Path) -> PathBuf {
-        db.file_name()
-            .map(|name| self.dir.join(log_path(Path::new(name))))
-            .unwrap_or_else(|| self.dir.join(&self.name))
-    }
 }
 
 fn fold(name: &Path) -> String {
     name.to_string_lossy().to_lowercase()
 }
 
-/// A database file (the file a symlink points to, once it exists) and the
-/// logs it may use.
-struct Keys {
-    db: PathBuf,
-    /// (the path the log is named after, the log)
-    logs: Vec<(PathBuf, Log)>,
-}
-
-/// `db`'s keys, with directories canonicalized.
-fn keys(db: &Path) -> Option<Keys> {
+/// The database file `db` names (the file a symlink points to, once it
+/// exists; otherwise the path with its directory canonicalized) and its log.
+fn keys(db: &Path) -> Option<(PathBuf, Log)> {
     let absolute = std::path::absolute(db).ok()?;
-    let given = std::fs::canonicalize(absolute.parent()?)
-        .ok()?
-        .join(absolute.file_name()?);
-    let target = std::fs::canonicalize(&absolute).unwrap_or_else(|_| given.clone());
-    let mut logs = vec![(target.clone(), Log::of(&target)?)];
-    let at_given = Log::of(&given)?;
-    if at_given != logs[0].1 {
-        logs.push((given, at_given));
-    }
-    Some(Keys { db: target, logs })
+    let target = match std::fs::canonicalize(&absolute) {
+        Ok(target) => target,
+        Err(_) => std::fs::canonicalize(absolute.parent()?)
+            .ok()?
+            .join(absolute.file_name()?),
+    };
+    let log = Log::of(&target)?;
+    Some((target, log))
 }
 
 enum Holder {
@@ -90,7 +85,7 @@ enum Holder {
 
 struct Entry {
     db: PathBuf,
-    logs: Vec<Log>,
+    log: Log,
     holder: Holder,
 }
 
@@ -108,17 +103,17 @@ static IN_USE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 /// The right to use `db`'s MVCC log while it is held (or, after
 /// [`Claim::keep_while`], while that database is open).
 pub struct Claim {
-    entry: Option<(PathBuf, Vec<Log>)>,
+    entry: Option<(PathBuf, Log)>,
     _token: Arc<()>,
 }
 
 impl Claim {
     /// Keeps the log reserved for as long as `database` is open.
     pub fn keep_while(self, database: &Arc<Database>) {
-        if let Some((db, logs)) = self.entry.clone() {
+        if let Some((db, log)) = self.entry.clone() {
             crate::conn::lock(&IN_USE).push(Entry {
                 db,
-                logs,
+                log,
                 holder: Holder::Database(Arc::downgrade(database)),
             });
         }
@@ -131,44 +126,31 @@ pub fn claim(db: &Path, purpose: Use) -> Result<Claim, String> {
     let token = Arc::new(());
     // Without a resolvable directory there is nothing to share; the open or
     // restore reports the path itself.
-    let Some(keys) = keys(db) else {
+    let Some((target, log)) = keys(db) else {
         return Ok(Claim {
             entry: None,
             _token: token,
         });
     };
-    let logs: Vec<Log> = keys.logs.iter().map(|(_, log)| log.clone()).collect();
     let mut in_use = crate::conn::lock(&IN_USE);
     in_use.retain(Entry::live);
-    for (named, log) in &keys.logs {
-        if let Some(other) = in_use
-            .iter()
-            .find(|e| e.db != keys.db && e.logs.contains(log))
-        {
-            return Err(conflict(
-                db,
-                &other.db,
-                &log.path(named),
-                "is open in this VM",
-            ));
-        }
+    if let Some(other) = in_use.iter().find(|e| e.db != target && e.log == log) {
+        return Err(conflict(db, &other.db, &target, "is open in this VM"));
     }
     // A database open here was checked when it opened: a database file added
     // next to it since is refused when it claims the log.
-    if !in_use.iter().any(|e| e.db == keys.db) {
-        for (named, log) in &keys.logs {
-            if let Some(other) = sharer(&keys.db, log, purpose) {
-                return Err(conflict(db, &other, &log.path(named), "exists"));
-            }
+    if !in_use.iter().any(|e| e.db == target) {
+        if let Some(other) = sharer(&target, &log, purpose) {
+            return Err(conflict(db, &other, &target, "exists"));
         }
     }
     in_use.push(Entry {
-        db: keys.db.clone(),
-        logs: logs.clone(),
+        db: target.clone(),
+        log: log.clone(),
         holder: Holder::Claim(Arc::downgrade(&token)),
     });
     Ok(Claim {
-        entry: Some((keys.db, logs)),
+        entry: Some((target, log)),
         _token: token,
     })
 }
@@ -179,34 +161,34 @@ pub fn explain_open_error(db: &Path, error: String) -> String {
     if !error.contains("MVCC logical log file exists") {
         return error;
     }
-    let found = keys(db).and_then(|keys| {
-        keys.logs
-            .iter()
-            .find_map(|(named, log)| Some((sharer(&keys.db, log, Use::Existing)?, log.path(named))))
-    });
+    let found =
+        keys(db).and_then(|(target, log)| Some((sharer(&target, &log, Use::Existing)?, target)));
     match found {
-        Some((other, log)) => format!("{error} ({})", conflict(db, &other, &log, "exists")),
+        Some((other, target)) => format!("{error} ({})", conflict(db, &other, &target, "exists")),
         None => error,
     }
 }
 
-fn conflict(db: &Path, other: &Path, log: &Path, how: &str) -> String {
+/// `db` (the file `target`) would share its log with `other`.
+fn conflict(db: &Path, other: &Path, target: &Path, how: &str) -> String {
     format!(
         "{} would share its MVCC log {} with {}, which {how}: turso names the log after \
          the database file without its extension. Give each database file its own name \
          before the last dot (app-1.db and app-2.db, not app.1 and app.2)",
         db.display(),
-        log.display(),
+        log_path(target).display(),
         other.display()
     )
 }
 
 /// Another database file in `log`'s directory whose log is `log` (for
-/// [`Use::Existing`], only an MVCC one). `db` itself, under any name, isn't.
+/// [`Use::Existing`], only an MVCC one). `db` itself, under any name, isn't,
+/// and neither is a symlink: its file's log is next to that file.
 fn sharer(db: &Path, log: &Log, purpose: Use) -> Option<PathBuf> {
     std::fs::read_dir(&log.dir)
         .ok()?
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()))
         .filter(|entry| fold(&log_path(Path::new(&entry.file_name()))) == log.name)
         .map(|entry| entry.path())
         .filter(|path| std::fs::canonicalize(path).map_or(true, |real| real != db))
@@ -214,6 +196,105 @@ fn sharer(db: &Path, log: &Log, purpose: Use) -> Option<PathBuf> {
             Use::Existing => is_mvcc_file(path),
             Use::New => is_database(path),
         })
+}
+
+/// Why a database opened with `experimental: [:attach]` uses no MVCC.
+pub const ATTACH_WITHOUT_MVCC: &str =
+    "experimental :attach can't be combined with MVCC: a database opened with :attach \
+     can't be in MVCC mode (no journal_mode mvcc, no :s3), and can't attach an MVCC \
+     database, because turso would name the attached database's MVCC log after its file \
+     without the extension, which may be another database's log";
+
+/// The IO of a database opened with `experimental: [:attach]`: it opens no
+/// MVCC log (see the module docs).
+pub struct NoMvccLogs(pub Arc<dyn IO>);
+
+impl NoMvccLogs {
+    fn check(path: &str) -> turso_core::Result<()> {
+        if fold(Path::new(path)).ends_with(".db-log") {
+            return Err(LimboError::InvalidArgument(ATTACH_WITHOUT_MVCC.into()));
+        }
+        Ok(())
+    }
+}
+
+impl Clock for NoMvccLogs {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.0.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.0.current_time_wall_clock()
+    }
+}
+
+impl IO for NoMvccLogs {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn File>> {
+        Self::check(path)?;
+        self.0.open_file(path, flags, direct)
+    }
+
+    fn open_shared_wal_file(&self, path: &str) -> turso_core::Result<Arc<dyn File>> {
+        Self::check(path)?;
+        self.0.open_shared_wal_file(path)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.0.remove_file(path)
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        self.0.supports_shared_wal_coordination()
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.0.step()
+    }
+
+    fn cancel(&self, c: &[Completion]) -> turso_core::Result<()> {
+        self.0.cancel(c)
+    }
+
+    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.0.drain_completions(completions)
+    }
+
+    fn wait_for_completion(&self, c: Completion) -> turso_core::Result<()> {
+        self.0.wait_for_completion(c)
+    }
+
+    fn generate_random_number(&self) -> i64 {
+        self.0.generate_random_number()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.0.fill_bytes(dest)
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        self.0.get_memory_io()
+    }
+
+    fn register_fixed_buffer(&self, ptr: NonNull<u8>, len: usize) -> turso_core::Result<u32> {
+        self.0.register_fixed_buffer(ptr, len)
+    }
+
+    fn yield_now(&self) {
+        self.0.yield_now()
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        self.0.sleep(duration)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
+        self.0.file_id(path)
+    }
 }
 
 /// Whether `path` is a database file (SQLite's header, or turso's encrypted
@@ -380,6 +461,38 @@ mod tests {
             err.contains(&v.join("app.1").display().to_string()),
             "{err}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_doesnt_share_the_log_its_own_name_maps_to() {
+        // app.1 -> v/one.db uses v/one.db-log; app.2 uses app.db-log.
+        let dir = dir();
+        let v = dir.join("v");
+        std::fs::create_dir_all(&v).unwrap();
+        mvcc(&v.join("one.db"));
+        mvcc(&dir.join("app.2"));
+        std::os::unix::fs::symlink(v.join("one.db"), dir.join("app.1")).unwrap();
+        let one = claim(&dir.join("app.1"), Use::Existing).expect("app.1");
+        let two = claim(&dir.join("app.2"), Use::Existing).expect("app.2");
+        drop((one, two));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_attach_io_opens_no_mvcc_log() {
+        let dir = dir();
+        let io = NoMvccLogs(Arc::new(MemoryIO::new()));
+        for log in ["app.db-log", "APP.DB-LOG"] {
+            let path = dir.join(log).display().to_string();
+            assert!(
+                io.open_file(&path, OpenFlags::Create, false).is_err(),
+                "{log}"
+            );
+        }
+        let path = dir.join("app.db").display().to_string();
+        assert!(io.open_file(&path, OpenFlags::Create, false).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

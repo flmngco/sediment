@@ -49,6 +49,7 @@ defmodule Sediment.Engine do
     * `:experimental` - list of experimental turso features to enable, such
       as `:attach`, `:views`, `:vacuum`, `:generated_columns`,
       `:without_rowid`, `:index_method`, `:custom_types`, `:autovacuum`.
+      `:attach` can't be combined with MVCC (see the Turso extensions guide).
 
     * `:s3` - S3 durability configuration (turso extension).
 

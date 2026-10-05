@@ -374,7 +374,8 @@ instead of faking it.
   switching to one while any other database file does (an export or backup
   next to an existing database is fine). Give database files distinct names
   before the last dot (`app-1.db`, `app-2.db`); see the Turso extensions
-  guide for symlinks, `ATTACH` and hard links.
+  guide for symlinks, hard links, and `experimental: [:attach]`, which
+  can't be combined with MVCC.
 * **Recursive triggers.** `PRAGMA recursive_triggers = on` is accepted, but
   turso_core 0.8.1 fires a trigger once instead of recursing.
 * **Infinite floats** (`SELECT 1e999`) are returned as `:inf` and `:"-inf"`,
