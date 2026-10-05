@@ -386,3 +386,16 @@ fn s3_destroy<'a>(env: Env<'a>, opts: Term<'a>, force: bool) -> Term<'a> {
         Err(err) => error_tuple(env, describe(&err)),
     }
 }
+
+/// Whether the prefix holds a database (see `s3::exists`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_exists<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match s3::exists(&config) {
+        Ok(exists) => ok_tuple(env, exists),
+        Err(err) => error_tuple(env, describe(&err)),
+    }
+}

@@ -109,6 +109,28 @@ defmodule Sediment.S3Test do
     assert {:ok, _} = S3.destroy(s3, force: true)
   end
 
+  test "exists?/1 and must_exist: true", %{s3: s3, dir: dir} do
+    refute S3.exists?(s3)
+    strict = Keyword.put(s3, :must_exist, true)
+    assert {:error, message} = Engine.open(Path.join(dir, "a.db"), s3: strict)
+    assert message =~ "no database at s3://"
+    assert message =~ "(must_exist: true)"
+    refute S3.exists?(s3)
+
+    {:ok, db} = Engine.open(Path.join(dir, "a.db"), s3: s3)
+    :ok = Engine.close(db)
+    assert S3.exists?(s3)
+    {:ok, db} = Engine.open(Path.join(dir, "b.db"), s3: strict)
+    :ok = Engine.close(db)
+
+    assert {:ok, _} = S3.destroy(s3)
+    refute S3.exists?(s3)
+
+    assert_raise Sediment.Error, ~r/s3/, fn ->
+      S3.exists?(Keyword.put(s3, :endpoint, "http://127.0.0.1:1"))
+    end
+  end
+
   test "destroy/2 refuses a writer's unexpired lease unless forced", %{
     prefix: prefix,
     dir: dir

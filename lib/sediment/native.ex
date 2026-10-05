@@ -179,6 +179,9 @@ defmodule Sediment.Native do
   def s3_import(_path, _opts, _verify, _encryption, _source_encryption),
     do: :erlang.nif_error(:not_loaded)
 
+  @spec s3_exists(keyword() | map()) :: {:ok, boolean()} | {:error, reason()}
+  def s3_exists(_opts), do: :erlang.nif_error(:not_loaded)
+
   @spec s3_destroy(keyword() | map(), boolean()) :: {:ok, map()} | {:error, reason()}
   def s3_destroy(_opts, _force), do: :erlang.nif_error(:not_loaded)
 

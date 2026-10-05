@@ -179,6 +179,11 @@ fn prepare_fresh(
     io: Arc<dyn IO>,
 ) -> Result<Arc<S3DurableStorage>> {
     let remote = cfg.remote()?;
+    // Before anything is written (the probe, the lease): a mistyped bucket
+    // or prefix gets nothing. Checked again under the lease below.
+    if cfg.must_exist && restore::read_manifest(&remote)?.is_none() {
+        return Err(no_database(cfg));
+    }
     require_encryption_choice(cfg, &remote)?;
     remove_snapshot_images(local_path);
     if cfg.verify_conditional_writes {
@@ -194,6 +199,9 @@ fn prepare_fresh(
     };
     if let Some((state, _)) = &current {
         refuse_newer(state.generation(), generation)?;
+    }
+    if cfg.must_exist && !matches!(current, Some((ManifestState::Database(_), _))) {
+        return Err(no_database(cfg));
     }
     let (manifest, version, published) = match current {
         Some((ManifestState::Database(decoded), object_version)) => {
@@ -536,6 +544,20 @@ fn check_no_old_objects(remote: &remote::Remote, tombstone: Option<&Tombstone>) 
         )));
     }
     Ok(())
+}
+
+/// Whether the prefix holds a database (not none yet, not destroyed),
+/// without taking the lease or writing anything.
+pub fn exists(cfg: &S3Config) -> Result<bool> {
+    cfg.validate()?;
+    Ok(restore::read_manifest(&cfg.remote()?)?.is_some())
+}
+
+fn no_database(cfg: &S3Config) -> S3Error {
+    S3Error::Config(format!(
+        "no database at s3://{}/{} (must_exist: true)",
+        cfg.bucket, cfg.prefix
+    ))
 }
 
 /// A manifest or tombstone written under a lease generation at least ours:

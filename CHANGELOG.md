@@ -11,6 +11,9 @@
   half way never leaves an older state of the database behind; opening the
   location again creates a new, empty database. 0.1.0-beta.1 refuses to
   open a destroyed prefix.
+* `Sediment.S3.exists?/1` tells whether a location holds a database, and
+  the `must_exist: true` S3 option makes a writer open fail, writing
+  nothing, instead of creating an empty database where there is none.
 * An open, import or destroy that finds the prefix written under a newer
   writer lease than its own fails as fenced instead of building on it.
 * Local I/O errors of S3 opens, restores, imports and replica refreshes

@@ -63,6 +63,9 @@ pub struct S3Config {
     /// Check at open that the store enforces If-None-Match / If-Match (a
     /// store that ignores them can't fence writers).
     pub verify_conditional_writes: bool,
+    /// A writer open fails instead of creating a new database when the
+    /// prefix holds none (empty, or destroyed).
+    pub must_exist: bool,
     /// Open a read-only replica: restore without the lease, never write to S3.
     pub replica: bool,
     /// The database's encryption (cipher and hex key), from the `:encryption`
@@ -117,6 +120,7 @@ impl S3Config {
             max_pending_bytes: 16 * 1024 * 1024,
             close_timeout: Duration::from_secs(10),
             verify_conditional_writes: true,
+            must_exist: false,
             replica: false,
             encryption: None,
             unencrypted: false,
@@ -178,6 +182,7 @@ impl S3Config {
                     cfg.close_timeout = Duration::from_millis(parse_num(&key, &value)?)
                 }
                 "verify_conditional_writes" => cfg.verify_conditional_writes = parse_bool(&value)?,
+                "must_exist" => cfg.must_exist = parse_bool(&value)?,
                 // Forwarded from the top-level `encryption: false` open option.
                 "encryption" => {
                     if parse_bool(&value)? {

@@ -299,3 +299,27 @@ fn an_open_with_an_older_lease_than_the_tombstone_refuses() {
     }
     assert!(matches!(state(&store), ManifestState::Destroyed(_)));
 }
+
+#[test]
+fn exists_and_must_exist_tell_a_database_from_none() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let mut strict = config(&store, "a");
+    strict.must_exist = true;
+    assert!(!crate::s3::exists(&config(&store, "x")).unwrap());
+    match open_db(&strict, &dir.db("a.db")) {
+        Err(S3Error::Config(msg)) => assert!(msg.contains("must_exist"), "{msg}"),
+        Err(other) => panic!("expected a config error, got {other}"),
+        Ok(_) => panic!("must_exist must not create a database"),
+    }
+    // Nothing written: no lease, no probe leftovers.
+    assert!(store.put_log().is_empty(), "{:?}", store.put_log());
+
+    drop(open_db(&config(&store, "a"), &dir.db("a.db")).unwrap());
+    assert!(crate::s3::exists(&config(&store, "x")).unwrap());
+    drop(open_db(&strict, &dir.db("b.db")).unwrap());
+
+    destroy(&config(&store, "d"), false).unwrap();
+    assert!(!crate::s3::exists(&config(&store, "x")).unwrap());
+    assert!(open_db(&strict, &dir.db("c.db")).is_err());
+}

@@ -265,6 +265,26 @@ defmodule Sediment.S3 do
   end
 
   @doc """
+  Whether the S3 location in `s3_opts` holds a database: `false` when it
+  holds none yet or one was destroyed. It reads `manifest.json` only: no
+  lease, no writes. Raises `Sediment.Error` when the store can't be read
+  (a store error is not an answer).
+
+  Opening a location without a database creates a new, empty one. Where
+  that must not happen, for example for a tenant you know exists, open with
+  `must_exist: true` in the `s3` options instead of checking first: the
+  open then fails with `"... no database at s3://... (must_exist: true)"`
+  and writes nothing.
+  """
+  @spec exists?(keyword() | map()) :: boolean()
+  def exists?(s3_opts) do
+    case Native.s3_exists(s3_opts) do
+      {:ok, exists} -> exists
+      {:error, message} -> raise Sediment.Error, message: message
+    end
+  end
+
+  @doc """
   Destroys the database stored at the S3 location in `s3_opts`: afterwards
   no open, replica or restore finds it, and its snapshots and log are
   deleted. Opening the location again creates a new, empty database.
