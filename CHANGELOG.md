@@ -14,6 +14,13 @@
 * `Sediment.S3.exists?/1` tells whether a location holds a database, and
   the `must_exist: true` S3 option makes a writer open fail, writing
   nothing, instead of creating an empty database where there is none.
+* Replica connections no longer serve a destroyed database from the
+  generation they share in the VM: a refresh or a new connection reuses
+  another connection's restored state only if S3 still has that epoch, and
+  otherwise restores (finding the new database, or none).
+* Garbage collection never deletes an epoch of a newer writer lease
+  generation, and a new lease starts above the manifest's generation (a lost
+  or restored `lease.json` doesn't make opens fail).
 * An open, import or destroy that finds the prefix written under a newer
   writer lease than its own fails as fenced instead of building on it.
 * Local I/O errors of S3 opens, restores, imports and replica refreshes

@@ -17,7 +17,7 @@ use turso_core::{Database, DatabaseOpts, OpenFlags, OpenOptions, PlatformIO, Sql
 
 use crate::conn::{closed, error_tuple, lock, ok_tuple, ConnRes, Handle};
 use crate::open::Opened;
-use crate::s3::replica::{stage, unique_path, ReplicaState};
+use crate::s3::replica::{stage, still_usable, unique_path, ReplicaState};
 use crate::s3::restore;
 use crate::s3::S3Config;
 
@@ -90,7 +90,7 @@ pub fn open(cfg: S3Config, path: &str, db_opts: DatabaseOpts) -> Result<Opened, 
     let path = PathBuf::from(path);
     let slot = slot(&Replica::key(&cfg, &path));
     let mut slot = lock(&slot);
-    let generation = match slot.current.upgrade() {
+    let generation = match usable(&mut slot, &cfg)? {
         Some(generation) => {
             crate::s3::check_same_encryption(generation.encryption.as_ref(), &cfg)
                 .map_err(|e| e.to_string())?;
@@ -109,6 +109,21 @@ pub fn open(cfg: S3Config, path: &str, db_opts: DatabaseOpts) -> Result<Opened, 
         db_opts,
         generation,
     })
+}
+
+/// The slot's current generation, if S3 still has it: a destroy (and maybe a
+/// new database in its place) since it was restored must not be served from
+/// the cache. Forgets it otherwise.
+fn usable(slot: &mut Slot, cfg: &S3Config) -> Result<Option<Arc<Generation>>, String> {
+    let Some(generation) = slot.current.upgrade() else {
+        return Ok(None);
+    };
+    if still_usable(cfg, &generation.state).map_err(|e| e.to_string())? {
+        Ok(Some(generation))
+    } else {
+        slot.current = Weak::new();
+        Ok(None)
+    }
 }
 
 /// Stages the latest state from S3 and opens it as a new generation.
@@ -231,7 +246,11 @@ fn s3_refresh(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
 
     let slot = slot(&Replica::key(&replica.cfg, &replica.path));
     let mut slot = lock(&slot);
-    let target = match slot.current.upgrade() {
+    let current = match usable(&mut slot, &replica.cfg) {
+        Ok(current) => current,
+        Err(msg) => return error_tuple(env, msg),
+    };
+    let target = match current {
         Some(current) if !Arc::ptr_eq(&current, &replica.generation) => {
             if let Err(err) =
                 crate::s3::check_same_encryption(current.encryption.as_ref(), &replica.cfg)

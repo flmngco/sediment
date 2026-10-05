@@ -109,6 +109,46 @@ defmodule Sediment.S3Test do
     assert {:ok, _} = S3.destroy(s3, force: true)
   end
 
+  test "replica connections don't serve a destroyed database from their shared cache", %{
+    s3: s3,
+    dir: dir
+  } do
+    rows = fn db ->
+      {:ok, stmt} = Engine.prepare(db, "SELECT x FROM t ORDER BY x")
+      {:ok, rows} = Engine.fetch_all(db, stmt)
+      :ok = Engine.release(db, stmt)
+      rows
+    end
+
+    {:ok, w} = Engine.open(Path.join(dir, "w.db"), s3: s3)
+    :ok = Engine.execute(w, "CREATE TABLE t(x); INSERT INTO t VALUES (1)")
+    rpath = Path.join(dir, "r.db")
+    replica = Keyword.put(s3, :mode, :replica)
+    {:ok, r1} = Engine.open(rpath, s3: replica)
+    {:ok, r2} = Engine.open(rpath, s3: replica)
+    {:ok, r4} = Engine.open(rpath, s3: replica)
+    :ok = Engine.execute(w, "INSERT INTO t VALUES (2)")
+    # r1 publishes a newer generation the other connections could adopt.
+    assert {:ok, _} = S3.refresh(r1)
+    assert rows.(r1) == [[1], [2]]
+    :ok = Engine.close(w)
+    assert {:ok, _} = S3.destroy(s3)
+
+    assert {:error, "s3 config: no database" <> _} = S3.refresh(r1)
+    assert {:error, "s3 config: no database" <> _} = S3.refresh(r2)
+    assert {:error, "s3 config: no database" <> _} = Engine.open(rpath, s3: replica)
+
+    # A new database in its place: the cached generation of the old one is
+    # not it either.
+    {:ok, recreated} = Engine.open(Path.join(dir, "new.db"), s3: s3)
+    :ok = Engine.execute(recreated, "CREATE TABLE t(x); INSERT INTO t VALUES (99)")
+    assert {:ok, _} = S3.refresh(r4)
+    assert rows.(r4) == [[99]]
+    {:ok, r5} = Engine.open(rpath, s3: replica)
+    assert rows.(r5) == [[99]]
+    for db <- [r1, r2, r4, r5, recreated], do: Engine.close(db)
+  end
+
   test "exists?/1 and must_exist: true", %{s3: s3, dir: dir} do
     refute S3.exists?(s3)
     strict = Keyword.put(s3, :must_exist, true)

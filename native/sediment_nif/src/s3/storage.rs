@@ -859,7 +859,14 @@ impl S3DurableStorage {
     fn collect_garbage(&self, manifest: &Manifest) -> Result<()> {
         let current = manifest.epoch;
         let retained: Vec<Epoch> = manifest.retained().map(|r| r.epoch).collect();
-        let doomed = |epoch: Epoch| epoch.seq < current.seq && !retained.contains(&epoch);
+        // Never an epoch of a newer lease generation: a writer that took the
+        // lease after this one wrote it (a takeover, or a new database after
+        // a destroy), and a stale writer collecting it would delete another
+        // database's data.
+        let generation = self.lease.generation();
+        let doomed = |epoch: Epoch| {
+            epoch.seq < current.seq && epoch.generation <= generation && !retained.contains(&epoch)
+        };
         let mut keys: Vec<String> = self
             .remote
             .list(LOG_DIR)?
@@ -878,8 +885,9 @@ impl S3DurableStorage {
                 .list(SNAPSHOT_DIR)?
                 .into_iter()
                 .filter(|o| {
-                    parse_snapshot_key(&o.key).is_some_and(|epoch| epoch.seq < current.seq)
-                        && !referenced.contains(&o.key)
+                    parse_snapshot_key(&o.key).is_some_and(|epoch| {
+                        epoch.seq < current.seq && epoch.generation <= generation
+                    }) && !referenced.contains(&o.key)
                 })
                 .map(|o| o.key),
         );

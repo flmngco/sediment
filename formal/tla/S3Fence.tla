@@ -30,6 +30,7 @@ CONSTANTS
     Readers,         \* reads (replica refreshes, restores) next to the hosts, whole behaviour
     Retain,          \* retain_epochs: past epochs a manifest keeps (GC spares them)
     Destroys,        \* destroys per host
+    ManifestLoss,    \* times manifest.json is deleted from outside (a user, a lifecycle rule)
     Patches          \* behaviours switched on by name; {} is the code
 
 VARIABLES
@@ -51,10 +52,11 @@ VARIABLES
     \* ---- the reader
     rd,         \* a replica refresh or restore/3 in progress, and a replica's log cache
     shown,      \* ghost: every history a reader returned
-    tomb        \* ghost: the generation of the last destroy that took effect (0: none)
+    tomb,       \* ghost: the generation of the last destroy that took effect (0: none)
+    mlost       \* manifest deletions from outside so far
 
 vars == <<man, objs, snaps, leaseGen, inflight, R, ctr, faults, kills, acked, committed>>
-rvars == <<rd, shown, tomb>>
+rvars == <<rd, shown, tomb, mlost>>
 allvars == <<vars, rvars>>
 
 -----------------------------------------------------------------------------
@@ -70,7 +72,7 @@ R0 == [pc |-> "off", gen |-> 0, db |-> <<>>, ldb |-> <<>>, img |-> <<>>, e |-> [
        mver |-> 0, poisoned |-> "no", orphans |-> {}, frame |-> NoFrame,
        seal |-> [on |-> FALSE, e |-> [s |-> 0, g |-> 0], o |-> 0],
        snapPend |-> FALSE, unconf |-> {}, nc |-> 0, ncp |-> 0, nopen |-> 0,
-       gcBelow |-> 0, gcKeep |-> {}, stalled |-> FALSE, nd |-> 0]
+       gcBelow |-> 0, gcKeep |-> {}, stalled |-> FALSE, nd |-> 0, tb |-> 0, dres |-> "none"]
 
 Patch(p) == p \in Patches
 CanFault == faults < MaxFaults
@@ -526,11 +528,14 @@ Man(n) ==
 \* object as a tombstone, as an earlier version did; not needed for safety).
 LastOff(e) == CHOOSE o \in {x.o : x \in {y \in objs : y.e = e}} :
                \A x \in objs : x.e = e => x.o <= o
+\* Never an epoch of a newer lease generation (a takeover's, or a database after a
+\* destroy): "GCAnyGeneration" collects those too.
+NewerGen(n, x) == x.e.g > R[n].gen /\ ~Patch("GCAnyGeneration")
 GC(n) ==
     /\ R[n].pc = "gc"
-    /\ objs' = {x \in objs : x.e.s >= R[n].gcBelow \/ x.e \in R[n].gcKeep
+    /\ objs' = {x \in objs : x.e.s >= R[n].gcBelow \/ x.e \in R[n].gcKeep \/ NewerGen(n, x)
                              \/ (Patch("KeepTails") /\ x.o = LastOff(x.e))}
-    /\ snaps' = {s \in snaps : s.e.s >= R[n].gcBelow \/ s.e \in R[n].gcKeep}
+    /\ snaps' = {s \in snaps : s.e.s >= R[n].gcBelow \/ s.e \in R[n].gcKeep \/ NewerGen(n, s)}
     /\ R' = [R EXCEPT ![n].pc = "run"]
     /\ UNCHANGED <<man, leaseGen, inflight, ctr, faults, kills, acked, committed>>
 
@@ -546,8 +551,13 @@ GC(n) ==
 
 NoEpoch == [s |-> 0, g |-> 0]
 NoCache == [on |-> FALSE, e |-> NoEpoch, o |-> 0, h |-> <<>>]
+\* g: the generation the replica's connections in this process share (the last state a
+\* read of the current epoch returned), which other connections adopt (replica.rs).
+\* ret: how many reads returned, and the epoch the last one returned.
+NoGen == [on |-> FALSE, e |-> NoEpoch, h |-> <<>>]
 RD0 == [pc |-> "idle", m |-> NoMan, t |-> NoEpoch, h |-> <<>>, n |-> 0, sealed |-> FALSE,
-        c |-> NoCache, k |-> 0, keys |-> {}, inc |-> FALSE]
+        c |-> NoCache, k |-> 0, keys |-> {}, inc |-> FALSE, g |-> NoGen,
+        ret |-> [n |-> 0, e |-> NoEpoch]]
 
 Settled(m) == m.gen = m.e.g
 
@@ -621,11 +631,27 @@ ReadCheck ==
             /\ rd' = [rd EXCEPT !.pc = "idle",
                                 !.c = IF rd.t = rd.m.e
                                       THEN [on |-> TRUE, e |-> rd.t, o |-> rd.n + 1, h |-> rd.h]
-                                      ELSE rd.c]
+                                      ELSE rd.c,
+                                !.g = IF rd.t = rd.m.e THEN [on |-> TRUE, e |-> rd.t, h |-> rd.h]
+                                      ELSE rd.g,
+                                !.ret = [n |-> rd.ret.n + 1, e |-> rd.t]]
        ELSE /\ rd' = [rd EXCEPT !.pc = "idle"]
             /\ UNCHANGED shown
 
-ReaderNext == (ReadMan \/ ReadList \/ ReadGet \/ ReadCheck) /\ UNCHANGED <<vars, tomb>>
+\* Another connection adopts the shared generation (a refresh, or a new connection),
+\* without restoring: only if one manifest read shows it still retained by a database
+\* (replica::still_usable); otherwise it is forgotten and the connection restores.
+\* "AdoptUnchecked": adopt it without looking.
+ReadAdopt ==
+    /\ rd.pc = "idle" /\ rd.g.on /\ rd.k < Readers
+    /\ IF Patch("AdoptUnchecked") \/ (Live(man) /\ rd.g.e \in Retained(man))
+       THEN /\ shown' = shown \cup {rd.g.h}
+            /\ rd' = [rd EXCEPT !.k = rd.k + 1, !.ret = [n |-> rd.ret.n + 1, e |-> rd.g.e]]
+       ELSE /\ rd' = [rd EXCEPT !.k = rd.k + 1, !.g = NoGen]
+            /\ UNCHANGED shown
+
+ReaderNext == (ReadMan \/ ReadList \/ ReadGet \/ ReadCheck \/ ReadAdopt)
+              /\ UNCHANGED <<vars, tomb, mlost>>
 
 -----------------------------------------------------------------------------
 (* Destroying: destroy.rs *)
@@ -633,6 +659,14 @@ ReaderNext == (ReadMan \/ ReadList \/ ReadGet \/ ReadCheck) /\ UNCHANGED <<vars,
 \* The database ends: what was acknowledged, committed and shown goes with it, so the
 \* properties then catch any history from before it coming back.
 EndDb(g) == acked' = {} /\ committed' = {<<>>} /\ shown' = {} /\ tomb' = g
+
+\* The tombstone's sequence number: past every epoch in the prefix, the manifest's and
+\* every object's (destroy.rs highest_seq). "SeqFromManifest": the manifest's only, 0
+\* without one.
+Seqs == {x.e.s : x \in objs \cup snaps} \cup (IF man.present THEN {man.e.s} ELSE {})
+TombSeq ==
+    IF Patch("SeqFromManifest") THEN (IF man.present THEN man.e.s ELSE 0)
+    ELSE IF Seqs = {} THEN 0 ELSE CHOOSE m \in Seqs : \A x \in Seqs : x <= m
 
 \* Lease::acquire_to_destroy (any clock: a running writer may be taken over, which is
 \* what force does), then GET the manifest: the tombstone PUT is conditional on its
@@ -644,7 +678,7 @@ DStart(n) ==
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.pc = IF man.present /\ man.gen >= leaseGen + 1
                                                  THEN "off" ELSE "dtomb",
                                         !.gen = leaseGen + 1, !.mver = man.ver,
-                                        !.e = IF man.present THEN man.e ELSE R0.e,
+                                        !.e = [s |-> TombSeq, g |-> 0],
                                         !.nopen = R[n].nopen, !.nc = R[n].nc,
                                         !.ncp = R[n].ncp, !.nd = R[n].nd + 1]]
     /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, kills, acked, committed, rvars>>
@@ -661,19 +695,29 @@ DTomb(n) ==
             /\ UNCHANGED <<inflight, ctr, faults>>
        ELSE LET rec == TombMan(R[n].gen, R[n].e.s, ctr + 1)
                 cond == IF R[n].mver = 0 THEN ~man.present ELSE man.ver = R[n].mver
-            IN \E out \in Outcomes(cond) :
-                 /\ Charge(out)
+                \* "lostrefused": it lands, and the client's retry of it gets 412.
+                outs == Outcomes(cond) \cup (IF cond /\ CanFault THEN {"lostrefused"} ELSE {})
+                landed == {"ok", "lost", "lostrefused"}
+            IN \E out \in outs :
+                 /\ faults' = IF out \in {"lost", "fail", "late", "trunc", "lostrefused"}
+                              THEN faults + 1 ELSE faults
                  /\ ctr' = ctr + 1
-                 /\ man' = IF out \in {"ok", "lost"} THEN rec
+                 /\ man' = IF out \in landed THEN rec
                          ELSE IF out = "trunc" THEN EmptyMan ELSE man
                  /\ inflight' = IF out = "late"
                                 THEN inflight \cup {[k |-> "man", cond |-> R[n].mver, rec |-> rec]}
                                 ELSE inflight
-                 /\ IF out \in {"ok", "lost"} THEN EndDb(R[n].gen)
+                 /\ IF out \in landed THEN EndDb(R[n].gen)
                     ELSE UNCHANGED <<acked, committed, shown, tomb>>
-                 /\ R' = IF out \in {"ok", "lost"} THEN [R EXCEPT ![n].pc = "dpurge"]
-                         ELSE [R EXCEPT ![n].pc = "off"]
-    /\ UNCHANGED <<objs, snaps, leaseGen, kills, rd>>
+                 \* A refusal is checked with a GET: our tombstone there means it landed
+                 \* ("TrustRefused": reported as refused, nothing purged).
+                 /\ R' = IF out \in {"ok", "lost"}
+                            \/ (out = "lostrefused" /\ ~Patch("TrustRefused"))
+                         THEN [R EXCEPT ![n].pc = "dpurge", ![n].tb = ctr + 1, ![n].dres = "ok"]
+                         ELSE [R EXCEPT ![n].pc = "off", ![n].tb = ctr + 1,
+                                        ![n].dres = IF out \in {"refused", "lostrefused"}
+                                                    THEN "refused" ELSE "failed"]
+    /\ UNCHANGED <<objs, snaps, leaseGen, kills, rd, mlost>>
 
 \* purge: delete the dead objects one at a time, in any order, and stop at any point
 \* (the code deletes what one listing found; a kill can stop it). "PurgeAll": ignore the
@@ -686,7 +730,19 @@ DPurge(n) ==
        \/ R' = [R EXCEPT ![n].pc = "off"] /\ UNCHANGED <<objs, snaps>>
     /\ UNCHANGED <<man, leaseGen, inflight, ctr, faults, kills, acked, committed, rvars>>
 
-DestroyNext == \E n \in Node : DStart(n) \/ DTomb(n) \/ DPurge(n)
+\* A database's manifest.json deleted from outside (the guide's "manifest.json deleted"
+\* failure, which destroy clears up). Not a tombstone: the docs say to keep it while a
+\* writer of the destroyed database may run. Not while a create-only manifest PUT is in
+\* flight: that would land and recreate an old database, a hazard of the deletion itself.
+LoseManifest ==
+    /\ Live(man) /\ mlost < ManifestLoss
+    /\ \A w \in inflight : ~(w.k = "man" /\ w.cond = 0)
+    /\ man' = NoMan
+    /\ mlost' = mlost + 1
+    /\ UNCHANGED <<objs, snaps, leaseGen, inflight, R, ctr, faults, kills, acked, committed,
+                   rd, shown, tomb>>
+
+DestroyNext == (\E n \in Node : DStart(n) \/ DTomb(n) \/ DPurge(n)) \/ LoseManifest
 
 -----------------------------------------------------------------------------
 (* Environment *)
@@ -714,14 +770,14 @@ Land(w) ==
     /\ IF w.k = "man" /\ w.rec.tomb /\ man' = w.rec
        THEN EndDb(w.rec.gen)
        ELSE UNCHANGED <<acked, committed, shown, tomb>>
-    /\ UNCHANGED <<snaps, leaseGen, R, ctr, faults, kills, rd>>
+    /\ UNCHANGED <<snaps, leaseGen, R, ctr, faults, kills, rd, mlost>>
 
 -----------------------------------------------------------------------------
 Init ==
     /\ man = NoMan /\ objs = {} /\ snaps = {} /\ leaseGen = 0 /\ inflight = {}
     /\ R = [n \in Node |-> R0]
     /\ ctr = 0 /\ faults = 0 /\ kills = 0 /\ acked = {} /\ committed = {<<>>}
-    /\ rd = RD0 /\ shown = {} /\ tomb = 0
+    /\ rd = RD0 /\ shown = {} /\ tomb = 0 /\ mlost = 0
 
 WriterNext ==
     \/ \E n \in Node :
@@ -810,15 +866,31 @@ EventuallyRuns == (\A n \in Node : R[n].pc = "off") ~> (\E n \in Node : Running(
 \* Action property: the manifest never moves backwards (an older epoch or version),
 \* i.e. the database in S3 never rolls back to an earlier state.
 ManifestForward ==
-    [][man.present => (man'.present /\ man.e.s <= man'.e.s /\ man.ver <= man'.ver)]_man
+    [][man.present /\ mlost' = mlost
+       => (man'.present /\ man.e.s <= man'.e.s /\ man.ver <= man'.ver)]_<<man, mlost>>
+
+\* Action property: no read that returns after a destroy returns an epoch the destroy
+\* ended (its generation at most the tombstone's), whether it restored or adopted a
+\* cached generation. ShownDurable can't see this while the tombstone is all there is.
+ReadsAfterDestroy ==
+    [][rd'.ret.n # rd.ret.n => (tomb = 0 \/ rd'.ret.e.g > tomb)]_<<rd, tomb>>
 
 \* After a destroy, a database is always one started after it: its epoch's generation is
 \* newer than the tombstone's, so nothing of the destroyed one (or older) comes back.
 NewAfterDestroy == Live(man) /\ tomb > 0 => man.e.g > tomb
 
+\* A destroy that reported "refused" (another writer opened the database) did not
+\* replace the manifest: its own tombstone isn't what the manifest holds.
+RefusedMeansIntact ==
+    \A n \in Node : R[n].dres = "refused" => ~(man.tomb /\ man.body = R[n].tb)
+
 \* Witnesses: a database created over a tombstone, and a commit acknowledged in it.
 OpenOverTomb == tomb > 0 /\ Live(man)
 AckAfterDestroy == tomb > 0 /\ acked # {}
+\* A replica's shared generation outlived a destroy (so adopting it is tried).
+CachedAtDestroy == tomb > 0 /\ rd.g.on
+\* A destroy took effect after manifest.json had been deleted from outside.
+DestroyAfterLoss == mlost > 0 /\ tomb > 0
 
 StateConstraint == ctr <= 12
 

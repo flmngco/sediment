@@ -32,6 +32,9 @@ pub enum Fault {
     LandLater(std::time::Duration),
     /// GET only: deliver the first chunk of the body, then fail the stream.
     FailMidStream,
+    /// PUT only: perform it, then answer 412, as a client's retry of a PUT
+    /// that landed with its answer lost gets.
+    LandThenPrecondition,
 }
 
 #[derive(Debug)]
@@ -168,6 +171,13 @@ impl ObjectStore for FaultyStore {
             Some(Fault::FailAfter) => {
                 self.inner.put_opts(location, payload, opts).await?;
                 Err(injected(location))
+            }
+            Some(Fault::LandThenPrecondition) => {
+                self.inner.put_opts(location, payload, opts).await?;
+                Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "injected: a retry of a PUT that landed".into(),
+                })
             }
             Some(Fault::LandLater(delay)) => {
                 let inner = self.inner.clone();

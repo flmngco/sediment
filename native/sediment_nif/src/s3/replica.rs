@@ -26,6 +26,16 @@ pub struct ReplicaState {
     pub restored_at_ms: u64,
 }
 
+/// Whether a generation another connection of this process restored may
+/// still be handed out: the manifest is a database's (not destroyed, and not
+/// a new one in its place) that still retains that epoch.
+pub fn still_usable(cfg: &S3Config, state: &ReplicaState) -> Result<bool> {
+    let Some(epoch) = super::layout::Epoch::parse(&state.epoch) else {
+        return Ok(false);
+    };
+    restore::still_retained(&cfg.remote()?, epoch)
+}
+
 /// A restore downloaded next to the database, ready to be moved in place.
 pub struct Staged {
     db: PathBuf,

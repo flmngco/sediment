@@ -65,6 +65,11 @@ NegDestroyDeletes NewAfterDestroy
 NegPurgeAll RestoreOK
 NegTakeAnyGeneration NewAfterDestroy
 NegSeqFromZero RestoreOK
+DestroyManifestLoss pass
+NegTrustRefused RefusedMeansIntact
+NegSeqFromManifest RestoreOK
+NegGCAnyGeneration RestoreOK
+NegAdoptUnchecked ReadsAfterDestroy
 NegReadRecheckGeneration ShownDurable
 NegReadRecheckSeal ShownDurable
 NegNoTakeoverSeal ShownDurable

@@ -87,11 +87,16 @@ delays commits. Checked: `AsyncSole` 74,596 states, `AsyncSoleDelays` 155,710, `
 | `NegReadTransitional` | 2 (late writes, 1 fault), 2 reads, retain 1 | `ReadTransitional`, `NoTakeoverSeal` (use a takeover's manifest before its seal) | `ShownDurable` violated |
 | `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (4,954,786 states) |
 | `AsyncDestroy` | as `Destroy`, async | none | pass (8,926,692 states) |
-| `ReadDestroy` | as `Destroy`, no kill, 1 read | none | pass (5,858,315 states) |
+| `ReadDestroy` | as `Destroy`, no kill, 2 reads | none | pass |
 | `NegDestroyDeletes` | 1 (late writes), 1 destroy | `DestroyDeletes` (delete the manifest instead of a tombstone) | `NewAfterDestroy` violated |
 | `NegPurgeAll` | 2 (late writes, 1 fault), 1 destroy each | `PurgeAll` (purge ignoring the generation) | `RestoreOK` violated |
 | `NegTakeAnyGeneration` | 2 (late writes, 1 fault), 1 destroy each | `TakeAnyGeneration` (an open builds on a manifest or tombstone of a newer lease) | `NewAfterDestroy` violated |
-| `NegSeqFromZero` | 2 (late writes, 1 fault), 1 destroy each | `SeqFromZero` (a database over a tombstone starts at epoch 0) | `RestoreOK` violated |
+| `NegSeqFromZero` | as `Destroy` | `SeqFromZero` (a database over a tombstone starts at epoch 0), `GCAnyGeneration` | `RestoreOK` violated |
+| `DestroyManifestLoss` | as `Destroy`, 2 checkpoints, no kill, `manifest.json` deleted once | none | pass |
+| `NegSeqFromManifest` | as `DestroyManifestLoss` | `SeqFromManifest` (the tombstone's sequence number from the manifest only, 0 without one), `GCAnyGeneration` | `RestoreOK` violated |
+| `NegGCAnyGeneration` | as `DestroyManifestLoss` | `GCAnyGeneration` (GC collects epochs of newer lease generations too) | `RestoreOK` violated |
+| `NegTrustRefused` | as `Destroy` | `TrustRefused` (a tombstone PUT reported refused is taken as refused) | `RefusedMeansIntact` violated |
+| `NegAdoptUnchecked` | as `ReadDestroy` | `AdoptUnchecked` (a replica connection adopts the shared generation without a manifest read) | `ReadsAfterDestroy` violated |
 
 ### Destroy
 
@@ -117,6 +122,28 @@ is one started after it: its epoch's generation is above the last tombstone's.
 The generation rule also applies without destroys: an open whose lease is older than the
 manifest it reads refuses. That only removes behaviours (stale opens), which is why the
 two-writer configs have fewer states than before it.
+
+Three more environment and reader details came from the reviews of the destroy:
+
+- `DTomb` has an extra outcome, `lostrefused`: the PUT lands and the client's retry of it
+  gets 412 (object_store retries on 5xx). The code checks a refusal with a GET and goes on
+  if its tombstone is there; `RefusedMeansIntact` says a destroy that reported "refused"
+  did not replace the manifest (`NegTrustRefused`).
+- `ManifestLoss = n` deletes a database's `manifest.json` from outside up to n times (the
+  guide's "manifest.json deleted" failure, which a destroy clears up), never while a
+  create-only manifest PUT is in flight (that would recreate an old database, a hazard of
+  the deletion itself) and never a tombstone (the docs say to keep it). The tombstone's
+  sequence number comes from every object's epoch, not only the manifest's
+  (`NegSeqFromManifest`), and GC never collects an epoch of a newer lease generation: a
+  destroy that read "no manifest", stalled, and landed its create-only tombstone after a
+  database had come and lost its manifest again would otherwise let a stale writer's GC
+  delete the next database's snapshot (`NegGCAnyGeneration`). The sequence controls
+  switch both protections off.
+- Replica connections of one process share a restored generation (`rd.g`), which a refresh
+  or a new connection adopts after one manifest read (`ReadAdopt`). `ReadsAfterDestroy` (an
+  action property: no read that returns after a tombstone returns an epoch it ended) checks
+  it; `ShownDurable` can't, as it only applies while there is a database
+  (`NegAdoptUnchecked`).
 
 The negative controls are the designs this replaced, or the rules it needs. Deleting the
 manifest instead lets an interrupted bootstrap's late create-only manifest land after the

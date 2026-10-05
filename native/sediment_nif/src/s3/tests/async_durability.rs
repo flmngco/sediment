@@ -534,7 +534,9 @@ fn interval_config(store: &Arc<FaultyStore>, interval_ms: u64) -> S3Config {
 fn commits_within_the_upload_interval_share_one_segment() {
     let store = FaultyStore::new();
     let dir = TempDir::new();
-    let cfg = interval_config(&store, 400);
+    // Long enough that the inserts fit in it on a loaded machine.
+    let mut cfg = interval_config(&store, 2_000);
+    cfg.max_lag = Duration::from_secs(10);
     let db = setup(&cfg, &dir);
     let before = segments(&store).len();
     for i in 1..=20 {
@@ -546,7 +548,7 @@ fn commits_within_the_upload_interval_share_one_segment() {
         before,
         "nothing uploaded before the interval"
     );
-    std::thread::sleep(Duration::from_millis(700));
+    std::thread::sleep(Duration::from_millis(2_500));
     assert_eq!(
         segments(&store).len(),
         before + 1,

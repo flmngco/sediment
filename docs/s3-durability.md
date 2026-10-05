@@ -244,8 +244,14 @@ Cost: one PUT plus one HEAD per commit.
    (`seq`: the epoch sequence number of what it replaces) with
    `If-Match` on what was read (create-only if there was none, so a prefix
    with objects but no manifest is cleared too). A 412 means another writer
-   opened the database: fail, nothing deleted. A lost answer is checked
-   with a GET.
+   opened the database: fail, nothing deleted. Any error, a 412 included
+   (a client's retry of a PUT that landed with its answer lost gets one), is
+   checked with a GET: our tombstone there means it landed. The lease is
+   taken the same way: a lease holding exactly what we sent is ours.
+   The tombstone's `seq` is the highest epoch sequence number of the manifest
+   and of every `log/` and `snapshots/` key, so it is right without a readable
+   manifest too (deleted, damaged, a newer format; for an unreadable one the
+   generation rule uses its `generation` field, read leniently).
 3. Delete (DeleteObjects batches) every `log/` and `snapshots/` key whose
    epoch generation is at most G, then release the lease.
 
@@ -266,6 +272,27 @@ published before the tombstone, so at most `seq`) leaves the new database
 alone (`NegSeqFromZero`: the new database's first snapshot collected), and
 the new database's own GC collects whatever a stale writer recreated in the
 old epochs.
+
+Garbage collection never deletes an epoch of a newer lease generation than
+the collecting writer's. A writer that took the lease later wrote it (a
+takeover, or a database created after a destroy), so a current writer never
+needs to, and a stale one (still running, poisoned or not) can't delete
+another database's objects whatever its epoch numbers say. This also covers a
+destroy that read "no manifest", stalled, and landed its create-only
+tombstone after a database had come and its manifest had been deleted again
+(model: `NegGCAnyGeneration`).
+
+Replica connections of one process share restored generations: a refresh or
+a new connection adopts the one another connection restored instead of
+downloading it again, but only after one manifest read shows a database that
+still retains that epoch (`replica::still_usable`); otherwise the generation is
+forgotten and the connection restores (or finds no database). Without that,
+they served a destroyed database, and after the prefix was reused, the old
+database instead of the new one (`NegAdoptUnchecked`).
+
+A new lease starts above the generation of the manifest (or tombstone) too, so
+a `lease.json` that was lost or rolled back (a restored backup) doesn't make
+every open refuse under the generation rule.
 
 Why not delete `manifest.json`: deletes are unconditional, so a destroy that
 stalled past its lease could delete a newer writer's manifest, and without a

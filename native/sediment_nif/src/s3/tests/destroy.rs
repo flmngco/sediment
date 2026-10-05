@@ -282,22 +282,47 @@ fn a_tombstone_covers_only_older_generations() {
 fn an_open_with_an_older_lease_than_the_tombstone_refuses() {
     let store = FaultyStore::new();
     let dir = TempDir::new();
-    // A destroy whose lease generation is ahead of the next open's: the
-    // open took its lease before that destroy, so it is stale.
-    let remote = Remote::new(store.clone(), PREFIX);
-    remote
+    // The open's lease PUT is in flight while a destroy with a newer lease
+    // writes its tombstone: the open's lease is then stale.
+    store.inject(
+        Op::Put,
+        LEASE_KEY,
+        Fault::Delay(Duration::from_millis(300)),
+        1,
+    );
+    let opening = {
+        let store = store.clone();
+        let path = dir.db("a.db");
+        std::thread::spawn(move || open_db(&config(&store, "a"), &path).err())
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    Remote::new(store.clone(), PREFIX)
         .put(
             MANIFEST_KEY,
             Tombstone::new(100, 0, "d").encode(),
             Put::Create,
         )
         .unwrap();
-    match open_db(&config(&store, "a"), &dir.db("a.db")) {
-        Err(S3Error::Fenced(msg)) => assert!(msg.contains("lease generation 100"), "{msg}"),
-        Err(other) => panic!("expected Fenced, got {other}"),
-        Ok(_) => panic!("a stale open must not build over a newer tombstone"),
+    match opening.join().unwrap() {
+        Some(S3Error::Fenced(msg)) => assert!(msg.contains("lease generation 100"), "{msg}"),
+        Some(other) => panic!("expected Fenced, got {other}"),
+        None => panic!("a stale open must not build over a newer tombstone"),
     }
     assert!(matches!(state(&store), ManifestState::Destroyed(_)));
+}
+
+#[test]
+fn a_new_lease_starts_above_the_manifest_generation() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    drop(open_db(&config(&store, "a"), &dir.db("a.db")).unwrap());
+    // lease.json lost (or an older copy restored): the next open still
+    // takes a generation above the manifest's, instead of being refused.
+    Remote::new(store.clone(), PREFIX)
+        .delete(LEASE_KEY)
+        .unwrap();
+    let db = open_db(&config(&store, "b"), &dir.db("b.db")).unwrap();
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
 }
 
 #[test]
@@ -322,4 +347,83 @@ fn exists_and_must_exist_tell_a_database_from_none() {
     destroy(&config(&store, "d"), false).unwrap();
     assert!(!crate::s3::exists(&config(&store, "x")).unwrap());
     assert!(open_db(&strict, &dir.db("c.db")).is_err());
+}
+
+#[test]
+fn a_tombstone_that_landed_while_its_answer_said_412_is_a_destroy() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    a_database_with_history(&store, &dir);
+    store.inject(Op::Put, MANIFEST_KEY, Fault::LandThenPrecondition, 1);
+    let destroyed = destroy(&config(&store, "d"), false).unwrap();
+    assert!(destroyed.objects > 0);
+    assert_destroyed(&store);
+}
+
+#[test]
+fn a_destroy_lease_that_landed_while_its_answer_said_412_is_its_own() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    a_database_with_history(&store, &dir);
+    store.inject(Op::Put, LEASE_KEY, Fault::LandThenPrecondition, 1);
+    destroy(&config(&store, "d"), false).unwrap();
+    assert_destroyed(&store);
+    // Released: a writer opens at once.
+    open_db(&config(&store, "b"), &dir.db("b.db")).unwrap();
+}
+
+#[test]
+fn without_a_manifest_the_tombstone_still_ends_past_every_epoch() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    // A writer in another process at epoch 3, which then loses its manifest.
+    let a = open_db(&elsewhere(&store, "a"), &dir.db("a.db")).unwrap();
+    a.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    for _ in 0..3 {
+        a.checkpoint();
+    }
+    let ManifestState::Database(manifest) = state(&store) else {
+        panic!("expected a database");
+    };
+    assert_eq!(manifest.epoch.seq, 3);
+    Remote::new(store.clone(), PREFIX)
+        .delete(MANIFEST_KEY)
+        .unwrap();
+
+    destroy(&config(&store, "d"), true).unwrap();
+    let ManifestState::Destroyed(tombstone) = state(&store) else {
+        panic!("expected a tombstone");
+    };
+    assert_eq!(tombstone.seq, 3);
+    let b = open_db(&config(&store, "b"), &dir.db("b.db")).unwrap();
+    b.exec("CREATE TABLE u(id INTEGER PRIMARY KEY)").unwrap();
+    // The stale writer's GC (epochs below 3) leaves the new database alone.
+    a.storage.collect_garbage_now();
+    drop(a);
+    b.crash();
+    let again = open_db(&config(&store, "b"), &dir.db("c.db")).unwrap();
+    assert_eq!(again.int("SELECT count(*) FROM u"), 0);
+}
+
+#[test]
+fn garbage_collection_leaves_newer_generations_alone() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let a = open_db(&config(&store, "a"), &dir.db("a.db")).unwrap();
+    a.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    a.checkpoint();
+    a.checkpoint();
+    // Objects of a newer lease generation at a lower epoch (a database
+    // created after a destroy that this writer outlived).
+    let remote = Remote::new(store.clone(), PREFIX);
+    let newer = crate::s3::layout::Epoch {
+        seq: 0,
+        generation: 99,
+    };
+    for key in [newer.snapshot_key(), newer.segment_key(0)] {
+        remote.put(&key, "newer".into(), Put::Create).unwrap();
+    }
+    a.storage.collect_garbage_now();
+    assert!(keys(&store, "snapshots/").contains(&newer.snapshot_key()));
+    assert!(segments(&store).contains(&newer.segment_key(0)));
 }

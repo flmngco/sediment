@@ -58,11 +58,14 @@ impl Lease {
         held: impl Fn(&LeaseRecord) -> bool,
     ) -> Result<Arc<Lease>> {
         let ttl_ms = ttl.as_millis() as u64;
+        // Generations only grow, even if lease.json was lost or rolled back
+        // (a restored backup): never below what wrote the manifest.
+        let floor = manifest_generation(&remote)?;
         let mut attempts = 0;
         let (generation, version, expires_at_ms) = loop {
             attempts += 1;
             let (generation, mode) = match remote.get(LEASE_KEY)? {
-                None => (1, Put::Create),
+                None => (floor + 1, Put::Create),
                 Some(object) => {
                     let current: LeaseRecord = serde_json::from_slice(&object.bytes)?;
                     if current.expires_at_ms > now_ms() && held(&current) {
@@ -71,7 +74,10 @@ impl Lease {
                             expires_at_ms: current.expires_at_ms,
                         });
                     }
-                    (current.generation + 1, Put::Update(object.version))
+                    (
+                        current.generation.max(floor) + 1,
+                        Put::Update(object.version),
+                    )
                 }
             };
             let record = LeaseRecord {
@@ -79,10 +85,19 @@ impl Lease {
                 generation,
                 expires_at_ms: now_ms() + ttl_ms,
             };
-            match remote.put(LEASE_KEY, serde_json::to_vec(&record)?.into(), mode) {
+            let body: bytes::Bytes = serde_json::to_vec(&record)?.into();
+            match remote.put(LEASE_KEY, body.clone(), mode) {
                 Ok(version) => break (generation, version, record.expires_at_ms),
-                Err(S3Error::Conflict(_)) if attempts < 3 => continue,
-                Err(err) => return Err(err),
+                // The PUT may have landed with its answer lost (a retry of it
+                // then gets 412): the lease holding exactly what we sent is
+                // ours, not someone else's to wait for.
+                Err(err) => match remote.get(LEASE_KEY) {
+                    Ok(Some(object)) if object.bytes == body => {
+                        break (generation, object.version, record.expires_at_ms)
+                    }
+                    _ if matches!(err, S3Error::Conflict(_)) && attempts < 3 => continue,
+                    _ => return Err(err),
+                },
             }
         };
         let lease = Arc::new(Lease {
@@ -270,6 +285,14 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.release();
     }
+}
+
+/// The lease generation the manifest (or a destroy's tombstone) was written
+/// under; 0 without one. Read leniently: only the number matters here.
+fn manifest_generation(remote: &Remote) -> Result<u64> {
+    Ok(remote
+        .get(super::layout::MANIFEST_KEY)?
+        .map_or(0, |object| super::layout::written_generation(&object.bytes)))
 }
 
 fn spawn_renewer(lease: Weak<Lease>, every: Duration) {

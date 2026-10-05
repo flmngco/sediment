@@ -378,6 +378,15 @@ pub struct LeaseRecord {
     pub expires_at_ms: u64,
 }
 
+/// The lease generation a manifest or tombstone records, read leniently (a
+/// damaged or newer-format one too); 0 when there is none to read.
+pub fn written_generation(bytes: &[u8]) -> u64 {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| value.get("generation")?.as_u64())
+        .unwrap_or(0)
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
