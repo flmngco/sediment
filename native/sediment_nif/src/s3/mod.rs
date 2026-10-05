@@ -338,11 +338,6 @@ pub struct Restored {
     pub frames: usize,
 }
 
-/// Restores the database into a standalone local file at `local_path`,
-/// without the lease and without writing to S3. With [`Target::Time`] or
-/// [`Target::Epoch`] this is point-in-time restore over the epochs the
-/// manifest retains (`retain_epochs`). The result is folded into one file
-/// that plain turso (or `Sediment.Engine.open/2` without `:s3`) opens.
 /// A restore renames a new file over the local path. Over a symlink, that
 /// replaces the link and leaves the file it pointed to behind, with the MVCC
 /// log next to it that the restored database would use too.
@@ -360,6 +355,11 @@ fn refuse_symlink(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Restores the database into a standalone local file at `local_path`,
+/// without the lease and without writing to S3. With [`Target::Time`] or
+/// [`Target::Epoch`] this is point-in-time restore over the epochs the
+/// manifest retains (`retain_epochs`). The result is folded into one file
+/// that plain turso (or `Sediment.Engine.open/2` without `:s3`) opens.
 pub fn restore_to(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Restored> {
     restore_into(cfg, local_path, target).map_err(|err| err.at(local_path))
 }

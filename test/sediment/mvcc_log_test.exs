@@ -235,5 +235,37 @@ defmodule Sediment.MvccLogTest do
       File.rm!(Path.join(dir, "later.db"))
       assert_intact(first)
     end
+
+    # These attaches don't use the main database's IO; turso refuses an MVCC
+    # file for a main database that isn't MVCC, which it never is here.
+    test "attaches no MVCC database from memory or through ?vfs=", %{dir: dir} do
+      first = mvcc_db(Path.join(dir, "app.1"))
+      {:ok, one} = Engine.open(first)
+      :ok = Engine.execute(one, "insert into t values ('c')")
+      log = File.read!(Path.join(dir, "app.db-log"))
+      File.cp!(first, Path.join(dir, "app.2"))
+      second = Path.join(dir, "app.2")
+
+      {:ok, memory} = Engine.open(":memory:", experimental: [:attach])
+      {:ok, wal} = Engine.open(Path.join(dir, "main.db"), experimental: [:attach])
+
+      for {main, sql} <- [
+            {memory, "ATTACH '#{second}' AS b"},
+            {wal, "ATTACH 'file:#{second}?vfs=syscall' AS b"}
+          ] do
+        assert {:error, message} = Engine.execute(main, sql)
+        assert message =~ "MVCC", sql
+        assert {:error, _} = Engine.prepare(main, "select * from b.t")
+      end
+
+      :ok = Engine.close(memory)
+      :ok = Engine.close(wal)
+      assert File.read!(Path.join(dir, "app.db-log")) == log
+      :ok = Engine.close(one)
+      File.rm!(second)
+      {:ok, conn} = Engine.open(first)
+      assert [["a"], ["b"], ["c"]] = query(conn, "select v from t order by v")
+      :ok = Engine.close(conn)
+    end
   end
 end

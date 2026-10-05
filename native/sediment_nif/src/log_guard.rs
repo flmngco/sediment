@@ -15,7 +15,11 @@
 //! ATTACH opens the attached file through the main database's IO, and names
 //! its log the same way. A database opened with `experimental: [:attach]` is
 //! never MVCC, and its IO ([`NoMvccLogs`]) opens no MVCC log, so no attached
-//! file uses one, whatever SQL attached it.
+//! file uses one, whatever SQL attached it. Two attaches don't go through that
+//! IO: from an in-memory main database, and with a `?vfs=` URI. turso itself
+//! refuses those for an MVCC file ("main database uses WAL journal mode but
+//! attached database uses MVCC"), which holds because the main database is
+//! never MVCC; mvcc_log_test pins both.
 
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;

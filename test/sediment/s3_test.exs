@@ -2010,6 +2010,25 @@ defmodule Sediment.S3Test do
       assert_first_intact(dir)
     end
 
+    test "a replica can't be opened with experimental :attach", %{s3: s3, dir: dir} do
+      {:ok, db} = Engine.open(Path.join(dir, "attach.db"), s3: s3, encryption: false)
+      :ok = Engine.execute(db, "CREATE TABLE t (v)")
+      :ok = Engine.close(db)
+      replica = Keyword.merge(s3, mode: :replica, owner: "reader")
+
+      for s3 <- [replica, s3] do
+        assert {:error, "experimental :attach can't be combined with MVCC" <> _} =
+                 Engine.open(Path.join(dir, "attach-replica.db"),
+                   s3: s3,
+                   encryption: false,
+                   experimental: [:attach]
+                 )
+      end
+
+      {:ok, r} = Engine.open(Path.join(dir, "attach-replica.db"), s3: replica, encryption: false)
+      :ok = Engine.close(r)
+    end
+
     test "import refuses a source whose log belongs to another file", %{s3: s3, dir: dir} do
       File.cp!(Path.join(dir, "app.1"), Path.join(dir, "app.2"))
 

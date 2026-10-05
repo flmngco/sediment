@@ -142,6 +142,21 @@ impl<'a> OpenConfig<'a> {
     }
 
     pub fn open(&self) -> Result<Opened, String> {
+        // See log_guard: a database that can ATTACH is never MVCC, and S3
+        // databases (replicas too) always are.
+        let attach = self.experimental.iter().any(|feature| feature == "attach");
+        let mvcc = || {
+            self.s3.is_some()
+                || self
+                    .journal_mode
+                    .as_ref()
+                    .is_some_and(|m| m.contains("mvcc"))
+                || crate::log_guard::is_mvcc_file(Path::new(&self.path))
+        };
+        if attach && mvcc() {
+            return Err(crate::log_guard::ATTACH_WITHOUT_MVCC.into());
+        }
+
         if let Some(term) = self.s3 {
             let mut cfg = crate::s3_nif::decode_config(term)?;
             if cfg.replica {
@@ -156,18 +171,7 @@ impl<'a> OpenConfig<'a> {
         } else {
             Arc::new(PlatformIO::new().map_err(|e| e.to_string())?)
         };
-        // See log_guard: a database that can ATTACH is never MVCC.
-        let attach = self.experimental.iter().any(|feature| feature == "attach");
         let io: Arc<dyn IO> = if attach {
-            let mvcc = self.s3.is_some()
-                || self
-                    .journal_mode
-                    .as_ref()
-                    .is_some_and(|m| m.contains("mvcc"))
-                || crate::log_guard::is_mvcc_file(Path::new(&self.path));
-            if mvcc {
-                return Err(crate::log_guard::ATTACH_WITHOUT_MVCC.into());
-            }
             Arc::new(crate::log_guard::NoMvccLogs(io))
         } else {
             io
