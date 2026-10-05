@@ -80,6 +80,13 @@ pub fn export(source: Source, dest: &Path, opts: &ExportOptions) -> Result<Expor
         }
     }
     let work = Work::new(dest)?;
+    // The source's log is copied with it: it must be the source's own.
+    let _log = match &source {
+        Source::Local(path) if crate::log_guard::is_mvcc_file(path) => {
+            Some(crate::log_guard::claim(path)?)
+        }
+        _ => None,
+    };
     let key = match &source {
         Source::Local(path) => {
             let files = source_files(path)?;

@@ -1,4 +1,5 @@
-//! Refuses to switch a database with AUTOINCREMENT tables into MVCC mode.
+//! Refuses to switch a database with AUTOINCREMENT tables into MVCC mode,
+//! or one whose MVCC log another database file would share (`log_guard`).
 //!
 //! turso_core 0.8.1 doesn't carry an AUTOINCREMENT table's sequence over when
 //! an existing database switches to MVCC: the next insert reuses id 1 and
@@ -76,7 +77,7 @@ pub fn check_switch(res: &ConnRes, conn: &Arc<Connection>) -> Result<(), Step> {
     }
     let tables = autoincrement_tables(res, conn)?;
     if tables.is_empty() {
-        return Ok(());
+        return claim_log(res);
     }
     Err(Step::Error(format!(
         "refusing to switch to MVCC: the database has AUTOINCREMENT tables ({}), and \
@@ -85,6 +86,19 @@ pub fn check_switch(res: &ConnRes, conn: &Arc<Connection>) -> Result<(), Step> {
          the data into a new database opened with journal_mode mvcc from the start",
         tables.join(", ")
     )))
+}
+
+/// Claims the log the database will use in MVCC mode, for as long as it is
+/// open (see `log_guard`).
+fn claim_log(res: &ConnRes) -> Result<(), Step> {
+    let Some((path, db)) = &res.file else {
+        return Ok(());
+    };
+    let claim = crate::log_guard::claim(std::path::Path::new(path)).map_err(Step::Error)?;
+    if let Some(db) = db.upgrade() {
+        claim.keep_while(&db);
+    }
+    Ok(())
 }
 
 fn autoincrement_tables(res: &ConnRes, conn: &Arc<Connection>) -> Result<Vec<String>, Step> {

@@ -80,6 +80,9 @@ pub struct ConnRes {
     /// What this connection's current autocommit statement or transaction
     /// committed, for `sync: true` (`s3_flush_commit`).
     commit_mark: Mutex<CommitMark>,
+    /// A file database (not in memory, not a replica): its path as opened
+    /// and the database, so a switch to MVCC can claim the log.
+    pub file: Option<(String, Weak<Database>)>,
 }
 
 /// See `ConnRes::commit_mark`.
@@ -180,6 +183,7 @@ impl ConnRes {
             statements: Mutex::new(Vec::new()),
             pending_script: Mutex::new(None),
             commit_mark: Mutex::new(CommitMark::default()),
+            file: None,
         }
     }
 
@@ -597,6 +601,8 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
         statements: Mutex::new(Vec::new()),
         pending_script: Mutex::new(None),
         commit_mark: Mutex::new(CommitMark::default()),
+        file: (!config.is_memory() && opened.replica.is_none())
+            .then(|| (config.path.clone(), Arc::downgrade(&opened.db))),
     };
 
     if let Some(mode) = &config.journal_mode {

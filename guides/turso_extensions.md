@@ -57,9 +57,16 @@ At the low level, `Sediment.Engine.open(path, journal_mode: :mvcc)` does
 the same.
 
 In MVCC mode Turso keeps a logical log next to the database, named by
-replacing the file extension with `.db-log`. Two databases in one directory
-that differ only in their extension (`app.db` and `app.sqlite`) would share
-`app.db-log`, so give MVCC databases distinct base names.
+replacing the file extension with `.db-log`. Database files in one directory
+that differ only after their last dot (`app.db` and `app.sqlite`, or `app.1`
+and `app.2`) would share `app.db-log`, and each would replay, checkpoint and
+truncate the other's commits. Sediment refuses that: an MVCC open of such a
+file, a switch to MVCC, an S3 open or restore at such a path, and an export
+or S3 import of such a source fail with `"... would share its MVCC log ..."`
+while another database file with the same name before the last dot exists,
+or while one is open in the VM. Give each database file its own base name
+(`app-1.db`, `app-2.db`). A log is not empty after a clean close, so rename
+a database together with its `.db-log` file, and only while it is closed.
 
 ## Encryption
 

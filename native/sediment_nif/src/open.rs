@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use rustler::{Atom, Term};
@@ -105,7 +106,7 @@ impl<'a> OpenConfig<'a> {
         })
     }
 
-    fn is_memory(&self) -> bool {
+    pub fn is_memory(&self) -> bool {
         let p = self.path.trim();
         p.is_empty() || p.starts_with(":memory:") || p.starts_with("file::memory:")
     }
@@ -161,6 +162,15 @@ impl<'a> OpenConfig<'a> {
             .db_opts(self.db_opts()?)
             .encryption(self.encryption.clone());
 
+        // Before an S3 restore writes the MVCC log or turso replays it.
+        let log_claim = if !self.is_memory()
+            && (self.s3.is_some() || crate::log_guard::is_mvcc_file(Path::new(&self.path)))
+        {
+            Some(crate::log_guard::claim(Path::new(&self.path))?)
+        } else {
+            None
+        };
+
         // s3 hook: restore from S3 (or create), take the writer lease, and
         // attach the storage that uploads every commit.
         let s3 = match self.s3 {
@@ -205,7 +215,12 @@ impl<'a> OpenConfig<'a> {
         }
         options = options.durable_storage(s3.clone().map(|s| s as Arc<dyn DurableStorage>));
 
-        let db = Database::open(io.clone(), &self.path, options).map_err(|e| e.to_string())?;
+        let db = Database::open(io.clone(), &self.path, options).map_err(|e| {
+            crate::log_guard::explain_open_error(Path::new(&self.path), e.to_string())
+        })?;
+        if let Some(claim) = log_claim {
+            claim.keep_while(&db);
+        }
         if s3.is_none() && !self.is_memory() {
             register_plain(&self.path, &db, self.encryption.clone());
         }

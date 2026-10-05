@@ -3,6 +3,7 @@ mod cleanup;
 mod conn;
 mod error;
 mod export;
+mod log_guard;
 mod mvcc_guard;
 mod open;
 mod replica;

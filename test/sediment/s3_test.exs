@@ -1833,4 +1833,82 @@ defmodule Sediment.S3Test do
       :ok = Engine.close(writer)
     end
   end
+
+  # turso names a database's MVCC log after the file without its extension:
+  # app.1 and app.2 both use app.db-log. Nothing may write, replay or delete
+  # the log of another database file.
+  describe "databases whose MVCC log names collide" do
+    setup %{dir: dir} do
+      {:ok, plain} = Engine.open(Path.join(dir, "app.1"), journal_mode: :mvcc)
+      :ok = Engine.execute(plain, "CREATE TABLE t (v); INSERT INTO t VALUES (1)")
+      :ok = Engine.close(plain)
+      %{log: Path.join(dir, "app.db-log")}
+    end
+
+    defp assert_first_intact(dir) do
+      {:ok, db} = Engine.open(Path.join(dir, "app.1"))
+      assert count(db, "t") == 1
+      :ok = Engine.close(db)
+    end
+
+    test "a writer open is refused before it touches the other's log", %{
+      s3: s3,
+      dir: dir,
+      log: log
+    } do
+      bytes = File.read!(log)
+
+      assert {:error, message} =
+               Engine.open(Path.join(dir, "app.2"), s3: s3, encryption: false)
+
+      assert message =~ "would share its MVCC log #{log} with #{Path.join(dir, "app.1")}"
+      assert File.read!(log) == bytes
+      refute File.exists?(Path.join(dir, "app.2"))
+      assert_first_intact(dir)
+    end
+
+    test "a second writer in this VM can't take an open writer's log", %{
+      s3: s3,
+      prefix: prefix,
+      dir: dir
+    } do
+      {:ok, a} = Engine.open(Path.join(dir, "w.1"), s3: s3, encryption: false)
+      :ok = Engine.execute(a, "CREATE TABLE t (v); INSERT INTO t VALUES (1)")
+      other = s3_opts(prefix <> "-b", "writer-b")
+
+      assert {:error, message} =
+               Engine.open(Path.join(dir, "w.2"), s3: other, encryption: false)
+
+      assert message =~ "would share its MVCC log #{Path.join(dir, "w.db-log")}"
+      :ok = Engine.execute(a, "INSERT INTO t VALUES (2)")
+      assert count(a, "t") == 2
+      :ok = Engine.close(a)
+    end
+
+    test "restore is refused next to a database with the same stem", %{s3: s3, dir: dir} do
+      {:ok, db} = Engine.open(Path.join(dir, "src.db"), s3: s3, encryption: false)
+      :ok = Engine.execute(db, "CREATE TABLE t (v)")
+      :ok = Engine.close(db)
+      # A WAL database has no log, so only the shared name gives it away.
+      {:ok, wal} = Engine.open(Path.join(dir, "rest.1"), journal_mode: :wal)
+      :ok = Engine.execute(wal, "CREATE TABLE t (v)")
+      :ok = Engine.close(wal)
+
+      assert {:error, "s3 config: " <> message} =
+               S3.restore(Path.join(dir, "rest.2"), s3, encryption: false)
+
+      assert message =~ "would share its MVCC log #{Path.join(dir, "rest.db-log")}"
+      refute File.exists?(Path.join(dir, "rest.2"))
+      refute File.exists?(Path.join(dir, "rest.db-log"))
+    end
+
+    test "import refuses a source whose log belongs to another file", %{s3: s3, dir: dir} do
+      File.cp!(Path.join(dir, "app.1"), Path.join(dir, "app.2"))
+
+      assert {:error, "s3 config: " <> message} = S3.import(Path.join(dir, "app.2"), s3)
+      assert message =~ "would share its MVCC log"
+      File.rm!(Path.join(dir, "app.2"))
+      assert_first_intact(dir)
+    end
+  end
 end

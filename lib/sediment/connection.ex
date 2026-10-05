@@ -93,7 +93,12 @@ defmodule Sediment.Connection do
 
     * `:database` - The path to the database. In memory is allowed. You can use
       `:memory` or `":memory:"` to designate that. `file:` URIs with a `mode`
-      query parameter (`ro`, `rw`, `rwc`, `memory`) are accepted.
+      query parameter (`ro`, `rw`, `rwc`, `memory`) are accepted. In MVCC
+      mode (and with `:s3`) the database's log is named after the file
+      without its extension (`app.db` uses `app.db-log`), so database files
+      in one directory need distinct names before the last dot: `app.1` and
+      `app.2`, or `app.db` and `app.sqlite`, would share a log, and opening
+      one of them in MVCC mode is refused while the other exists.
     * `:default_transaction_mode` - one of `deferred` (default), `immediate`,
       `exclusive` or `concurrent`. If a mode is not specified in a call to
       `Repo.transaction/2`, this will be the default transaction mode.

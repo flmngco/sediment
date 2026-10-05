@@ -121,6 +121,11 @@ pub fn import(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Imp
     }
     let remote = cfg.remote()?;
     require_encryption_choice(cfg, &remote)?;
+    // The source's log is copied with it: it must be the source's own.
+    let _log = crate::log_guard::is_mvcc_file(source)
+        .then(|| crate::log_guard::claim(source))
+        .transpose()
+        .map_err(S3Error::Config)?;
     let size = check_source(source)?;
     let work = Work::new(source)?;
     // The source's copy, and the new database at most as large again.

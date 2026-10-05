@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* Distinct database files could share one MVCC log: turso_core names it
+  after the file without its extension, so `app.1` and `app.2` both used
+  `app.db-log`, replaying and truncating each other's commits, and an S3
+  bootstrap of one deleted the other's log. MVCC and S3 opens, switches to
+  MVCC, S3 restores, imports and exports now refuse a database file whose
+  log another database file in its directory (or one open in the VM) maps
+  to, and say which.
+
 ## 0.1.0-beta.1 (2026-10-04)
 
 First release.
