@@ -291,9 +291,12 @@ defmodule Sediment.S3 do
 
   Stop every writer of the database first: like an open, destroy takes the
   writer lease, and it returns `{:error, "s3 lease held by ..."}` while a
-  writer holds it (also one with this VM's owner name), or an error while
-  the database is open in this VM. A writer that was closed released the
-  lease; one that crashed holds it until `lease_ttl_ms` has passed.
+  writer holds it (also one with this VM's owner name), or
+  `{:error, "... is open in this VM ..."}` while a connection of this VM has
+  the database open. Connections that are closing (a pool that just stopped)
+  are waited for, up to their `:close_timeout_ms` and a second. A writer that
+  was closed released the lease; one that crashed holds it until
+  `lease_ttl_ms` has passed.
 
   The database is gone as soon as destroy replaces `manifest.json` with a
   marker that there is no database, before it deletes anything: a destroy
@@ -314,6 +317,7 @@ defmodule Sediment.S3 do
       is fenced: it acknowledges no further commit, and commits it has not
       uploaded yet are lost with the database. Use it for a writer that
       can't be stopped, not instead of waiting for a crashed one's lease.
+      It never overrides "open in this VM": close the database here first.
 
   Returns `{:ok, %{objects: n}}` with the number of objects deleted, or
   `{:error, message}`.

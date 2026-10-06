@@ -126,11 +126,37 @@ fn destroy_refuses_a_database_open_in_this_vm() {
     let store = FaultyStore::new();
     let dir = TempDir::new();
     let db = open_db(&config(&store, "a"), &dir.db("a.db")).unwrap();
+    // As a NIF connection does while it is open.
+    let attached = crate::s3::Attached::new(&db.storage);
     for force in [false, true] {
+        let started = std::time::Instant::now();
         let err = destroy(&config(&store, "d"), force).unwrap_err();
         assert!(err.to_string().contains("open in this VM"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused within the grace"
+        );
     }
     db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    drop(attached);
+}
+
+#[test]
+fn destroy_waits_for_a_database_that_is_closing() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let db = open_db(&config(&store, "a"), &dir.db("a.db")).unwrap();
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    // No connection counts it as open anymore, but the storage is still
+    // there: a pool that just stopped, its connections closing on threads
+    // of their own.
+    let closing = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(db);
+    });
+    destroy(&config(&store, "d"), false).unwrap();
+    closing.join().unwrap();
+    assert_destroyed(&store);
 }
 
 #[test]

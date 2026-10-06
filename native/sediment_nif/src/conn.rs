@@ -26,6 +26,9 @@ pub struct Handle {
     pub _db: Arc<Database>,
     pub s3: Option<Arc<S3DurableStorage>>,
     pub replica: Option<crate::replica::Replica>,
+    /// Counts this connection among the S3 storage's open ones until it
+    /// starts closing (see `S3DurableStorage::attach`).
+    pub attached: Option<crate::s3::Attached>,
 }
 
 impl From<crate::open::Opened> for Handle {
@@ -34,6 +37,7 @@ impl From<crate::open::Opened> for Handle {
             conn: opened.conn,
             _db: opened.db,
             _io: opened.io,
+            attached: opened.s3.as_ref().map(crate::s3::Attached::new),
             s3: opened.s3,
             replica: opened.replica,
         }
@@ -231,7 +235,10 @@ impl ConnRes {
             .filter_map(Weak::upgrade)
             .collect();
         let graveyard = std::mem::take(&mut *lock(&self.graveyard));
-        let handle = guard.take();
+        let mut handle = guard.take();
+        if let Some(handle) = &mut handle {
+            handle.attached.take();
+        }
         crate::cleanup::defer(move || {
             drop(pending);
             for slot in slots {
@@ -251,7 +258,10 @@ impl ConnRes {
         lock(&self.interrupt).take();
         self.finalize_all();
         self.clear_s3_guard();
-        if let Some(handle) = guard.take() {
+        if let Some(mut handle) = guard.take() {
+            // Closing from here on: not counted as open (a destroy waits for
+            // the close instead of refusing).
+            handle.attached.take();
             // `durability: async`: upload what this database committed so far.
             if let Some(storage) = &handle.s3 {
                 storage.close(storage.close_timeout());

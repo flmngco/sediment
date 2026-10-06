@@ -111,6 +111,7 @@ fn open_image(bytes: &[u8]) -> Result<Handle, String> {
         _db: db,
         s3: None,
         replica: None,
+        attached: None,
     })
 }
 

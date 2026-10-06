@@ -7,6 +7,7 @@ defmodule Sediment.S3Test do
   use ExUnit.Case, async: false
 
   alias Sediment.Engine
+  alias Sediment.Native
   alias Sediment.S3
 
   @moduletag :s3
@@ -179,6 +180,40 @@ defmodule Sediment.S3Test do
     assert {:ok, _} = S3.refresh(r1)
     assert rows.(r1) == [["a"], ["b"], ["c"]]
     for db <- [r1, r2, w], do: Engine.close(db)
+  end
+
+  test "destroy/2 right after the database's pool stopped", %{s3: s3, dir: dir} do
+    {:ok, sup} =
+      Supervisor.start_link(
+        [{Sediment, database: Path.join(dir, "a.db"), s3: s3, pool_size: 2}],
+        strategy: :one_for_one
+      )
+
+    [{_, pool, _, _}] = Supervisor.which_children(sup)
+    {:ok, _} = Sediment.query(pool, "CREATE TABLE t(x)", [])
+    :ok = Supervisor.stop(sup)
+    assert {:ok, _} = S3.destroy(s3)
+  end
+
+  test "destroy/2 waits for a connection whose owner died to close", %{
+    s3: s3,
+    dir: dir
+  } do
+    test = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, db} = Engine.open(Path.join(dir, "a.db"), s3: Keyword.put(s3, :durability, :async))
+        :ok = Native.monitor_owner(db)
+        :ok = Engine.execute(db, "CREATE TABLE t(x); INSERT INTO t VALUES (1)")
+        send(test, :open)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :open, 10_000
+    # Closed by the NIF on a thread of its own, uploading the commit first.
+    Process.exit(owner, :kill)
+    assert {:ok, _} = S3.destroy(s3)
   end
 
   test "exists?/1 and must_exist: true", %{s3: s3, dir: dir} do

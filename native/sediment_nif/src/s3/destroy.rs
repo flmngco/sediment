@@ -16,6 +16,7 @@ use super::layout::{
 use super::lease::Lease;
 use super::remote::{Put, Remote};
 use super::{default_owner, open_at, probe, purge, refuse_newer, Result, S3Config, S3Error};
+use std::time::{Duration, Instant};
 
 /// What a destroy deleted.
 #[derive(Debug)]
@@ -33,12 +34,7 @@ pub fn destroy(cfg: &S3Config, force: bool) -> Result<Destroyed> {
             "destroy can't run with mode: :replica".into(),
         ));
     }
-    if open_at(&cfg.place()) {
-        return Err(S3Error::Config(format!(
-            "the database at s3://{}/{} is open in this VM; close every connection to it first",
-            cfg.bucket, cfg.prefix
-        )));
-    }
+    wait_until_closed(cfg)?;
     let remote = cfg.remote()?;
     if cfg.verify_conditional_writes {
         probe::verify(&remote, &cfg.store_identity())?;
@@ -49,6 +45,34 @@ pub fn destroy(cfg: &S3Config, force: bool) -> Result<Destroyed> {
     // Not left to Drop: the renewal thread may hold the lease a while longer.
     lease.release();
     Ok(Destroyed { objects: ended? })
+}
+
+/// Refuses a database open in this VM. One whose connections are all closing
+/// (a pool that just stopped: an owner that died closes its connection on a
+/// thread of its own, uploading pending commits first) is waited for, at
+/// most its close timeout and a second. An owner's death reaches the NIF
+/// asynchronously, so connections still open get a moment to start closing.
+fn wait_until_closed(cfg: &S3Config) -> Result<()> {
+    const GRACE: Duration = Duration::from_millis(250);
+    let place = cfg.place();
+    let start = Instant::now();
+    loop {
+        let waiting = match open_at(&place) {
+            None => return Ok(()),
+            Some((true, _)) => start.elapsed() < GRACE,
+            Some((false, close_timeout)) => {
+                start.elapsed() < close_timeout + Duration::from_secs(1)
+            }
+        };
+        if !waiting {
+            return Err(S3Error::Config(format!(
+                "the database at s3://{}/{} is open in this VM; close every connection to it \
+                 first",
+                cfg.bucket, cfg.prefix
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Replaces the manifest with a tombstone, then purges what it ended.

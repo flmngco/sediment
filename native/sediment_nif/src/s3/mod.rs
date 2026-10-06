@@ -37,7 +37,7 @@ pub use import::{import, ImportOptions, Imported, Verify};
 pub use restore::Target;
 use snapshot::Digests;
 pub use storage::Loss;
-pub use storage::{take_last_enqueued, S3DurableStorage, S3Info};
+pub use storage::{take_last_enqueued, Attached, S3DurableStorage, S3Info};
 
 use layout::{now_ms, Epoch, Manifest, ManifestState, Tombstone, MANIFEST_KEY, MANIFEST_VERSION};
 use lease::Lease;
@@ -165,13 +165,15 @@ pub fn live_storage(local_path: &Path) -> Option<Arc<S3DurableStorage>> {
     live.get(&key).and_then(Weak::upgrade)
 }
 
-/// Whether a database at `place` (see `S3Config::place`) is open in
-/// this process.
-fn open_at(place: &str) -> bool {
+/// The database at `place` (see `S3Config::place`) in this process: whether
+/// a connection has it open (not only closing), and how long its close may
+/// take. `None`: not open here.
+fn open_at(place: &str) -> Option<(bool, std::time::Duration)> {
     let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     live.values()
         .filter_map(Weak::upgrade)
-        .any(|storage| storage.place() == place)
+        .find(|storage| storage.place() == place)
+        .map(|storage| (storage.attached() > 0, storage.close_timeout()))
 }
 
 fn prepare_fresh(

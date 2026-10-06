@@ -94,6 +94,27 @@ pub struct S3Info {
     pub lost: Option<Loss>,
 }
 
+/// One connection counted in `S3DurableStorage::attached`, until dropped
+/// (when the connection starts closing).
+pub struct Attached(Arc<S3DurableStorage>);
+
+impl Attached {
+    pub fn new(storage: &Arc<S3DurableStorage>) -> Self {
+        storage
+            .attached
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(storage.clone())
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.0
+            .attached
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct S3DurableStorage {
     inner: Storage,
     remote: Remote,
@@ -102,6 +123,8 @@ pub struct S3DurableStorage {
     location: (String, String),
     settings: String,
     place: String,
+    /// Connections that have it open and haven't started closing.
+    attached: std::sync::atomic::AtomicUsize,
     /// The key it was opened with: another open must give the same.
     encryption: Option<turso_core::EncryptionOpts>,
     retain_epochs: usize,
@@ -162,6 +185,7 @@ impl S3DurableStorage {
             location: (cfg.bucket.clone(), cfg.prefix.clone()),
             settings: cfg.settings(),
             place: cfg.place(),
+            attached: std::sync::atomic::AtomicUsize::new(0),
             encryption: cfg.encryption.clone(),
             retain_epochs: cfg.retain_epochs,
             group_commit: cfg.group_commit,
@@ -245,6 +269,11 @@ impl S3DurableStorage {
     }
 
     /// `(bucket, prefix)` this storage writes to.
+    /// Connections that have the database open and haven't started closing.
+    pub fn attached(&self) -> usize {
+        self.attached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// See `S3Config::place`.
     pub fn place(&self) -> &str {
         &self.place

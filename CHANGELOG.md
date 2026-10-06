@@ -8,6 +8,11 @@
   database's MVCC log led with turso's "Corrupt database: ... The database
   may be corrupted" and only then said whose log it was. The error now
   leads with the shared log and keeps turso's text after it.
+* `Sediment.S3.destroy/2` right after the database's pool stopped failed
+  with "open in this VM" for a moment: connections of a pool whose
+  processes died close on a thread of their own. Destroy now waits for
+  connections that are closing (up to their `:close_timeout_ms` and a
+  second) and refuses only one that is still open.
 
 ## 0.1.0-beta.2 (2026-10-05)
 
