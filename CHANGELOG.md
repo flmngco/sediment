@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* `Sediment.S3.snapshot/1`, `info/1`, `refresh/1`, `flush/2` and
+  `acknowledge_loss/1` given a process that isn't a `DBConnection` pool
+  (such as an Ecto repo's pid) waited for the 15 s checkout timeout. They
+  now raise `ArgumentError` at once, for an Ecto repo with a pointer to the
+  adapter's functions or `Ecto.Adapter.lookup_meta(repo).pid`.
+
 ## 0.1.0-beta.3 (2026-10-06)
 
 ### Fixed

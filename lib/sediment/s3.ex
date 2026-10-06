@@ -440,6 +440,8 @@ defmodule Sediment.S3 do
   # Runs an S3 operation on one connection of a DBConnection pool; see
   # Sediment.Connection.handle_execute/4.
   defp pool_call(conn, op, opts \\ []) do
+    check_pool!(conn, op)
+
     query = %Sediment.Query{
       statement: "-- sediment s3 #{inspect(op)}",
       command: {:sediment_s3, op}
@@ -450,6 +452,41 @@ defmodule Sediment.S3 do
       {:error, error} -> {:error, error}
     end
   end
+
+  # DBConnection.execute/4 on a process that isn't a pool (an Ecto repo's
+  # supervisor, say) only fails after the checkout timeout: refuse at once.
+  defp check_pool!(%DBConnection{}, _op), do: :ok
+
+  defp check_pool!(conn, op) do
+    case GenServer.whereis(conn) do
+      pid when is_pid(pid) and node(pid) == node() -> check_pool_pid!(pid, conn, op)
+      # Another node's process: DBConnection reaches it as usual.
+      pid when is_pid(pid) -> :ok
+      {_name, _node} -> :ok
+      nil -> raise ArgumentError, "#{call(op)}: no process #{inspect(conn)}"
+    end
+  end
+
+  defp check_pool_pid!(pid, conn, op) do
+    case Process.alive?(pid) && :proc_lib.translate_initial_call(pid) do
+      {module, _fun, _arity}
+      when module in [DBConnection.ConnectionPool, DBConnection.Ownership.Manager] ->
+        :ok
+
+      {:supervisor, Ecto.Repo.Supervisor, _arity} ->
+        raise ArgumentError,
+              "#{call(op)} expects a db reference or a DBConnection pool, got the Ecto repo " <>
+                "#{inspect(conn)}: use the adapter's s3_* functions (Ecto.Adapters.Sediment), " <>
+                "or pass Ecto.Adapter.lookup_meta(repo).pid"
+
+      _ ->
+        raise ArgumentError,
+              "#{call(op)} expects a db reference or a DBConnection pool, got #{inspect(conn)}"
+    end
+  end
+
+  defp call({op, _timeout}), do: call(op)
+  defp call(op), do: "Sediment.S3.#{op}"
 
   @doc """
   Waits until everything committed so far is durable in S3, at most
