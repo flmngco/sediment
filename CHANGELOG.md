@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* Opening a WAL database file (or creating one) next to another
+  database's MVCC log led with turso's "Corrupt database: ... The database
+  may be corrupted" and only then said whose log it was. The error now
+  leads with the shared log and keeps turso's text after it.
+
 ## 0.1.0-beta.2 (2026-10-05)
 
 ### S3 durability

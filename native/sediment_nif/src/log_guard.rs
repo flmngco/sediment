@@ -160,7 +160,7 @@ pub fn claim(db: &Path, purpose: Use) -> Result<Claim, String> {
 }
 
 /// turso's error for a WAL database next to another database's MVCC log
-/// suggests corruption; say whose log it is instead.
+/// suggests corruption; lead with whose log it is, keeping turso's text.
 pub fn explain_open_error(db: &Path, error: String) -> String {
     if !error.contains("MVCC logical log file exists") {
         return error;
@@ -168,7 +168,10 @@ pub fn explain_open_error(db: &Path, error: String) -> String {
     let found =
         keys(db).and_then(|(target, log)| Some((sharer(&target, &log, Use::Existing)?, target)));
     match found {
-        Some((other, target)) => format!("{error} ({})", conflict(db, &other, &target, "exists")),
+        Some((other, target)) => format!(
+            "{} (turso: {error})",
+            conflict(db, &other, &target, "exists")
+        ),
         None => error,
     }
 }

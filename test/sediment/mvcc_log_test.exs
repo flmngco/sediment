@@ -92,10 +92,15 @@ defmodule Sediment.MvccLogTest do
     log = File.read!(Path.join(dir, "app.db-log"))
     assert byte_size(log) > 0
 
-    # turso refuses the file itself (its header says WAL but a log exists).
-    assert {:error, message} = Engine.open(Path.join(dir, "app.x"))
-    assert message =~ "MVCC logical log file exists"
-    assert message =~ "would share its MVCC log"
+    # turso refuses the file (its header says WAL but a log exists) as a
+    # corrupt database; the error leads with whose log it is. A new file too.
+    for name <- ["app.x", "app.new"] do
+      assert {:error, message} = Engine.open(Path.join(dir, name))
+      assert String.starts_with?(message, shared_log_error(dir, name, "app.1"))
+      assert message =~ "(turso: Corrupt database: MVCC logical log file exists"
+    end
+
+    File.rm(Path.join(dir, "app.new"))
 
     assert File.read!(Path.join(dir, "app.db-log")) == log
     File.rm!(Path.join(dir, "app.x"))
