@@ -174,7 +174,12 @@ fn s3_request_counts(env: Env<'_>) -> Term<'_> {
 /// Waits until everything committed through this database so far (all
 /// connections) is in S3. `cancel/1` interrupts the wait.
 #[rustler::nif(schedule = "DirtyIo")]
-fn s3_flush<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, timeout_ms: u64) -> Term<'a> {
+fn s3_flush<'a>(
+    env: Env<'a>,
+    res: ResourceArc<ConnRes>,
+    timeout_ms: u64,
+    admission: u64,
+) -> Term<'a> {
     let storage = {
         let guard = res.handle();
         match guard.as_ref() {
@@ -185,10 +190,9 @@ fn s3_flush<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, timeout_ms: u64) -> Ter
             },
         }
     };
-    let flushed = s3::remote::with_cancel(&res.cancelled, || {
+    let flushed = s3::remote::with_cancel(&|| res.is_cancelled(admission), || {
         storage.flush(std::time::Duration::from_millis(timeout_ms))
     });
-    res.consume_cancel();
     match flushed {
         Ok((epoch, offset)) => {
             let map = rustler::Term::map_from_pairs(
@@ -212,7 +216,12 @@ fn s3_flush<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, timeout_ms: u64) -> Ter
 /// statement or transaction committed is in S3, and no longer. `{:ok, nil}`
 /// at once when it committed nothing (a read), so reads never wait for S3.
 #[rustler::nif(schedule = "DirtyIo")]
-fn s3_flush_commit<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, timeout_ms: u64) -> Term<'a> {
+fn s3_flush_commit<'a>(
+    env: Env<'a>,
+    res: ResourceArc<ConnRes>,
+    timeout_ms: u64,
+    admission: u64,
+) -> Term<'a> {
     let mark = res.take_commit_mark();
     if !mark.wrote && mark.seq.is_none() {
         return ok_tuple(env, rustler::types::atom::nil());
@@ -231,11 +240,10 @@ fn s3_flush_commit<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, timeout_ms: u64)
     // No sequence although it wrote: nothing queued (sync durability), or
     // turso's group commit queued this commit on another connection's
     // thread; waiting for everything queued covers it.
-    let flushed = s3::remote::with_cancel(&res.cancelled, || match mark.seq {
+    let flushed = s3::remote::with_cancel(&|| res.is_cancelled(admission), || match mark.seq {
         Some(seq) => storage.flush_through(seq, timeout),
         None => storage.flush(timeout),
     });
-    res.consume_cancel();
     match flushed {
         Ok(_) => ok_tuple(env, rustler::types::atom::ok()),
         Err(err) => error_tuple(env, describe(&err)),

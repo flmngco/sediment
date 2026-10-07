@@ -45,8 +45,8 @@ defmodule Sediment.Native do
   @spec close(db()) :: :ok | {:error, reason()}
   def close(_conn), do: :erlang.nif_error(:not_loaded)
 
-  @spec close_interrupting(db()) :: :ok | {:error, reason()}
-  def close_interrupting(_conn), do: :erlang.nif_error(:not_loaded)
+  @spec start_closing(db()) :: :ok
+  def start_closing(_conn), do: :erlang.nif_error(:not_loaded)
 
   @spec interrupt(db()) :: :ok | {:error, reason()}
   def interrupt(_conn), do: :erlang.nif_error(:not_loaded)
@@ -54,8 +54,8 @@ defmodule Sediment.Native do
   @spec cancel(db()) :: :ok | {:error, reason()}
   def cancel(_conn), do: :erlang.nif_error(:not_loaded)
 
-  @spec clear_cancel(db()) :: :ok
-  def clear_cancel(_conn), do: :erlang.nif_error(:not_loaded)
+  @spec admit(db()) :: non_neg_integer()
+  def admit(_conn), do: :erlang.nif_error(:not_loaded)
 
   @spec set_busy_timeout(db(), integer()) :: :ok | {:error, reason()}
   def set_busy_timeout(_conn, _timeout_ms), do: :erlang.nif_error(:not_loaded)
@@ -68,8 +68,13 @@ defmodule Sediment.Native do
   @spec execute(db(), String.t()) :: :ok | {:sleep, pos_integer()} | {:error, reason()}
   def execute(_conn, _sql), do: :erlang.nif_error(:not_loaded)
 
-  @spec execute_resume(db()) :: :ok | {:sleep, pos_integer()} | {:error, reason()}
-  def execute_resume(_conn), do: :erlang.nif_error(:not_loaded)
+  @spec execute(db(), String.t(), non_neg_integer()) ::
+          :ok | {:sleep, pos_integer()} | {:error, reason()}
+  def execute(_conn, _sql, _admission), do: :erlang.nif_error(:not_loaded)
+
+  @spec execute_resume(db(), non_neg_integer()) ::
+          :ok | {:sleep, pos_integer()} | {:error, reason()}
+  def execute_resume(_conn, _admission), do: :erlang.nif_error(:not_loaded)
 
   @spec changes(db()) :: {:ok, integer()} | {:error, reason()}
   def changes(_conn), do: :erlang.nif_error(:not_loaded)
@@ -84,17 +89,22 @@ defmodule Sediment.Native do
           :done | :busy | {:row, row()} | {:sleep, pos_integer()} | {:error, reason()}
   def step(_conn, _statement), do: :erlang.nif_error(:not_loaded)
 
-  @spec run_prepared(db(), statement(), list()) ::
+  @spec step(db(), statement(), non_neg_integer()) ::
+          :done | :busy | {:row, row()} | {:sleep, pos_integer()} | {:error, reason()}
+  def step(_conn, _statement, _admission), do: :erlang.nif_error(:not_loaded)
+
+  @spec run_prepared(db(), statement(), list(), non_neg_integer()) ::
           {:ok, [String.t()], [[term()]], non_neg_integer(), :idle | :transaction}
           | {:sleep, pos_integer(), [[term()]]}
           | {:error, :parameter_count | reason()}
-  def run_prepared(_conn, _statement, _params), do: :erlang.nif_error(:not_loaded)
+  def run_prepared(_conn, _statement, _params, _admission),
+    do: :erlang.nif_error(:not_loaded)
 
-  @spec resume_prepared(db(), statement()) ::
+  @spec resume_prepared(db(), statement(), non_neg_integer()) ::
           {:ok, [String.t()], [[term()]], non_neg_integer(), :idle | :transaction}
           | {:sleep, pos_integer(), [[term()]]}
           | {:error, reason()}
-  def resume_prepared(_conn, _statement), do: :erlang.nif_error(:not_loaded)
+  def resume_prepared(_conn, _statement, _admission), do: :erlang.nif_error(:not_loaded)
 
   @spec multi_step(db(), statement(), integer()) ::
           :busy
@@ -103,6 +113,15 @@ defmodule Sediment.Native do
           | {:sleep, pos_integer(), [row()]}
           | {:error, reason()}
   def multi_step(_conn, _statement, _chunk_size), do: :erlang.nif_error(:not_loaded)
+
+  @spec multi_step(db(), statement(), integer(), non_neg_integer()) ::
+          :busy
+          | {:rows, [row()]}
+          | {:done, [row()]}
+          | {:sleep, pos_integer(), [row()]}
+          | {:error, reason()}
+  def multi_step(_conn, _statement, _chunk_size, _admission),
+    do: :erlang.nif_error(:not_loaded)
 
   @spec columns(db(), statement()) :: {:ok, [binary()]} | {:error, reason()}
   def columns(_conn, _statement), do: :erlang.nif_error(:not_loaded)
@@ -146,11 +165,12 @@ defmodule Sediment.Native do
   @spec s3_flush_snapshot(db()) :: {:ok, boolean()} | {:error, reason()}
   def s3_flush_snapshot(_conn), do: :erlang.nif_error(:not_loaded)
 
-  @spec s3_flush(db(), non_neg_integer()) :: {:ok, map()} | {:error, reason()}
-  def s3_flush(_conn, _timeout_ms), do: :erlang.nif_error(:not_loaded)
+  @spec s3_flush(db(), non_neg_integer(), non_neg_integer()) :: {:ok, map()} | {:error, reason()}
+  def s3_flush(_conn, _timeout_ms, _admission), do: :erlang.nif_error(:not_loaded)
 
-  @spec s3_flush_commit(db(), non_neg_integer()) :: {:ok, :ok | nil} | {:error, reason()}
-  def s3_flush_commit(_conn, _timeout_ms), do: :erlang.nif_error(:not_loaded)
+  @spec s3_flush_commit(db(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, :ok | nil} | {:error, reason()}
+  def s3_flush_commit(_conn, _timeout_ms, _admission), do: :erlang.nif_error(:not_loaded)
 
   @spec s3_acknowledge_loss(db()) :: {:ok, map() | nil} | {:error, reason()}
   def s3_acknowledge_loss(_conn), do: :erlang.nif_error(:not_loaded)

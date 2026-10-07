@@ -99,30 +99,31 @@ where
     }
 }
 
+type Cancelled = *const (dyn Fn() -> bool + 'static);
+
 thread_local! {
-    static CANCEL: std::cell::Cell<*const std::sync::atomic::AtomicBool> =
-        const { std::cell::Cell::new(std::ptr::null()) };
+    static CANCEL: std::cell::Cell<Option<Cancelled>> = const { std::cell::Cell::new(None) };
 }
 
-/// Runs `f` with `flag` as this thread's cancellation flag: S3 waits inside
-/// it (a commit's upload) give up when the flag is set, e.g. by cancel/1.
-pub fn with_cancel<T>(flag: &std::sync::atomic::AtomicBool, f: impl FnOnce() -> T) -> T {
-    struct Reset(*const std::sync::atomic::AtomicBool);
+/// Runs `f` with `cancelled` as this thread's cancellation check: S3 waits
+/// inside it (a commit's upload) give up once it returns true, e.g. after
+/// cancel/1.
+pub fn with_cancel<T>(cancelled: &dyn Fn() -> bool, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Cancelled>);
     impl Drop for Reset {
         fn drop(&mut self) {
             CANCEL.with(|c| c.set(self.0));
         }
     }
-    let _reset = Reset(CANCEL.with(|c| c.replace(flag)));
+    // SAFETY: only called (in `cancelled`) while `f` runs, which borrows it.
+    let check: Cancelled = unsafe { std::mem::transmute(cancelled) };
+    let _reset = Reset(CANCEL.with(|c| c.replace(Some(check))));
     f()
 }
 
 pub(crate) fn cancelled() -> bool {
-    CANCEL.with(|c| {
-        let flag = c.get();
-        // Only set for the duration of `with_cancel`, which borrows the flag.
-        !flag.is_null() && unsafe { &*flag }.load(std::sync::atomic::Ordering::SeqCst)
-    })
+    // SAFETY: set only for the duration of `with_cancel` (see there).
+    CANCEL.with(|c| c.get().is_some_and(|check| unsafe { (*check)() }))
 }
 
 /// Precondition for a PUT.

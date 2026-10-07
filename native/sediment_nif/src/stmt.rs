@@ -85,7 +85,6 @@ fn from_err(err: LimboError) -> Step {
 }
 
 fn cancelled(res: &ConnRes, stmt: &mut Statement) -> Step {
-    res.consume_cancel();
     let _ = guarded(res, || stmt.reset());
     Step::Error("interrupted".to_string())
 }
@@ -259,8 +258,9 @@ pub fn advance_with(
     let _ = crate::s3::take_last_enqueued();
     let _running = res.running();
     // cancel/1 also gives up an S3 upload this step is waiting on.
-    let step =
-        crate::s3::remote::with_cancel(&res.cancelled, || advance_inner(res, stmt, baseline));
+    let step = crate::s3::remote::with_cancel(&|| res.active_cancelled(), || {
+        advance_inner(res, stmt, baseline)
+    });
     if let Some(seq) = crate::s3::take_last_enqueued() {
         res.note_queued(seq);
     }
@@ -290,7 +290,7 @@ pub fn advance_blocking(res: &ConnRes, stmt: &mut Statement) -> Result<Step, Ste
             Step::Sleep(duration) => {
                 let deadline = Instant::now() + duration;
                 loop {
-                    if res.cancelled.load(Ordering::SeqCst) {
+                    if res.active_cancelled() {
                         return Err(cancelled(res, stmt));
                     }
                     let now = Instant::now();
@@ -337,7 +337,7 @@ fn advance_inner(
     res.check_s3_mvcc().map_err(Step::Error)?;
     // A cancel/1 issued since `Sediment.Engine` started this operation:
     // while its call waited for a scheduler, or during a busy backoff.
-    if res.cancelled.load(Ordering::SeqCst) {
+    if res.active_cancelled() {
         return Err(cancelled(res, stmt));
     }
     let state = stmt.execution_state();
@@ -367,12 +367,11 @@ fn advance_inner(
                 return Ok(Step::Busy);
             }
             Ok(StepResult::Interrupt) => {
-                res.consume_cancel();
                 let _ = guarded(res, || stmt.reset());
                 return Err(Step::Error("interrupted".to_string()));
             }
             Ok(StepResult::IO) | Ok(StepResult::Yield) => {
-                if res.cancelled.load(Ordering::SeqCst) {
+                if res.active_cancelled() {
                     return Err(cancelled(res, stmt));
                 }
                 guarded(res, || stmt._io().step())?.map_err(from_err)?;
@@ -388,7 +387,7 @@ fn advance_inner(
                     let _ = guarded(res, || stmt.reset());
                     return Ok(Step::Busy);
                 }
-                if res.cancelled.load(Ordering::SeqCst) {
+                if res.active_cancelled() {
                     return Err(cancelled(res, stmt));
                 }
                 return Ok(Step::Sleep(duration));
@@ -485,17 +484,40 @@ fn prepare<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, sql: String) -> Term<'a>
     }
 }
 
+/// `step/3` admitted when the call starts (exqlite's `step/2`).
 #[rustler::nif(schedule = "DirtyIo")]
 fn step<'a>(
     env: Env<'a>,
     res: ResourceArc<ConnRes>,
     stmt: ResourceArc<StmtRes>,
 ) -> NifResult<Term<'a>> {
+    let admission = res.admit();
+    run_step(env, res, stmt, admission)
+}
+
+/// Steps for an operation admitted with `admission` (see `ConnRes::cancels`).
+#[rustler::nif(schedule = "DirtyIo", name = "step")]
+fn step_admitted<'a>(
+    env: Env<'a>,
+    res: ResourceArc<ConnRes>,
+    stmt: ResourceArc<StmtRes>,
+    admission: u64,
+) -> NifResult<Term<'a>> {
+    run_step(env, res, stmt, admission)
+}
+
+fn run_step<'a>(
+    env: Env<'a>,
+    res: ResourceArc<ConnRes>,
+    stmt: ResourceArc<StmtRes>,
+    admission: u64,
+) -> NifResult<Term<'a>> {
     check_owner(&res, &stmt)?;
     let guard = res.handle();
     if guard.is_none() {
         return Ok(closed(env));
     }
+    let _active = res.begin(admission);
     let mut stmt_guard = lock(&stmt.stmt);
     let Some(statement) = stmt_guard.as_mut() else {
         return Ok(error_tuple(env, atoms::invalid_statement()));
@@ -521,6 +543,7 @@ fn step<'a>(
     })
 }
 
+/// `multi_step/4` admitted when the call starts (exqlite's `multi_step/3`).
 #[rustler::nif(schedule = "DirtyIo")]
 fn multi_step<'a>(
     env: Env<'a>,
@@ -528,11 +551,35 @@ fn multi_step<'a>(
     stmt: ResourceArc<StmtRes>,
     chunk_size: i64,
 ) -> NifResult<Term<'a>> {
+    let admission = res.admit();
+    run_multi_step(env, res, stmt, chunk_size, admission)
+}
+
+/// `multi_step` for an operation admitted with `admission`.
+#[rustler::nif(schedule = "DirtyIo", name = "multi_step")]
+fn multi_step_admitted<'a>(
+    env: Env<'a>,
+    res: ResourceArc<ConnRes>,
+    stmt: ResourceArc<StmtRes>,
+    chunk_size: i64,
+    admission: u64,
+) -> NifResult<Term<'a>> {
+    run_multi_step(env, res, stmt, chunk_size, admission)
+}
+
+fn run_multi_step<'a>(
+    env: Env<'a>,
+    res: ResourceArc<ConnRes>,
+    stmt: ResourceArc<StmtRes>,
+    chunk_size: i64,
+    admission: u64,
+) -> NifResult<Term<'a>> {
     check_owner(&res, &stmt)?;
     let guard = res.handle();
     if guard.is_none() {
         return Ok(closed(env));
     }
+    let _active = res.begin(admission);
     let mut stmt_guard = lock(&stmt.stmt);
     let Some(statement) = stmt_guard.as_mut() else {
         return Ok(error_tuple(env, atoms::invalid_statement()));
@@ -578,12 +625,14 @@ fn run_prepared<'a>(
     res: ResourceArc<ConnRes>,
     stmt: ResourceArc<StmtRes>,
     params: Vec<Term<'a>>,
+    admission: u64,
 ) -> NifResult<Term<'a>> {
     check_owner(&res, &stmt)?;
     let guard = res.handle();
     let Some(handle) = guard.as_ref() else {
         return Ok(closed(env));
     };
+    let _active = res.begin(admission);
     let mut stmt_guard = lock(&stmt.stmt);
     let Some(statement) = stmt_guard.as_mut() else {
         return Ok(error_tuple(env, atoms::invalid_statement()));
@@ -625,12 +674,14 @@ fn resume_prepared<'a>(
     env: Env<'a>,
     res: ResourceArc<ConnRes>,
     stmt: ResourceArc<StmtRes>,
+    admission: u64,
 ) -> NifResult<Term<'a>> {
     check_owner(&res, &stmt)?;
     let guard = res.handle();
     let Some(handle) = guard.as_ref() else {
         return Ok(closed(env));
     };
+    let _active = res.begin(admission);
     let mut stmt_guard = lock(&stmt.stmt);
     let Some(statement) = stmt_guard.as_mut() else {
         return Ok(error_tuple(env, atoms::invalid_statement()));
@@ -899,17 +950,20 @@ mod tests {
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
 
     /// Runs `ENDLESS` on `res`'s connection through the driver's step loop on
-    /// a thread of its own (the hooks are per thread), with `hook` run right
-    /// before each call into turso; the result, unless it ran for a minute.
+    /// a thread of its own (the hooks are per thread), as an operation
+    /// admitted with `admission`, with `hook` run right before each call into
+    /// turso; the result, unless it ran for a minute.
     fn endless_with(
         res: Arc<ConnRes>,
         conn: Arc<Connection>,
+        admission: u64,
         hook: impl FnMut() + Send + 'static,
     ) -> Option<Result<Step, Step>> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             BEFORE_STEP.with(|before| *before.borrow_mut() = Some(Box::new(hook)));
             let mut stmt = conn.prepare(ENDLESS).unwrap();
+            let _active = res.begin(admission);
             let _ = tx.send(advance(&res, &mut stmt));
         });
         rx.recv_timeout(Duration::from_secs(60)).ok()
@@ -925,33 +979,68 @@ mod tests {
         db.connect().unwrap()
     }
 
+    fn interrupted(step: Option<Result<Step, Step>>) -> bool {
+        matches!(step, Some(Err(Step::Error(ref msg))) if msg == "interrupted")
+    }
+
     #[test]
     fn a_cancel_landing_just_before_turso_starts_the_statement_stops_it() {
         // turso's interrupt only reaches a statement that is executing; this
-        // cancel lands after the driver's last look at the flag, before that.
+        // cancel lands after the driver's last look at it, before that.
         let conn = memory_conn();
         let res = Arc::new(ConnRes::detached_with(conn.clone()));
         let canceller = res.clone();
         let mut once = true;
-        let step = endless_with(res.clone(), conn, move || {
+        let admission = res.admit();
+        let step = endless_with(res.clone(), conn, admission, move || {
             if std::mem::take(&mut once) {
                 ConnRes::request_cancel(canceller.clone());
             }
         });
-        let step = step.expect("the cancel stopped the statement");
-        assert!(matches!(step, Err(Step::Error(ref msg)) if msg == "interrupted"));
-        assert!(!res.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(interrupted(step));
     }
 
     #[test]
-    fn a_cancel_before_the_call_applies_and_is_used_up() {
+    fn a_cancel_applies_to_operations_admitted_before_it_only() {
+        // A admitted, the cancel, then B admitted: B's admission doesn't
+        // erase A's cancel (A still waiting for a scheduler, say), and the
+        // cancel doesn't reach B.
         let conn = memory_conn();
         let res = Arc::new(ConnRes::detached_with(conn.clone()));
+        let a = res.admit();
         ConnRes::request_cancel(res.clone());
-        let step = endless_with(res.clone(), conn.clone(), || {}).expect("stopped");
-        assert!(matches!(step, Err(Step::Error(ref msg)) if msg == "interrupted"));
+        let b = res.admit();
+        let mut stmt = conn.prepare("SELECT 42").unwrap();
+        {
+            let _active = res.begin(b);
+            assert!(matches!(advance(&res, &mut stmt), Ok(Step::Row)));
+        }
+        assert!(interrupted(endless_with(
+            res.clone(),
+            conn.clone(),
+            a,
+            || {}
+        )));
         let mut stmt = conn.prepare("SELECT 1").unwrap();
+        let _active = res.begin(b);
         assert!(matches!(advance(&res, &mut stmt), Ok(Step::Row)));
+    }
+
+    #[test]
+    fn closing_stops_every_operation_admitted_before_or_after_it() {
+        let conn = memory_conn();
+        let res = Arc::new(ConnRes::detached_with(conn.clone()));
+        let before = res.admit();
+        ConnRes::start_closing(res.clone());
+        let after = res.admit();
+        for admission in [before, after] {
+            assert!(interrupted(endless_with(
+                res.clone(),
+                conn.clone(),
+                admission,
+                || {}
+            )));
+        }
     }
 
     #[test]

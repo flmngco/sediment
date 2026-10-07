@@ -1595,7 +1595,9 @@ fn a_commit_waiting_on_s3_gives_up_when_cancelled() {
     let commit = {
         let (db, flag) = (db.clone(), flag.clone());
         std::thread::spawn(move || {
-            super::remote::with_cancel(&flag, || db.exec("INSERT INTO t VALUES (1)"))
+            super::remote::with_cancel(&|| flag.load(std::sync::atomic::Ordering::SeqCst), || {
+                db.exec("INSERT INTO t VALUES (1)")
+            })
         })
     };
     std::thread::sleep(Duration::from_millis(200));

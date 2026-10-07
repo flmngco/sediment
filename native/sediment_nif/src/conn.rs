@@ -52,13 +52,17 @@ pub struct ConnRes {
     pub id: u64,
     handle: Mutex<Option<Handle>>,
     pub interrupt: Mutex<Option<Arc<Connection>>>,
-    /// A cancel/1 that no operation consumed yet. Operations never clear it
-    /// when they start (a cancel can land while the call waits for a dirty
-    /// scheduler); `Sediment.Engine` clears it (`clear_cancel`) before it
-    /// starts one, and an operation that gives up on it consumes it.
-    pub cancelled: AtomicBool,
-    /// Set by close: `cancelled` stays set from then on.
+    /// cancel/1s so far. An operation is admitted (`admit`) with the count
+    /// at that moment, before its native call is queued, and gives up once
+    /// the count is past it: a cancel applies to every operation admitted
+    /// before it, also one still waiting for a dirty scheduler, and to none
+    /// admitted after it. Nothing ever clears a cancel.
+    cancels: AtomicU64,
+    /// Set by `start_closing`: every operation gives up from then on.
     closing: AtomicBool,
+    /// The admission of the operation holding `handle` (`NONE` without one).
+    /// Changed under the `interrupt` lock.
+    active: AtomicU64,
     /// Operations stepping turso right now (see `request_cancel`).
     running: AtomicU64,
     /// Set when turso panicked on this connection: its state is unknown, so
@@ -98,6 +102,19 @@ pub struct ConnRes {
     /// The database was opened with `experimental: [:attach]`, so it may not
     /// switch to MVCC (see `log_guard`).
     pub attach: bool,
+}
+
+/// No operation holds the connection (see `ConnRes::active`).
+const NONE: u64 = u64::MAX;
+
+/// See `ConnRes::begin`.
+pub struct Active<'a>(&'a ConnRes);
+
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        let _conn = lock(&self.0.interrupt);
+        self.0.active.store(NONE, Ordering::SeqCst);
+    }
 }
 
 /// See `ConnRes::running`.
@@ -146,9 +163,10 @@ impl rustler::Resource for ConnRes {
             return;
         };
         // An operation still running (say, a commit waiting on S3) gives up.
+        ConnRes::start_closing(me.clone());
         let spawned = std::thread::Builder::new()
             .name("sediment_owner_down".into())
-            .spawn(move || me.close_now(true));
+            .spawn(move || me.close_now());
         if let Err(err) = spawned {
             eprintln!("sediment: could not close a connection after its owner died: {err}");
         }
@@ -187,65 +205,93 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl ConnRes {
-    /// cancel/1: the running operation, or one whose call is on its way,
-    /// gives up. turso's interrupt only reaches a statement that is already
-    /// executing, so while an operation runs it is repeated until that
-    /// operation consumed the cancel (or ended): one that checked the flag
-    /// just before turso started the statement still stops.
+    /// The admission for an operation about to start (see `cancels`).
+    pub fn admit(&self) -> u64 {
+        self.cancels.load(Ordering::SeqCst)
+    }
+
+    /// Whether an operation admitted with `admission` must give up.
+    pub fn is_cancelled(&self, admission: u64) -> bool {
+        self.closing.load(Ordering::SeqCst) || self.cancels.load(Ordering::SeqCst) > admission
+    }
+
+    /// `is_cancelled` for the operation holding `handle`.
+    pub fn active_cancelled(&self) -> bool {
+        let active = self.active.load(Ordering::SeqCst);
+        active != NONE && self.is_cancelled(active)
+    }
+
+    /// The operation admitted with `admission` holds `handle` while the
+    /// guard lives (see `active`).
+    pub fn begin(&self, admission: u64) -> Active<'_> {
+        let _conn = lock(&self.interrupt);
+        self.active.store(admission, Ordering::SeqCst);
+        Active(self)
+    }
+
+    /// cancel/1: every operation admitted so far gives up. turso's interrupt
+    /// only reaches a statement that is executing, and is sent only then;
+    /// while one runs, it is repeated until the operation stops (or another
+    /// one, not cancelled, holds the connection), so an operation that
+    /// checked just before turso started its statement still stops.
     pub fn request_cancel<R>(this: R)
     where
         R: std::ops::Deref<Target = ConnRes> + Send + 'static,
     {
-        {
-            let conn = lock(&this.interrupt);
-            if conn.is_none() {
-                return;
-            }
-            this.cancelled.store(true, Ordering::SeqCst);
-            if let Some(conn) = conn.as_ref() {
-                conn.interrupt();
-            }
-        }
-        if this.running.load(Ordering::SeqCst) > 0 {
+        this.cancels.fetch_add(1, Ordering::SeqCst);
+        Self::interrupt_running(this);
+    }
+
+    /// The pool discards the connection (or its owner died): every operation
+    /// gives up from now on, including one admitted later. Runs on a normal
+    /// scheduler, so it works while every dirty scheduler is taken.
+    pub fn start_closing<R>(this: R)
+    where
+        R: std::ops::Deref<Target = ConnRes> + Send + 'static,
+    {
+        this.closing.store(true, Ordering::SeqCst);
+        Self::interrupt_running(this);
+    }
+
+    fn interrupt_running<R>(this: R)
+    where
+        R: std::ops::Deref<Target = ConnRes> + Send + 'static,
+    {
+        if this.interrupt_once() {
             let spawned = std::thread::Builder::new()
                 .name("sediment_cancel".into())
-                .spawn(move || this.repeat_interrupt());
+                .spawn(move || {
+                    while {
+                        std::thread::sleep(Duration::from_millis(1));
+                        this.interrupt_once()
+                    } {}
+                });
             if let Err(err) = spawned {
                 eprintln!("sediment: could not start repeating a cancel: {err}");
             }
         }
     }
 
-    /// Interrupts turso every millisecond while an operation runs and the
-    /// cancel is still pending. Checked and sent under the `interrupt` lock,
-    /// which consuming the cancel takes too, so no interrupt is sent after
-    /// the operation gave up (it would reach the next statement).
-    fn repeat_interrupt(&self) {
-        loop {
-            {
-                let conn = lock(&self.interrupt);
-                let pending = self.cancelled.load(Ordering::SeqCst)
-                    && self.running.load(Ordering::SeqCst) > 0;
-                match conn.as_ref() {
-                    Some(conn) if pending => conn.interrupt(),
-                    _ => return,
-                }
+    /// Interrupts turso if the operation holding the connection is cancelled
+    /// and stepping. Checked and sent under the `interrupt` lock, which
+    /// `begin` and its end take too, so it never reaches an operation that
+    /// isn't cancelled. Whether to try again.
+    fn interrupt_once(&self) -> bool {
+        let conn = lock(&self.interrupt);
+        let pending = self.active_cancelled() && self.running.load(Ordering::SeqCst) > 0;
+        match conn.as_ref() {
+            Some(conn) if pending => {
+                conn.interrupt();
+                true
             }
-            std::thread::sleep(Duration::from_millis(1));
+            _ => false,
         }
     }
 
-    /// An operation gave up on the cancel (or `Sediment.Engine` starts a new
-    /// one): it no longer applies, unless the connection is closing.
-    pub fn consume_cancel(&self) {
-        let _conn = lock(&self.interrupt);
-        if !self.closing.load(Ordering::SeqCst) {
-            self.cancelled.store(false, Ordering::SeqCst);
-        }
-    }
-
-    /// Counts an operation as running while the guard lives. Taken before
-    /// the operation's first look at `cancelled` (see `request_cancel`).
+    /// Counts an operation as stepping turso while the guard lives. Taken
+    /// before the operation's first look at `active_cancelled`: a cancel
+    /// either sees it running (and interrupts) or the operation sees the
+    /// cancel.
     pub fn running(&self) -> Running<'_> {
         self.running.fetch_add(1, Ordering::SeqCst);
         Running(self)
@@ -267,8 +313,9 @@ impl ConnRes {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             handle: Mutex::new(None),
             interrupt: Mutex::new(None),
-            cancelled: AtomicBool::new(false),
+            cancels: AtomicU64::new(0),
             closing: AtomicBool::new(false),
+            active: AtomicU64::new(NONE),
             running: AtomicU64::new(0),
             broken: AtomicBool::new(false),
             panic_next_step: AtomicBool::new(false),
@@ -342,19 +389,9 @@ impl ConnRes {
     }
 
     /// Closes the connection, waiting for a running operation first (until
-    /// then interrupt/1 must still be able to reach it). With `interrupt`, the
-    /// running operation is interrupted until it stops, and one starting
-    /// meanwhile gives up at once, so the wait ends (a pool discarding the
-    /// connection, or its owner gone).
-    pub fn close_now(&self, interrupt: bool) {
-        if interrupt {
-            {
-                let _conn = lock(&self.interrupt);
-                self.closing.store(true, Ordering::SeqCst);
-                self.cancelled.store(true, Ordering::SeqCst);
-            }
-            self.repeat_interrupt();
-        }
+    /// then interrupt/1 must still be able to reach it). `start_closing`
+    /// first makes that operation stop.
+    pub fn close_now(&self) {
         let mut guard = self.handle();
         lock(&self.interrupt).take();
         self.finalize_all();
@@ -695,8 +732,9 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         handle: Mutex::new(None),
         interrupt: Mutex::new(Some(opened.conn.clone())),
-        cancelled: AtomicBool::new(false),
+        cancels: AtomicU64::new(0),
         closing: AtomicBool::new(false),
+        active: AtomicU64::new(NONE),
         running: AtomicU64::new(0),
         broken: AtomicBool::new(false),
         panic_next_step: AtomicBool::new(false),
@@ -737,44 +775,63 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn close(res: ResourceArc<ConnRes>) -> Atom {
     lock(&res.self_ref).take();
-    res.close_now(false);
+    res.close_now();
     atoms::ok()
 }
 
-/// `close`, interrupting a running operation until it stops (see
-/// `ConnRes::close_now`): a pool discarding a connection a client timed out on.
-#[rustler::nif(schedule = "DirtyIo")]
-fn close_interrupting(res: ResourceArc<ConnRes>) -> Atom {
-    lock(&res.self_ref).take();
-    res.close_now(true);
+/// A pool discards the connection: the running operation stops, and every
+/// later one gives up at once; `close/1` follows. On a normal scheduler.
+#[rustler::nif]
+fn start_closing(res: ResourceArc<ConnRes>) -> Atom {
+    ConnRes::start_closing(res);
     atoms::ok()
 }
 
+/// `execute/3` admitted when the call starts (exqlite's `execute/2`).
 #[rustler::nif(schedule = "DirtyIo")]
 fn execute<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, sql: String) -> Term<'a> {
+    let admission = res.admit();
+    run_execute(env, &res, sql, admission)
+}
+
+/// Runs a script for an operation admitted with `admission` (see
+/// `ConnRes::cancels`).
+#[rustler::nif(schedule = "DirtyIo", name = "execute")]
+fn execute_admitted<'a>(
+    env: Env<'a>,
+    res: ResourceArc<ConnRes>,
+    sql: String,
+    admission: u64,
+) -> Term<'a> {
+    run_execute(env, &res, sql, admission)
+}
+
+fn run_execute<'a>(env: Env<'a>, res: &ConnRes, sql: String, admission: u64) -> Term<'a> {
     let guard = res.handle();
     let Some(handle) = guard.as_ref() else {
         return closed(env);
     };
+    let _active = res.begin(admission);
     // A script abandoned mid-wait (its caller gave up) is dropped.
     drop(lock(&res.pending_script).take());
     if crate::mvcc_guard::requests_mvcc(&sql) {
-        if let Err(step) = crate::mvcc_guard::check_switch(&res, &handle.conn) {
+        if let Err(step) = crate::mvcc_guard::check_switch(res, &handle.conn) {
             return step.into_error(env);
         }
     }
-    let outcome = run_script_resumable(&res, &handle.conn, None, &sql);
-    script_result(env, &res, outcome)
+    let outcome = run_script_resumable(res, &handle.conn, None, &sql);
+    script_result(env, res, outcome)
 }
 
 /// Continues an `execute` that returned `{:sleep, ms}` after the caller
 /// waited; a `cancel/1` issued during the wait still applies.
 #[rustler::nif(schedule = "DirtyIo")]
-fn execute_resume(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
+fn execute_resume(env: Env<'_>, res: ResourceArc<ConnRes>, admission: u64) -> Term<'_> {
     let guard = res.handle();
     let Some(handle) = guard.as_ref() else {
         return closed(env);
     };
+    let _active = res.begin(admission);
     let Some(pending) = lock(&res.pending_script).take() else {
         return error_tuple(env, "no execute to resume");
     };
@@ -805,13 +862,12 @@ fn cancel(res: ResourceArc<ConnRes>) -> Atom {
     atoms::ok()
 }
 
-/// `Sediment.Engine` starts an operation: a cancel issued before it doesn't
-/// apply to it. On a normal scheduler, before the operation's dirty call is
-/// queued (a cancel landing while it waits for a scheduler applies).
+/// The admission of an operation `Sediment.Engine` starts (see
+/// `ConnRes::cancels`), taken on a normal scheduler before the operation's
+/// native calls are queued, and passed to each of them.
 #[rustler::nif]
-fn clear_cancel(res: ResourceArc<ConnRes>) -> Atom {
-    res.consume_cancel();
-    atoms::ok()
+fn admit(res: ResourceArc<ConnRes>) -> u64 {
+    res.admit()
 }
 
 fn with_conn<'a>(
@@ -900,4 +956,45 @@ fn resource_counts() -> (i64, i64) {
 fn debug_panic_next_step(res: ResourceArc<ConnRes>) -> Atom {
     res.panic_next_step.store(true, Ordering::SeqCst);
     atoms::ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnRes;
+    use std::sync::Arc;
+    use turso_core::{Database, MemoryIO, OpenOptions, SqliteDialect};
+
+    fn res() -> Arc<ConnRes> {
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        Arc::new(ConnRes::detached_with(db.connect().unwrap()))
+    }
+
+    #[test]
+    fn a_cancel_interrupts_only_the_cancelled_operation_while_it_steps() {
+        let res = res();
+        let a = res.admit();
+        ConnRes::request_cancel(res.clone());
+        let b = res.admit();
+        {
+            let _active = res.begin(a);
+            assert!(!res.interrupt_once(), "not stepping yet");
+            let _running = res.running();
+            assert!(res.interrupt_once());
+        }
+        {
+            // Admitted after the cancel: a repeat left over from it stops here.
+            let _active = res.begin(b);
+            let _running = res.running();
+            assert!(!res.interrupt_once());
+        }
+        ConnRes::start_closing(res.clone());
+        let _active = res.begin(res.admit());
+        let _running = res.running();
+        assert!(res.interrupt_once());
+    }
 }

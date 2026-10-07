@@ -282,7 +282,10 @@ fn a_flush_gives_up_when_cancelled_or_after_its_timeout() {
     let err = db.storage.flush(Duration::from_millis(100)).unwrap_err();
     assert!(err.to_string().contains("timed out after"), "{err}");
     let flag = AtomicBool::new(true);
-    let err = crate::s3::remote::with_cancel(&flag, || db.storage.flush(Duration::from_secs(10)))
+    let err =
+        crate::s3::remote::with_cancel(&|| flag.load(std::sync::atomic::Ordering::SeqCst), || {
+            db.storage.flush(Duration::from_secs(10))
+        })
         .unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err}");
     flag.store(false, Ordering::SeqCst);

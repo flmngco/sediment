@@ -7,10 +7,16 @@
 * A `cancel/1` that landed before its query's native call started (waiting
   for a dirty scheduler under load) was lost: every call cleared it. A
   pool's disconnect after a client timeout could then leave an endless
-  query running and the connection stuck in close. `Sediment.Engine` now
-  clears a pending cancel before it starts an operation, not the native
-  call; a cancel is repeated until turso's statement sees it; and a pool
-  discarding a connection interrupts the running query until it stops.
+  query running and the connection stuck in close. Now a cancel applies to
+  every operation started on the connection before it, until that
+  operation ends (its native calls still queued, between busy waits,
+  between `fetch_all/3` chunks), and to none started after it; turso's
+  interrupt is sent while the operation runs, repeated until its statement
+  sees it. A pool's disconnect stops the running query, and makes every
+  later one give up, on a normal scheduler before closing, so it also works
+  while every dirty scheduler runs a long query.
+* `cancel/1` with nothing running no longer leaves turso's interrupt set
+  for later statements while another statement is open.
 * `Sediment.S3.snapshot/1`, `info/1`, `refresh/1`, `flush/2` and
   `acknowledge_loss/1` given a process that isn't a `DBConnection` pool
   (such as an Ecto repo's pid) waited for the 15 s checkout timeout. They

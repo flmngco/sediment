@@ -200,10 +200,18 @@ defmodule Sediment.Engine do
   @doc """
   Cancel a running query: abort both a running statement and a busy wait.
 
-  It also applies to an operation whose call is under way but hasn't
-  reached the database yet (waiting for a dirty scheduler under load). The
-  next operation started through this module clears a cancel that nothing
-  used, so after a cancel the connection can be reused normally.
+  It applies to every operation started on the connection (through this
+  module) before the cancel, also one whose native call is still waiting
+  for a dirty scheduler under load, and to none started after it, so after
+  a cancel the connection can be reused normally. An operation that hasn't
+  started yet (its process not scheduled) when the cancel is issued is not
+  cancelled.
+
+  turso stops an interrupted statement, but keeps the connection's
+  interrupt pending while another statement on it is still open (a
+  statement stepped to a row, not done or reset): until that statement
+  finishes or is reset, every statement on the connection fails with
+  `"interrupted"`. Reset or release open statements after a cancel.
   """
   @spec cancel(db() | nil) :: :ok | {:error, reason()}
   def cancel(nil), do: :ok
@@ -215,26 +223,26 @@ defmodule Sediment.Engine do
   @spec execute(db(), String.t()) :: :ok | {:error, reason()}
   def execute(conn, sql) do
     with :ok <- check_utf8(sql) do
-      :ok = start_operation(conn)
-      conn |> Native.execute(sql) |> resume_execute(conn)
+      admission = Native.admit(conn)
+      conn |> Native.execute(sql, admission) |> resume_execute(conn, admission)
     end
   end
 
-  # A cancel/1 issued before an operation starts doesn't apply to it; one
-  # issued from here on does, also while its native call waits for a
-  # scheduler. The waits below (`{:sleep, ...}`) resume without clearing.
-  defp start_operation(conn), do: Native.clear_cancel(conn)
+  # An operation is admitted (`Native.admit/1`, on a normal scheduler) when
+  # it starts, before its native calls are queued, and passes the admission
+  # to each of them, the resumes after busy waits included: a cancel/1
+  # issued from then on applies to it (see cancel/1).
 
   # The native calls hand busy backoffs back (`{:sleep, ms}`) instead of
   # sleeping on a dirty scheduler thread, which the lock holder may need to
   # commit: the caller's process sleeps, then the call resumes where it
   # stopped (the busy timeout still bounds the whole wait).
-  defp resume_execute({:sleep, ms}, conn) do
+  defp resume_execute({:sleep, ms}, conn, admission) do
     Process.sleep(ms)
-    conn |> Native.execute_resume() |> resume_execute(conn)
+    conn |> Native.execute_resume(admission) |> resume_execute(conn, admission)
   end
 
-  defp resume_execute(result, _conn), do: result
+  defp resume_execute(result, _conn, _admission), do: result
 
   @doc """
   Get the number of changes recently.
@@ -399,28 +407,28 @@ defmodule Sediment.Engine do
           {:ok, [String.t()], [row()], non_neg_integer(), :idle | :transaction}
           | {:error, :parameter_count | reason()}
   def run_prepared(conn, statement, params) do
-    :ok = start_operation(conn)
+    admission = Native.admit(conn)
 
     conn
-    |> Native.run_prepared(statement, Enum.map(params, &normalize/1))
-    |> resume_prepared(conn, statement, [])
+    |> Native.run_prepared(statement, Enum.map(params, &normalize/1), admission)
+    |> resume_prepared(conn, statement, admission, [])
   rescue
     e in ErlangError -> handle_nif_exception(e, __STACKTRACE__)
   end
 
   # `chunks`: the rows returned before each wait, latest first.
-  defp resume_prepared({:sleep, ms, rows}, conn, statement, chunks) do
+  defp resume_prepared({:sleep, ms, rows}, conn, statement, admission, chunks) do
     Process.sleep(ms)
 
     conn
-    |> Native.resume_prepared(statement)
-    |> resume_prepared(conn, statement, [rows | chunks])
+    |> Native.resume_prepared(statement, admission)
+    |> resume_prepared(conn, statement, admission, [rows | chunks])
   end
 
-  defp resume_prepared({:ok, columns, rows, changes, status}, _conn, _statement, chunks),
+  defp resume_prepared({:ok, columns, rows, changes, status}, _, _, _, chunks),
     do: {:ok, columns, Enum.concat(Enum.reverse([rows | chunks])), changes, status}
 
-  defp resume_prepared(result, _conn, _statement, _chunks), do: result
+  defp resume_prepared(result, _conn, _statement, _admission, _chunks), do: result
 
   defp raise_on_bind_error(:ok), do: :ok
   defp raise_on_bind_error({:error, :invalid_statement} = error), do: error
@@ -461,17 +469,16 @@ defmodule Sediment.Engine do
   """
   @spec step(db(), statement()) :: :done | :busy | {:row, row()} | {:error, reason()}
   def step(conn, statement) do
-    :ok = start_operation(conn)
-    do_step(conn, statement)
+    do_step(conn, statement, Native.admit(conn))
   rescue
     e -> handle_nif_exception(e, __STACKTRACE__)
   end
 
-  defp do_step(conn, statement) do
-    case Native.step(conn, statement) do
+  defp do_step(conn, statement, admission) do
+    case Native.step(conn, statement, admission) do
       {:sleep, ms} ->
         Process.sleep(ms)
-        do_step(conn, statement)
+        do_step(conn, statement, admission)
 
       result ->
         result
@@ -495,17 +502,16 @@ defmodule Sediment.Engine do
   @spec multi_step(db(), statement(), integer()) ::
           :busy | {:rows, [row()]} | {:done, [row()]} | {:error, reason()}
   def multi_step(conn, statement, chunk_size) do
-    :ok = start_operation(conn)
-    do_multi_step(conn, statement, chunk_size)
+    do_multi_step(conn, statement, chunk_size, Native.admit(conn))
   rescue
     e -> handle_nif_exception(e, __STACKTRACE__)
   end
 
-  defp do_multi_step(conn, statement, chunk_size) do
-    case Native.multi_step(conn, statement, chunk_size) do
+  defp do_multi_step(conn, statement, chunk_size, admission) do
+    case Native.multi_step(conn, statement, chunk_size, admission) do
       {:sleep, ms, rows} ->
         Process.sleep(ms)
-        more = do_multi_step(conn, statement, chunk_size - length(rows))
+        more = do_multi_step(conn, statement, chunk_size - length(rows), admission)
         prepend_rows(rows, more)
 
       result ->
@@ -540,15 +546,18 @@ defmodule Sediment.Engine do
   """
   @spec fetch_all(db(), statement(), integer()) :: {:ok, [row()]} | {:error, reason()}
   def fetch_all(conn, statement, chunk_size) do
-    {:ok, try_fetch_all(conn, statement, chunk_size)}
+    # One operation: a cancel/1 between two chunks applies.
+    {:ok, try_fetch_all(conn, statement, chunk_size, Native.admit(conn))}
+  rescue
+    e -> handle_nif_exception(e, __STACKTRACE__)
   catch
     :throw, {:error, _reason} = error -> error
   end
 
-  defp try_fetch_all(conn, statement, chunk_size) do
-    case multi_step(conn, statement, chunk_size) do
+  defp try_fetch_all(conn, statement, chunk_size, admission) do
+    case do_multi_step(conn, statement, chunk_size, admission) do
       {:done, rows} -> rows
-      {:rows, rows} -> rows ++ try_fetch_all(conn, statement, chunk_size)
+      {:rows, rows} -> rows ++ try_fetch_all(conn, statement, chunk_size, admission)
       {:error, _reason} = error -> throw(error)
       :busy -> throw({:error, "Database busy"})
     end

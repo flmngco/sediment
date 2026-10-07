@@ -160,9 +160,11 @@ defmodule Sediment.Connection do
 
   ## Cancellation notes
 
-  Connection teardown uses `Sediment.Engine.cancel/1`, so DBConnection
-  timeouts and disconnects break out of both long-running statements and
-  busy waits.
+  A disconnect (after a DBConnection timeout, for example) stops the
+  connection's running statement or busy wait, and makes any statement
+  starting on it afterwards give up at once, before it closes the
+  connection. The stop is issued on a normal scheduler, so it works while
+  every dirty scheduler runs a long statement.
   """
   @spec connect([connection_opt()]) :: {:ok, t()} | {:error, Exception.t()}
   def connect(options) do
@@ -207,10 +209,16 @@ defmodule Sediment.Connection do
     end
   end
 
-  # Interrupts a running query until it stops, also one whose call started
-  # after a cancel/1 here would have been issued (a client that timed out).
+  # Stops a running query (also one whose call started after this, a client
+  # that timed out) on a normal scheduler, then closes on a dirty one: with
+  # every dirty scheduler running such queries, a dirty close alone would
+  # never start.
   defp close_interrupting(nil), do: :ok
-  defp close_interrupting(db), do: Native.close_interrupting(db)
+
+  defp close_interrupting(db) do
+    :ok = Native.start_closing(db)
+    Engine.close(db)
+  end
 
   defp apply_before_disconnect({module, function, args}, err, state),
     do: apply(module, function, [err, state | args])

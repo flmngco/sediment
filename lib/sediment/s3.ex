@@ -509,7 +509,7 @@ defmodule Sediment.S3 do
 
   def flush(db, timeout) when is_reference(db) do
     Telemetry.span([:s3, :flush], %{timeout: timeout}, fn ->
-      case Native.s3_flush(db, timeout_ms(timeout)) do
+      case Native.s3_flush(db, timeout_ms(timeout), Native.admit(db)) do
         {:ok, _durable} -> :ok
         {:error, _reason} = error -> error
       end
@@ -562,7 +562,7 @@ defmodule Sediment.S3 do
   @spec flush_commit(Sediment.Engine.db(), timeout()) :: :ok | {:error, term()}
   def flush_commit(db, timeout) do
     Telemetry.span([:s3, :flush], %{timeout: timeout}, fn ->
-      case Native.s3_flush_commit(db, timeout_ms(timeout)) do
+      case Native.s3_flush_commit(db, timeout_ms(timeout), Native.admit(db)) do
         {:ok, _} -> :ok
         {:error, _reason} = error -> error
       end

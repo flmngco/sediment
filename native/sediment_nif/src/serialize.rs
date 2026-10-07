@@ -54,6 +54,8 @@ fn read_copy(path: &str) -> Result<Vec<u8>, String> {
 }
 
 fn serialize_handle(res: &ConnRes, handle: &Handle, database: &str) -> Result<Vec<u8>, String> {
+    // cancel/1 stops the copy.
+    let _active = res.begin(res.admit());
     let path = tmp_path();
     let sql = format!(
         "VACUUM {} INTO '{}'",

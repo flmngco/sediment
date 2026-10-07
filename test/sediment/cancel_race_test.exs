@@ -1,8 +1,9 @@
 defmodule Sediment.CancelRaceTest do
   # A cancel can land before the native call of the operation it is meant
-  # for starts: under load, the call waits for a dirty scheduler. These
-  # tests issue the cancel at that point (after Sediment.Engine started the
-  # operation, before the native call) by calling Sediment.Native directly.
+  # for starts: under load, the call waits for a dirty scheduler. An
+  # operation is admitted (Native.admit/1) when Sediment.Engine starts it;
+  # these tests admit, cancel and call Sediment.Native in a chosen order to
+  # put the cancel at those points.
   use ExUnit.Case, async: true
 
   alias Sediment.{Engine, Native}
@@ -11,7 +12,13 @@ defmodule Sediment.CancelRaceTest do
 
   setup do
     {:ok, db} = Engine.open(":memory:")
-    on_exit(fn -> Engine.close(db) end)
+
+    # Stops whatever a failed test left running, so it fails, not hangs.
+    on_exit(fn ->
+      Native.start_closing(db)
+      Engine.close(db)
+    end)
+
     %{db: db}
   end
 
@@ -25,43 +32,80 @@ defmodule Sediment.CancelRaceTest do
     end
   end
 
-  test "a cancel issued before the native call starts applies to it", %{db: db} do
+  test "a cancel applies to an operation admitted before it, still queued", %{db: db} do
     {:ok, stmt} = Engine.prepare(db, @endless)
 
     for call <- [
-          fn -> Native.execute(db, @endless) end,
-          fn -> Native.step(db, stmt) end,
-          fn -> Native.multi_step(db, stmt, 10) end,
-          fn -> Native.run_prepared(db, stmt, []) end
+          &Native.execute(db, @endless, &1),
+          &Native.step(db, stmt, &1),
+          &Native.multi_step(db, stmt, 10, &1),
+          &Native.run_prepared(db, stmt, [], &1)
         ] do
+      admission = Native.admit(db)
       :ok = Native.cancel(db)
-      assert {:error, "interrupted"} = within(call)
+      assert {:error, "interrupted"} = within(fn -> call.(admission) end)
     end
-
-    # Used up: the next operation runs.
-    assert {:ok, [[1]]} = Engine.fetch_all(db, elem(Engine.prepare(db, "select 1"), 1))
   end
 
-  test "a cancel issued before Engine starts an operation doesn't apply to it", %{db: db} do
+  test "admitting another operation after a cancel doesn't erase it", %{db: db} do
+    # A admitted and queued, the cancel, then B admitted (and run first).
+    a = Native.admit(db)
+    :ok = Native.cancel(db)
+    b = Native.admit(db)
+
+    assert :ok = Native.execute(db, "create table t (x)", b)
+    assert {:error, "interrupted"} = within(fn -> Native.execute(db, @endless, a) end)
+    assert :ok = Native.execute(db, "insert into t values (1)", b)
+  end
+
+  test "a cancel issued before an operation starts doesn't apply to it", %{db: db} do
     :ok = Engine.cancel(db)
     assert :ok = Engine.execute(db, "create table t (x)")
     :ok = Engine.cancel(db)
     {:ok, stmt} = Engine.prepare(db, "select 1")
     assert {:row, [1]} = Engine.step(db, stmt)
+    :ok = Engine.cancel(db)
+    {:ok, stmt} = Engine.prepare(db, "select 2")
+    assert {:ok, [[2]]} = Engine.fetch_all(db, stmt)
   end
 
-  test "closing for a pool interrupts a query that started after a cancel", %{db: db} do
-    # The pool's cancel landed before the client's query started (and that
-    # query's start cleared it): the close that follows must still end it.
-    :ok = Native.cancel(db)
+  test "a cancel with nothing running doesn't break statements next to an open one", %{db: db} do
+    {:ok, cursor} =
+      Engine.prepare(
+        db,
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 300000) SELECT x FROM c"
+      )
+
+    assert {:row, [1]} = Engine.step(db, cursor)
+    :ok = Engine.cancel(db)
+    {:ok, one} = Engine.prepare(db, "select 1")
+    assert {:row, [1]} = Engine.step(db, one)
+    assert :ok = Engine.execute(db, "create table t (x)")
+    assert {:row, [2]} = Engine.step(db, cursor)
+  end
+
+  test "a cancel during fetch_all applies to it", %{db: db} do
+    {:ok, stmt} =
+      Engine.prepare(
+        db,
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c"
+      )
+
     parent = self()
-
-    spawn(fn ->
-      send(parent, {:query, Engine.execute(db, @endless)})
-    end)
-
+    spawn(fn -> send(parent, {:fetched, Engine.fetch_all(db, stmt, 1)}) end)
     Process.sleep(200)
-    assert :ok = within(fn -> Native.close_interrupting(db) end)
-    assert_receive {:query, {:error, _}}, 5_000
+    :ok = Engine.cancel(db)
+    assert_receive {:fetched, {:error, "interrupted"}}, 10_000
+  end
+
+  test "start_closing stops a running query and every later one", %{db: db} do
+    parent = self()
+    spawn(fn -> send(parent, {:query, Engine.execute(db, @endless)}) end)
+    Process.sleep(200)
+
+    :ok = Native.start_closing(db)
+    assert_receive {:query, {:error, "interrupted"}}, 10_000
+    assert {:error, "interrupted"} = within(fn -> Engine.execute(db, @endless) end)
+    assert :ok = Engine.close(db)
   end
 end
