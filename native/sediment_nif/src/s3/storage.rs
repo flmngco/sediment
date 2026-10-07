@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -109,9 +110,14 @@ impl Attached {
 
 impl Drop for Attached {
     fn drop(&mut self) {
-        self.0
+        if self
+            .0
             .attached
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.closing.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -125,6 +131,8 @@ pub struct S3DurableStorage {
     place: String,
     /// Connections that have it open and haven't started closing.
     attached: std::sync::atomic::AtomicUsize,
+    /// Every connection it had has started closing: never handed to a new open.
+    closing: AtomicBool,
     /// The key it was opened with: another open must give the same.
     encryption: Option<turso_core::EncryptionOpts>,
     retain_epochs: usize,
@@ -186,6 +194,7 @@ impl S3DurableStorage {
             settings: cfg.settings(),
             place: cfg.place(),
             attached: std::sync::atomic::AtomicUsize::new(0),
+            closing: AtomicBool::new(false),
             encryption: cfg.encryption.clone(),
             retain_epochs: cfg.retain_epochs,
             group_commit: cfg.group_commit,
@@ -269,6 +278,11 @@ impl S3DurableStorage {
     }
 
     /// `(bucket, prefix)` this storage writes to.
+    /// Every connection that had it open has started closing.
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
     /// Connections that have the database open and haven't started closing.
     pub fn attached(&self) -> usize {
         self.attached.load(std::sync::atomic::Ordering::SeqCst)

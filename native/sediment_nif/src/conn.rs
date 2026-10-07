@@ -406,6 +406,12 @@ impl ConnRes {
             }
             // A panicking close (after an earlier turso panic) must not escape.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.conn.close()));
+            // Closing the last connection checkpoints, which hands the storage
+            // a snapshot to publish: wait for it (within the close timeout), so
+            // a closed database leaves nothing running behind.
+            if let Some(storage) = &handle.s3 {
+                storage.wait_background(storage.close_timeout());
+            }
         }
         // Statements collected while this held the lock were parked; from now
         // on finalize drops them directly.

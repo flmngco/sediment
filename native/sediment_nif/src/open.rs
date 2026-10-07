@@ -177,8 +177,13 @@ impl<'a> OpenConfig<'a> {
             io
         };
 
+        let flags = if self.s3.is_some() {
+            s3_open_flags(self.flags())
+        } else {
+            self.flags()
+        };
         let mut options = OpenOptions::new(Arc::new(SqliteDialect))
-            .flags(self.flags())
+            .flags(flags)
             .db_opts(self.db_opts()?)
             .encryption(self.encryption.clone());
 
@@ -242,9 +247,17 @@ impl<'a> OpenConfig<'a> {
         options = options.durable_storage(s3.clone().map(|s| s as Arc<dyn DurableStorage>));
 
         let db = Database::open(io.clone(), &self.path, options).map_err(|e| {
+            if s3.is_some() && !Path::new(&self.path).exists() {
+                return removed_while_opening(&self.path);
+            }
             let message = crate::error::locked_elsewhere(&e).unwrap_or_else(|| e.to_string());
             crate::log_guard::explain_open_error(Path::new(&self.path), message)
         })?;
+        // What the S3 prepare restored (or created) is an MVCC database; any
+        // other file here was put in its place since.
+        if s3.is_some() && !db.mvcc_enabled() {
+            return Err(removed_while_opening(&self.path));
+        }
         if let Some(claim) = log_claim {
             claim.keep_while(&db);
         }
@@ -356,6 +369,22 @@ fn plain_open(path: &str) -> bool {
     let mut plain = crate::conn::lock(&PLAIN);
     plain.retain(|(_, db, _)| db.strong_count() > 0);
     plain.iter().any(|(open, _, _)| *open == key)
+}
+
+/// An S3 open's turso open never creates the database file: the S3 prepare
+/// just restored or created it. If it is gone by then (removed while the open
+/// ran, say by a cleanup after a pool stopped while one of its connections
+/// was still opening), turso would create an empty database that isn't in
+/// MVCC journal mode, with the S3 storage attached.
+pub(crate) fn s3_open_flags(flags: OpenFlags) -> OpenFlags {
+    flags - OpenFlags::Create
+}
+
+fn removed_while_opening(path: &str) -> String {
+    format!(
+        "s3: {path} was removed or replaced while it was being opened; open it again \
+         (the next open restores it from S3)"
+    )
 }
 
 /// turso's own error quotes the offending character of the key; this one

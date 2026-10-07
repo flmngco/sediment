@@ -375,7 +375,14 @@ running background pass first.
 ## Sharing, fencing and recovery in the VM
 
 - One storage per file: a process-wide registry keyed by the canonical
-  directory plus file name (so `..` and symlink aliases share it). Every
+  directory plus file name (so `..` and symlink aliases share it).
+  A storage whose connections have all started closing is never handed to a
+  new open (its last close may still be publishing a snapshot, and the file
+  at the path may have been replaced meanwhile: inodes are reused at once);
+  the open waits for it to go, at most its close timeout and a second. Closing
+  the last connection waits for the snapshot its checkpoint queued, within
+  the close timeout. An S3 open's turso open never creates the file (the S3
+  prepare restored or created it); one removed in between fails the open. Every
   S3 connection to a path must use the same behaviour-relevant settings
   (location, owner, lease TTL, group commit, retention, threshold).
 - A plain (non-S3) open of a file whose S3 storage is live attaches that

@@ -5,6 +5,7 @@ mod faulty;
 mod group_commit;
 mod import;
 mod incremental;
+mod reopen;
 mod replica;
 mod seaweed;
 

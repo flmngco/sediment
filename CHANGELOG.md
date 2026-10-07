@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+* An S3 database whose working copy was removed right after its pool
+  stopped could, rarely, reopen as an empty database outside MVCC mode
+  ("s3 writer fenced: the database left MVCC journal mode ..."): a
+  connection of the stopped pool that was still opening created a new file
+  in its place. S3 opens no longer create the file in turso's open (the S3
+  restore does), and a database whose connections have all closed is
+  never handed to a new open: the open waits for its close to finish.
+  Closing the last connection now also waits for the snapshot its
+  checkpoint queued (within `:close_timeout_ms`), so a reopen right after a
+  close restores instead of waiting on that upload.
+
 ### Docs
 
 * `Sediment.Connection` and `Sediment.Engine.cancel/1`: a query stopped

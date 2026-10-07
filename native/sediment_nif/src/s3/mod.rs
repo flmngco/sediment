@@ -74,10 +74,15 @@ pub fn prepare_with_io(
 fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Arc<S3DurableStorage>> {
     refuse_symlink(local_path)?;
     cfg.validate()?;
+    wait_while_closing(local_path)?;
     let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let key = canonical_key(local_path)?;
     live.retain(|_, storage| storage.strong_count() > 0);
-    if let Some(storage) = live.get(&key).and_then(Weak::upgrade) {
+    if let Some(storage) = live
+        .get(&key)
+        .and_then(Weak::upgrade)
+        .filter(|storage| !storage.is_closing())
+    {
         // Before the settings: they name the cipher only, and this open
         // would share the storage's decrypted state.
         check_same_encryption(storage.encryption(), cfg)?;
@@ -111,6 +116,29 @@ fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Arc<
 }
 
 static LIVE: Mutex<BTreeMap<PathBuf, Weak<S3DurableStorage>>> = Mutex::new(BTreeMap::new());
+
+/// A storage whose connections have all closed may still be finishing (a
+/// snapshot its last close queued). It is never handed to a new open: its
+/// file may have been replaced since (inodes are reused at once, and the
+/// registry keys by inode), and it would make the open wait for that work
+/// anyway. Wait for it to go, at most its close timeout and a second.
+fn wait_while_closing(local_path: &Path) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let closing = live_storage(local_path).filter(|storage| storage.is_closing());
+        let Some(storage) = closing else {
+            return Ok(());
+        };
+        if start.elapsed() > storage.close_timeout() + std::time::Duration::from_secs(1) {
+            return Err(S3Error::Timeout(format!(
+                "s3: {} is still closing from an earlier open; try again",
+                local_path.display()
+            )));
+        }
+        drop(storage);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 
 /// Flushes every S3 database open in this VM (the VM is about to exit
 /// without closing them), waiting at most `timeout` in all. Returns what
