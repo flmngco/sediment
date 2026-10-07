@@ -212,6 +212,10 @@ defmodule Sediment.Engine do
   statement stepped to a row, not done or reset): until that statement
   finishes or is reset, every statement on the connection fails with
   `"interrupted"`. Reset or release open statements after a cancel.
+
+  A cancelled operation returns `{:error, "interrupted"}`, like one stopped
+  by `interrupt/1`; so does a query a DBConnection pool stopped after its
+  client timed out (see `Sediment.Connection`).
   """
   @spec cancel(db() | nil) :: :ok | {:error, reason()}
   def cancel(nil), do: :ok

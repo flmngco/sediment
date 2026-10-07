@@ -165,6 +165,14 @@ defmodule Sediment.Connection do
   starting on it afterwards give up at once, before it closes the
   connection. The stop is issued on a normal scheduler, so it works while
   every dirty scheduler runs a long statement.
+
+  The caller whose query timed out gets
+  `{:error, %Sediment.Error{message: "interrupted"}}`, the same error as for
+  any other interrupt or cancel, while DBConnection logs the
+  `DBConnection.ConnectionError` with the timeout. The error alone doesn't
+  tell a timeout apart; exqlite behaves the same. To react to timeouts,
+  compare the elapsed time with the `:timeout` you passed, or attach to the
+  `[:sediment, :connection, :disconnect]` telemetry event.
   """
   @spec connect([connection_opt()]) :: {:ok, t()} | {:error, Exception.t()}
   def connect(options) do

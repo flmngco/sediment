@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+
+* `Sediment.Connection` and `Sediment.Engine.cancel/1`: a query stopped
+  after a DBConnection client timeout returns the same `"interrupted"`
+  error as any other interrupt, and how to tell timeouts apart.
+
 ## 0.1.0-beta.4 (2026-10-07)
 
 ### Fixed
