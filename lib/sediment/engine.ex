@@ -200,7 +200,10 @@ defmodule Sediment.Engine do
   @doc """
   Cancel a running query: abort both a running statement and a busy wait.
 
-  After a cancel, the connection can be reused normally.
+  It also applies to an operation whose call is under way but hasn't
+  reached the database yet (waiting for a dirty scheduler under load). The
+  next operation started through this module clears a cancel that nothing
+  used, so after a cancel the connection can be reused normally.
   """
   @spec cancel(db() | nil) :: :ok | {:error, reason()}
   def cancel(nil), do: :ok
@@ -211,8 +214,16 @@ defmodule Sediment.Engine do
   """
   @spec execute(db(), String.t()) :: :ok | {:error, reason()}
   def execute(conn, sql) do
-    with :ok <- check_utf8(sql), do: conn |> Native.execute(sql) |> resume_execute(conn)
+    with :ok <- check_utf8(sql) do
+      :ok = start_operation(conn)
+      conn |> Native.execute(sql) |> resume_execute(conn)
+    end
   end
+
+  # A cancel/1 issued before an operation starts doesn't apply to it; one
+  # issued from here on does, also while its native call waits for a
+  # scheduler. The waits below (`{:sleep, ...}`) resume without clearing.
+  defp start_operation(conn), do: Native.clear_cancel(conn)
 
   # The native calls hand busy backoffs back (`{:sleep, ms}`) instead of
   # sleeping on a dirty scheduler thread, which the lock holder may need to
@@ -388,6 +399,8 @@ defmodule Sediment.Engine do
           {:ok, [String.t()], [row()], non_neg_integer(), :idle | :transaction}
           | {:error, :parameter_count | reason()}
   def run_prepared(conn, statement, params) do
+    :ok = start_operation(conn)
+
     conn
     |> Native.run_prepared(statement, Enum.map(params, &normalize/1))
     |> resume_prepared(conn, statement, [])
@@ -448,16 +461,21 @@ defmodule Sediment.Engine do
   """
   @spec step(db(), statement()) :: :done | :busy | {:row, row()} | {:error, reason()}
   def step(conn, statement) do
+    :ok = start_operation(conn)
+    do_step(conn, statement)
+  rescue
+    e -> handle_nif_exception(e, __STACKTRACE__)
+  end
+
+  defp do_step(conn, statement) do
     case Native.step(conn, statement) do
       {:sleep, ms} ->
         Process.sleep(ms)
-        step(conn, statement)
+        do_step(conn, statement)
 
       result ->
         result
     end
-  rescue
-    e -> handle_nif_exception(e, __STACKTRACE__)
   end
 
   @doc """
@@ -477,17 +495,22 @@ defmodule Sediment.Engine do
   @spec multi_step(db(), statement(), integer()) ::
           :busy | {:rows, [row()]} | {:done, [row()]} | {:error, reason()}
   def multi_step(conn, statement, chunk_size) do
+    :ok = start_operation(conn)
+    do_multi_step(conn, statement, chunk_size)
+  rescue
+    e -> handle_nif_exception(e, __STACKTRACE__)
+  end
+
+  defp do_multi_step(conn, statement, chunk_size) do
     case Native.multi_step(conn, statement, chunk_size) do
       {:sleep, ms, rows} ->
         Process.sleep(ms)
-        more = multi_step(conn, statement, chunk_size - length(rows))
+        more = do_multi_step(conn, statement, chunk_size - length(rows))
         prepend_rows(rows, more)
 
       result ->
         result
     end
-  rescue
-    e -> handle_nif_exception(e, __STACKTRACE__)
   end
 
   defp prepend_rows(rows, {:rows, more}), do: {:rows, rows ++ more}

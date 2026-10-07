@@ -107,7 +107,8 @@ their checksums.
   concurrently; keep it isolated to one process.
 * Native calls that touch the database run on dirty IO schedulers.
   `interrupt/1` and `cancel/1` only set a flag and run on normal
-  schedulers, so they are never queued behind busy dirty schedulers.
+  schedulers, so they are never queued behind busy dirty schedulers. A
+  `cancel/1` also applies to an operation whose call is still queued.
 * Datetimes are stored without offsets, as ISO 8601 text, like exqlite.
 * When storing `BLOB` values, use `{:blob, the_binary}`, otherwise the value
   is stored as text. Binaries that are not valid UTF-8 are stored as blobs,

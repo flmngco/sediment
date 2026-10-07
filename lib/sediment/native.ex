@@ -45,11 +45,17 @@ defmodule Sediment.Native do
   @spec close(db()) :: :ok | {:error, reason()}
   def close(_conn), do: :erlang.nif_error(:not_loaded)
 
+  @spec close_interrupting(db()) :: :ok | {:error, reason()}
+  def close_interrupting(_conn), do: :erlang.nif_error(:not_loaded)
+
   @spec interrupt(db()) :: :ok | {:error, reason()}
   def interrupt(_conn), do: :erlang.nif_error(:not_loaded)
 
   @spec cancel(db()) :: :ok | {:error, reason()}
   def cancel(_conn), do: :erlang.nif_error(:not_loaded)
+
+  @spec clear_cancel(db()) :: :ok
+  def clear_cancel(_conn), do: :erlang.nif_error(:not_loaded)
 
   @spec set_busy_timeout(db(), integer()) :: :ok | {:error, reason()}
   def set_busy_timeout(_conn, _timeout_ms), do: :erlang.nif_error(:not_loaded)

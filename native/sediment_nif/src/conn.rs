@@ -52,7 +52,15 @@ pub struct ConnRes {
     pub id: u64,
     handle: Mutex<Option<Handle>>,
     pub interrupt: Mutex<Option<Arc<Connection>>>,
+    /// A cancel/1 that no operation consumed yet. Operations never clear it
+    /// when they start (a cancel can land while the call waits for a dirty
+    /// scheduler); `Sediment.Engine` clears it (`clear_cancel`) before it
+    /// starts one, and an operation that gives up on it consumes it.
     pub cancelled: AtomicBool,
+    /// Set by close: `cancelled` stays set from then on.
+    closing: AtomicBool,
+    /// Operations stepping turso right now (see `request_cancel`).
+    running: AtomicU64,
     /// Set when turso panicked on this connection: its state is unknown, so
     /// the next operation closes it.
     broken: AtomicBool,
@@ -92,6 +100,15 @@ pub struct ConnRes {
     pub attach: bool,
 }
 
+/// See `ConnRes::running`.
+pub struct Running<'a>(&'a ConnRes);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// See `ConnRes::commit_mark`.
 #[derive(Default)]
 pub struct CommitMark {
@@ -129,10 +146,9 @@ impl rustler::Resource for ConnRes {
             return;
         };
         // An operation still running (say, a commit waiting on S3) gives up.
-        me.cancelled.store(true, Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name("sediment_owner_down".into())
-            .spawn(move || me.close_now());
+            .spawn(move || me.close_now(true));
         if let Err(err) = spawned {
             eprintln!("sediment: could not close a connection after its owner died: {err}");
         }
@@ -171,6 +187,78 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl ConnRes {
+    /// cancel/1: the running operation, or one whose call is on its way,
+    /// gives up. turso's interrupt only reaches a statement that is already
+    /// executing, so while an operation runs it is repeated until that
+    /// operation consumed the cancel (or ended): one that checked the flag
+    /// just before turso started the statement still stops.
+    pub fn request_cancel<R>(this: R)
+    where
+        R: std::ops::Deref<Target = ConnRes> + Send + 'static,
+    {
+        {
+            let conn = lock(&this.interrupt);
+            if conn.is_none() {
+                return;
+            }
+            this.cancelled.store(true, Ordering::SeqCst);
+            if let Some(conn) = conn.as_ref() {
+                conn.interrupt();
+            }
+        }
+        if this.running.load(Ordering::SeqCst) > 0 {
+            let spawned = std::thread::Builder::new()
+                .name("sediment_cancel".into())
+                .spawn(move || this.repeat_interrupt());
+            if let Err(err) = spawned {
+                eprintln!("sediment: could not start repeating a cancel: {err}");
+            }
+        }
+    }
+
+    /// Interrupts turso every millisecond while an operation runs and the
+    /// cancel is still pending. Checked and sent under the `interrupt` lock,
+    /// which consuming the cancel takes too, so no interrupt is sent after
+    /// the operation gave up (it would reach the next statement).
+    fn repeat_interrupt(&self) {
+        loop {
+            {
+                let conn = lock(&self.interrupt);
+                let pending = self.cancelled.load(Ordering::SeqCst)
+                    && self.running.load(Ordering::SeqCst) > 0;
+                match conn.as_ref() {
+                    Some(conn) if pending => conn.interrupt(),
+                    _ => return,
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// An operation gave up on the cancel (or `Sediment.Engine` starts a new
+    /// one): it no longer applies, unless the connection is closing.
+    pub fn consume_cancel(&self) {
+        let _conn = lock(&self.interrupt);
+        if !self.closing.load(Ordering::SeqCst) {
+            self.cancelled.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Counts an operation as running while the guard lives. Taken before
+    /// the operation's first look at `cancelled` (see `request_cancel`).
+    pub fn running(&self) -> Running<'_> {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        Running(self)
+    }
+
+    /// `detached`, with `conn` for interrupt/cancel to reach.
+    #[cfg(test)]
+    pub fn detached_with(conn: Arc<Connection>) -> ConnRes {
+        let res = ConnRes::detached();
+        *lock(&res.interrupt) = Some(conn);
+        res
+    }
+
     /// A resource without a handle, to drive statements in unit tests.
     #[cfg(test)]
     pub fn detached() -> ConnRes {
@@ -180,6 +268,8 @@ impl ConnRes {
             handle: Mutex::new(None),
             interrupt: Mutex::new(None),
             cancelled: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            running: AtomicU64::new(0),
             broken: AtomicBool::new(false),
             panic_next_step: AtomicBool::new(false),
             self_ref: Mutex::new(None),
@@ -252,8 +342,19 @@ impl ConnRes {
     }
 
     /// Closes the connection, waiting for a running operation first (until
-    /// then interrupt/1 must still be able to reach it).
-    pub fn close_now(&self) {
+    /// then interrupt/1 must still be able to reach it). With `interrupt`, the
+    /// running operation is interrupted until it stops, and one starting
+    /// meanwhile gives up at once, so the wait ends (a pool discarding the
+    /// connection, or its owner gone).
+    pub fn close_now(&self, interrupt: bool) {
+        if interrupt {
+            {
+                let _conn = lock(&self.interrupt);
+                self.closing.store(true, Ordering::SeqCst);
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            self.repeat_interrupt();
+        }
         let mut guard = self.handle();
         lock(&self.interrupt).take();
         self.finalize_all();
@@ -595,6 +696,8 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
         handle: Mutex::new(None),
         interrupt: Mutex::new(Some(opened.conn.clone())),
         cancelled: AtomicBool::new(false),
+        closing: AtomicBool::new(false),
+        running: AtomicU64::new(0),
         broken: AtomicBool::new(false),
         panic_next_step: AtomicBool::new(false),
         self_ref: Mutex::new(None),
@@ -634,7 +737,16 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn close(res: ResourceArc<ConnRes>) -> Atom {
     lock(&res.self_ref).take();
-    res.close_now();
+    res.close_now(false);
+    atoms::ok()
+}
+
+/// `close`, interrupting a running operation until it stops (see
+/// `ConnRes::close_now`): a pool discarding a connection a client timed out on.
+#[rustler::nif(schedule = "DirtyIo")]
+fn close_interrupting(res: ResourceArc<ConnRes>) -> Atom {
+    lock(&res.self_ref).take();
+    res.close_now(true);
     atoms::ok()
 }
 
@@ -644,7 +756,6 @@ fn execute<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, sql: String) -> Term<'a>
     let Some(handle) = guard.as_ref() else {
         return closed(env);
     };
-    res.cancelled.store(false, Ordering::SeqCst);
     // A script abandoned mid-wait (its caller gave up) is dropped.
     drop(lock(&res.pending_script).take());
     if crate::mvcc_guard::requests_mvcc(&sql) {
@@ -690,10 +801,16 @@ fn interrupt(res: ResourceArc<ConnRes>) -> Atom {
 
 #[rustler::nif]
 fn cancel(res: ResourceArc<ConnRes>) -> Atom {
-    if let Some(conn) = lock(&res.interrupt).as_ref() {
-        res.cancelled.store(true, Ordering::SeqCst);
-        conn.interrupt();
-    }
+    ConnRes::request_cancel(res);
+    atoms::ok()
+}
+
+/// `Sediment.Engine` starts an operation: a cancel issued before it doesn't
+/// apply to it. On a normal scheduler, before the operation's dirty call is
+/// queued (a cancel landing while it waits for a scheduler applies).
+#[rustler::nif]
+fn clear_cancel(res: ResourceArc<ConnRes>) -> Atom {
+    res.consume_cancel();
     atoms::ok()
 }
 

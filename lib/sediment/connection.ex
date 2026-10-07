@@ -201,13 +201,16 @@ defmodule Sediment.Connection do
       apply_before_disconnect(state.before_disconnect, err, state)
     end
 
-    Engine.cancel(db)
-
-    case Engine.close(db) do
+    case close_interrupting(db) do
       :ok -> :ok
       {:error, reason} -> {:error, %Error{message: to_string(reason)}}
     end
   end
+
+  # Interrupts a running query until it stops, also one whose call started
+  # after a cancel/1 here would have been issued (a client that timed out).
+  defp close_interrupting(nil), do: :ok
+  defp close_interrupting(db), do: Native.close_interrupting(db)
 
   defp apply_before_disconnect({module, function, args}, err, state),
     do: apply(module, function, [err, state | args])

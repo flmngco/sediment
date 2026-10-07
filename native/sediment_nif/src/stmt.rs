@@ -20,14 +20,15 @@ thread_local! {
     /// Test hook: runs whenever `advance` is about to wait out a busy backoff.
     static ON_BUSY_SLEEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Test hook: runs right before each call into turso's `step`, after the
+    /// cancellation checks.
+    static BEFORE_STEP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub struct StmtRes {
     conn: ResourceArc<ConnRes>,
     stmt: Arc<Mutex<Option<Statement>>>,
-    /// Set while the caller waits out a busy backoff (`{:sleep, ms}`), so the
-    /// call that resumes keeps a `cancel/1` issued during the wait.
-    waiting: std::sync::atomic::AtomicBool,
     /// Rows written when the current execution started, kept across the
     /// calls that resume it (see `busy_inner_commit`).
     baseline: Mutex<Option<u64>>,
@@ -84,7 +85,7 @@ fn from_err(err: LimboError) -> Step {
 }
 
 fn cancelled(res: &ConnRes, stmt: &mut Statement) -> Step {
-    res.cancelled.store(false, Ordering::SeqCst);
+    res.consume_cancel();
     let _ = guarded(res, || stmt.reset());
     Step::Error("interrupted".to_string())
 }
@@ -256,6 +257,7 @@ pub fn advance_with(
     // A commit this step queues for upload is this connection's (for
     // `sync: true`); a value left by other work on this thread is not.
     let _ = crate::s3::take_last_enqueued();
+    let _running = res.running();
     // cancel/1 also gives up an S3 upload this step is waiting on.
     let step =
         crate::s3::remote::with_cancel(&res.cancelled, || advance_inner(res, stmt, baseline));
@@ -333,8 +335,8 @@ fn advance_inner(
     baseline: &mut Option<u64>,
 ) -> Result<Step, Step> {
     res.check_s3_mvcc().map_err(Step::Error)?;
-    // Fresh calls clear the flag before stepping, so a set flag here is a
-    // cancel/1 that arrived while the caller waited out a busy backoff.
+    // A cancel/1 issued since `Sediment.Engine` started this operation:
+    // while its call waited for a scheduler, or during a busy backoff.
     if res.cancelled.load(Ordering::SeqCst) {
         return Err(cancelled(res, stmt));
     }
@@ -344,6 +346,12 @@ fn advance_inner(
     }
     let written_before = *baseline;
     loop {
+        #[cfg(test)]
+        BEFORE_STEP.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook()
+            }
+        });
         match guarded(res, || stmt.step())? {
             Ok(StepResult::Row) => return Ok(Step::Row),
             Ok(StepResult::Done) => {
@@ -359,7 +367,7 @@ fn advance_inner(
                 return Ok(Step::Busy);
             }
             Ok(StepResult::Interrupt) => {
-                res.cancelled.store(false, Ordering::SeqCst);
+                res.consume_cancel();
                 let _ = guarded(res, || stmt.reset());
                 return Err(Step::Error("interrupted".to_string()));
             }
@@ -415,15 +423,6 @@ impl StmtRes {
     fn note_start(&self, res: &ConnRes, conn: &turso_core::Connection, statement: &Statement) {
         res.note_start(conn, *self.writes.get_or_init(|| writes(statement)));
     }
-
-    /// Called at the start of every stepping call. A call that resumes a
-    /// busy wait keeps a `cancel/1` that arrived during the wait; any other
-    /// call starts with a clear cancellation flag.
-    fn start_call(&self, res: &ConnRes) {
-        if !self.waiting.swap(false, Ordering::SeqCst) {
-            res.cancelled.store(false, Ordering::SeqCst);
-        }
-    }
 }
 
 /// A busy backoff in whole milliseconds for `Process.sleep/1` (at least 1).
@@ -476,7 +475,6 @@ fn prepare<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, sql: String) -> Term<'a>
             let stmt = StmtRes {
                 conn: res.clone(),
                 stmt: slot,
-                waiting: std::sync::atomic::AtomicBool::new(false),
                 baseline: Mutex::new(None),
                 writes: std::sync::OnceLock::new(),
                 switches_to_mvcc,
@@ -506,7 +504,6 @@ fn step<'a>(
     if let Err(step) = stmt.check_mvcc_switch(&res, &guard.as_ref().expect("checked").conn) {
         return Ok(step.into_error(env));
     }
-    stmt.start_call(&res);
     if !statement.execution_state().is_running() {
         stmt.note_start(&res, &guard.as_ref().expect("checked").conn, statement);
     }
@@ -518,10 +515,7 @@ fn step<'a>(
         }
         Ok(Step::Done) => atoms::done().encode(env),
         Ok(Step::Busy) => atoms::busy().encode(env),
-        Ok(Step::Sleep(duration)) => {
-            stmt.waiting.store(true, Ordering::SeqCst);
-            (atoms::sleep(), millis(duration)).encode(env)
-        }
+        Ok(Step::Sleep(duration)) => (atoms::sleep(), millis(duration)).encode(env),
         Ok(Step::Error(msg)) | Err(Step::Error(msg)) => error_tuple(env, msg),
         Err(other) => other.into_error(env),
     })
@@ -547,7 +541,6 @@ fn multi_step<'a>(
     if let Err(step) = stmt.check_mvcc_switch(&res, &guard.as_ref().expect("checked").conn) {
         return Ok(step.into_error(env));
     }
-    stmt.start_call(&res);
     if !statement.execution_state().is_running() {
         stmt.note_start(&res, &guard.as_ref().expect("checked").conn, statement);
     }
@@ -564,7 +557,6 @@ fn multi_step<'a>(
             Ok(Step::Done) => return Ok((atoms::done(), rows).encode(env)),
             Ok(Step::Busy) => return Ok(atoms::busy().encode(env)),
             Ok(Step::Sleep(duration)) => {
-                stmt.waiting.store(true, Ordering::SeqCst);
                 return Ok((atoms::sleep(), millis(duration), rows).encode(env));
             }
             Ok(Step::Error(msg)) | Err(Step::Error(msg)) => return Ok(error_tuple(env, msg)),
@@ -617,8 +609,6 @@ fn run_prepared<'a>(
         Ok(Err(msg)) | Err(msg) => return Ok(error_tuple(env, msg)),
     }
 
-    res.cancelled.store(false, Ordering::SeqCst);
-    stmt.waiting.store(false, Ordering::SeqCst);
     *lock(&stmt.baseline) = None;
     if let Err(step) = stmt.check_mvcc_switch(&res, &handle.conn) {
         return Ok(step.into_error(env));
@@ -648,7 +638,6 @@ fn resume_prepared<'a>(
     if let Err(step) = stmt.check_mvcc_switch(&res, &handle.conn) {
         return Ok(step.into_error(env));
     }
-    stmt.start_call(&res);
     Ok(collect_prepared(env, &res, &stmt, handle, statement))
 }
 
@@ -672,7 +661,6 @@ fn collect_prepared<'a>(
             Ok(Step::Done) => break,
             Ok(Step::Busy) => return error_tuple(env, "Database busy"),
             Ok(Step::Sleep(duration)) => {
-                stmt.waiting.store(true, Ordering::SeqCst);
                 return (atoms::sleep(), millis(duration), rows).encode(env);
             }
             Ok(Step::Error(msg)) | Err(Step::Error(msg)) => return error_tuple(env, msg),
@@ -862,7 +850,7 @@ fn bind_all<'a>(env: Env<'a>, stmt: ResourceArc<StmtRes>, values: Vec<Term<'a>>)
 mod tests {
     use super::declared_parameter_count;
     use super::with_turso_stack;
-    use super::{advance_blocking as advance, Step, ON_BUSY_SLEEP};
+    use super::{advance_blocking as advance, Step, BEFORE_STEP, ON_BUSY_SLEEP};
     use crate::conn::ConnRes;
     use crate::s3::tests::TempDir;
     use std::sync::Arc;
@@ -905,6 +893,65 @@ mod tests {
 
     fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
         conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+    }
+
+    const ENDLESS: &str =
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+
+    /// Runs `ENDLESS` on `res`'s connection through the driver's step loop on
+    /// a thread of its own (the hooks are per thread), with `hook` run right
+    /// before each call into turso; the result, unless it ran for a minute.
+    fn endless_with(
+        res: Arc<ConnRes>,
+        conn: Arc<Connection>,
+        hook: impl FnMut() + Send + 'static,
+    ) -> Option<Result<Step, Step>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            BEFORE_STEP.with(|before| *before.borrow_mut() = Some(Box::new(hook)));
+            let mut stmt = conn.prepare(ENDLESS).unwrap();
+            let _ = tx.send(advance(&res, &mut stmt));
+        });
+        rx.recv_timeout(Duration::from_secs(60)).ok()
+    }
+
+    fn memory_conn() -> Arc<Connection> {
+        let db = Database::open(
+            Arc::new(turso_core::MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        db.connect().unwrap()
+    }
+
+    #[test]
+    fn a_cancel_landing_just_before_turso_starts_the_statement_stops_it() {
+        // turso's interrupt only reaches a statement that is executing; this
+        // cancel lands after the driver's last look at the flag, before that.
+        let conn = memory_conn();
+        let res = Arc::new(ConnRes::detached_with(conn.clone()));
+        let canceller = res.clone();
+        let mut once = true;
+        let step = endless_with(res.clone(), conn, move || {
+            if std::mem::take(&mut once) {
+                ConnRes::request_cancel(canceller.clone());
+            }
+        });
+        let step = step.expect("the cancel stopped the statement");
+        assert!(matches!(step, Err(Step::Error(ref msg)) if msg == "interrupted"));
+        assert!(!res.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_cancel_before_the_call_applies_and_is_used_up() {
+        let conn = memory_conn();
+        let res = Arc::new(ConnRes::detached_with(conn.clone()));
+        ConnRes::request_cancel(res.clone());
+        let step = endless_with(res.clone(), conn.clone(), || {}).expect("stopped");
+        assert!(matches!(step, Err(Step::Error(ref msg)) if msg == "interrupted"));
+        let mut stmt = conn.prepare("SELECT 1").unwrap();
+        assert!(matches!(advance(&res, &mut stmt), Ok(Step::Row)));
     }
 
     #[test]

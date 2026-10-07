@@ -188,8 +188,7 @@ fn s3_flush<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, timeout_ms: u64) -> Ter
     let flushed = s3::remote::with_cancel(&res.cancelled, || {
         storage.flush(std::time::Duration::from_millis(timeout_ms))
     });
-    res.cancelled
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    res.consume_cancel();
     match flushed {
         Ok((epoch, offset)) => {
             let map = rustler::Term::map_from_pairs(
@@ -236,8 +235,7 @@ fn s3_flush_commit<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, timeout_ms: u64)
         Some(seq) => storage.flush_through(seq, timeout),
         None => storage.flush(timeout),
     });
-    res.cancelled
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    res.consume_cancel();
     match flushed {
         Ok(_) => ok_tuple(env, rustler::types::atom::ok()),
         Err(err) => error_tuple(env, describe(&err)),
