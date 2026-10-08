@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-beta.5 (2026-10-08)
 
 ### S3 durability
 
