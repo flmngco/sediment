@@ -107,6 +107,9 @@ impl Attached {
     /// Counts one more connection, unless every connection has started
     /// closing: then the storage is on its way out and `None`.
     pub fn try_new(storage: &Arc<S3DurableStorage>) -> Option<Self> {
+        // `fetch_update` is deprecated as `try_update` in newer Rust, which
+        // the 1.91 minimum doesn't have.
+        #[allow(deprecated)]
         storage
             .attached
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
