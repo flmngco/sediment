@@ -566,3 +566,47 @@ fn a_missing_earlier_log_object_is_never_skipped() {
         Ok(_) => panic!("the full restore must fail"),
     }
 }
+
+/// A database closed with its Drop on another thread, its lease release
+/// held up by `delay`; then reopened 100 ms into that Drop.
+fn reopen_during_a_slow_drop(delay: Duration) -> (Db, usize, Duration, u64) {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    let mut cfg = config(&store, "a");
+    cfg.close_timeout = Duration::from_millis(200);
+    let db = open_db(&cfg, &path).unwrap();
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    db.exec("INSERT INTO t VALUES (1)").unwrap();
+    let generation = db.storage.info().generation;
+    drop(crate::s3::Attached::try_new(&db.storage).unwrap());
+    store.inject(Op::Put, "lease", Fault::Delay(delay), 1);
+    let closing = std::thread::spawn(move || drop(db));
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    let (reopened, gets) = reopen(&store, &cfg, &path);
+    let took = started.elapsed();
+    closing.join().unwrap();
+    assert_eq!(reopened.int("SELECT count(*) FROM t"), 1);
+    (reopened, gets, took, generation)
+}
+
+#[test]
+fn a_reopen_waits_out_a_drop_slower_than_the_close_timeout() {
+    // Well past the close timeout and a second (1.2 s), within the dropping
+    // budget (twice the close timeout and the margin, 2.4 s in tests).
+    // Before: the reopen failed "still closing from an earlier open".
+    let (db, gets, took, generation) = reopen_during_a_slow_drop(Duration::from_millis(1_800));
+    assert!(took >= Duration::from_millis(1_500), "{took:?}");
+    assert_eq!(gets, 0, "reused the copy the close left");
+    assert!(db.storage.info().generation > generation);
+}
+
+#[test]
+fn a_reopen_goes_ahead_cold_when_a_drop_takes_too_long() {
+    let (db, gets, took, generation) = reopen_during_a_slow_drop(Duration::from_millis(4_000));
+    // Opened once the dropping budget ran out, not when the Drop ended.
+    assert!(took < Duration::from_millis(3_700), "{took:?}");
+    assert!(gets > 0, "full restore");
+    assert!(db.storage.info().generation > generation);
+}

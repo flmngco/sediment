@@ -49,8 +49,8 @@ pub fn destroy(cfg: &S3Config, force: bool) -> Result<Destroyed> {
 
 /// Refuses a database open in this VM. One whose connections are all closing
 /// (a pool that just stopped: an owner that died closes its connection on a
-/// thread of its own, uploading pending commits first) is waited for, at
-/// most its close timeout and a second. An owner's death reaches the NIF
+/// thread of its own, uploading pending commits first) is waited for, as
+/// long as an open would wait for it. An owner's death reaches the NIF
 /// asynchronously, so connections still open get a moment to start closing.
 fn wait_until_closed(cfg: &S3Config) -> Result<()> {
     const GRACE: Duration = Duration::from_millis(250);
@@ -60,9 +60,7 @@ fn wait_until_closed(cfg: &S3Config) -> Result<()> {
         let waiting = match open_at(&place) {
             None => return Ok(()),
             Some((true, _)) => start.elapsed() < GRACE,
-            Some((false, close_timeout)) => {
-                start.elapsed() < close_timeout + Duration::from_secs(1)
-            }
+            Some((false, wait)) => start.elapsed() < wait,
         };
         if !waiting {
             return Err(S3Error::Config(format!(

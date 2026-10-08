@@ -244,8 +244,9 @@ another version (version 1 had no SHA-256) is never reused. It syncs the databas
 log, verifies the log's chain, writes a temp file, syncs, renames and syncs
 the directory. The lease is released before; an open or destroy of the
 database in the same VM waits until the whole Drop has finished (the storage
-stays in the registry, marked dropping, until then), so it finds the lease
-free and the sidecar written. Another process opening the files in between
+stays in the registry, marked dropping, until then; see "Sharing, fencing and
+recovery in the VM" for how long), so it finds the lease free and the sidecar
+written. Another process opening the files in between
 may meet a sidecar written after its takeover: the sidecar is only a hint,
 and the checks below reject it (its generation is older than the manifest's,
 and the content checks fail too).
@@ -421,8 +422,13 @@ running background pass first.
   A storage whose connections have all started closing is never handed to a
   new open (its last close may still be publishing a snapshot, and the file
   at the path may have been replaced meanwhile: inodes are reused at once);
-  the open waits for it to go (until its Drop has finished), at most its
-  close timeout and a second. An open counts as a connection from its
+  the open waits for it to go (until its Drop has finished): while the
+  storage is still referenced, at most its close timeout and a second (then
+  the open fails, to be retried); once it is dropping, at most twice its
+  close timeout and 5 s (final uploads, lease release, the sidecar's hashing),
+  then the open goes ahead without it and restores in full (the late
+  sidecar names an older generation). Whether to wait and for which storage
+  is decided under one registry lock. An open counts as a connection from its
   prepare (`Attached`, handed on to the connection), and the count and the
   closing mark are one atomic word: the storage is marked closing only when
   the count drops to 0 with no open attached in between, and an open never

@@ -183,7 +183,8 @@ are then if the database file is still the closed epoch's snapshot and the log h
 closed length (`warm::write`). An open of the same host waits for a pending sidecar,
 as an open (or destroy) in the same VM waits for the close to finish;
 `SecondProcess` lets it go ahead (another process on the host, which nothing
-serializes), so a sidecar can land after a newer writer's takeover. An open takes the sidecar first (`got`; on disk it is
+serializes, or an in-VM open whose wait for a slow Drop ran out), so a sidecar
+can land after a newer writer's takeover. An open takes the sidecar first (`got`; on disk it is
 gone), remembers the manifest it took over, and in `RestoreStep` reuses the copy when
 every check holds: the same database (`id`), the manifest's generation and epoch the
 sidecar's, the local files the sidecar's, the database file the epoch's snapshot, and

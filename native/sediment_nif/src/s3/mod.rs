@@ -136,18 +136,44 @@ impl Live {
         }
     }
 
-    /// Every connection has started closing, or its Drop still runs (it
-    /// uploads what is left, releases the lease and leaves the sidecar).
-    fn closing(&self) -> bool {
+    fn state(&self) -> LiveState {
         match self.storage.upgrade() {
-            Some(storage) => storage.is_closing(),
-            None => !self.gone.load(Ordering::SeqCst),
+            Some(storage) if storage.is_closing() => LiveState::Closing,
+            Some(storage) => LiveState::Open(storage),
+            None if self.gone.load(Ordering::SeqCst) => LiveState::Finished,
+            None => LiveState::Dropping,
         }
     }
 
     fn finished(&self) -> bool {
         self.storage.strong_count() == 0 && self.gone.load(Ordering::SeqCst)
     }
+
+    /// How long an open (or destroy) waits for it to finish closing: a
+    /// storage still referenced is waited for its close timeout and a
+    /// second; a dropping one (final uploads up to its close timeout, the
+    /// lease release, the sidecar's hashing) for longer.
+    fn wait(&self, dropping: bool) -> std::time::Duration {
+        if dropping {
+            2 * self.close_timeout + DROP_MARGIN
+        } else {
+            self.close_timeout + std::time::Duration::from_secs(1)
+        }
+    }
+}
+
+/// Beyond twice the close timeout: the lease release and the sidecar.
+const DROP_MARGIN: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 2_000 } else { 5_000 });
+
+enum LiveState {
+    Open(Arc<S3DurableStorage>),
+    /// Every connection has started closing.
+    Closing,
+    /// Its Drop runs: it uploads what is left, releases the lease and
+    /// leaves the sidecar.
+    Dropping,
+    Finished,
 }
 
 static LIVE: Mutex<BTreeMap<PathBuf, Live>> = Mutex::new(BTreeMap::new());
@@ -156,43 +182,46 @@ static LIVE: Mutex<BTreeMap<PathBuf, Live>> = Mutex::new(BTreeMap::new());
 /// is open (`None`: none is, or the last one has finished closing). A
 /// storage that is closing is never handed to a new open (its file may have
 /// been replaced since: inodes are reused at once, and the registry keys by
-/// inode), so this waits for it to finish first.
+/// inode), so this waits for it to finish first: a storage still referenced
+/// at most its close timeout and a second (then the open fails, to be
+/// retried), a dropping one longer, and after that the open goes ahead
+/// without it (it restores in full; the dropping storage's late sidecar
+/// names an older generation, so no open reuses it).
 pub fn attach_live(local_path: &Path) -> Result<Option<Attached>> {
-    loop {
-        wait_while_closing(local_path)?;
-        let key = canonical_key(local_path)?;
-        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-        live.retain(|_, entry| !entry.finished());
-        let Some(storage) = live.get(&key).and_then(|entry| entry.storage.upgrade()) else {
-            return Ok(None);
-        };
-        // Fails only if its last connection closed since the wait.
-        if let Some(attached) = Attached::try_new(&storage) {
-            return Ok(Some(attached));
-        }
-    }
-}
-
-/// Waits for a closing storage of `local_path` to finish (see
-/// [`Live::closing`]), at most its close timeout and a second.
-fn wait_while_closing(local_path: &Path) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
-        let close_timeout = {
-            let Ok(key) = canonical_key(local_path) else {
-                return Ok(());
+        let key = canonical_key(local_path)?;
+        {
+            let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            live.retain(|_, entry| !entry.finished());
+            let Some(entry) = live.get(&key) else {
+                return Ok(None);
             };
-            let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-            match live.get(&key).filter(|entry| entry.closing()) {
-                Some(entry) => entry.close_timeout,
-                None => return Ok(()),
+            let waited_out = start.elapsed() > entry.wait(false);
+            match entry.state() {
+                LiveState::Finished => return Ok(None),
+                LiveState::Open(storage) => {
+                    // Fails only if its last connection closed just now.
+                    if let Some(attached) = Attached::try_new(&storage) {
+                        return Ok(Some(attached));
+                    }
+                }
+                LiveState::Closing if waited_out => {
+                    return Err(S3Error::Timeout(format!(
+                        "s3: {} is still closing from an earlier open; try again",
+                        local_path.display()
+                    )));
+                }
+                LiveState::Closing => {}
+                LiveState::Dropping if start.elapsed() > entry.wait(true) => {
+                    tracing::warn!(
+                        "s3: {} is still finishing its close; opening without waiting for it",
+                        local_path.display()
+                    );
+                    return Ok(None);
+                }
+                LiveState::Dropping => {}
             }
-        };
-        if start.elapsed() > close_timeout + std::time::Duration::from_secs(1) {
-            return Err(S3Error::Timeout(format!(
-                "s3: {} is still closing from an earlier open; try again",
-                local_path.display()
-            )));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -253,17 +282,16 @@ pub fn live_storage(local_path: &Path) -> Option<Arc<S3DurableStorage>> {
 
 /// The database at `place` (see `S3Config::place`) in this process: whether
 /// a connection has it open (not only closing, or still finishing its
-/// Drop), and how long its close may take. `None`: not open here.
+/// Drop), and how long to wait for its close (see `Live::wait`). `None`: not
+/// open here.
 fn open_at(place: &str) -> Option<(bool, std::time::Duration)> {
     let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     live.values()
         .filter(|entry| entry.place == place && !entry.finished())
-        .map(|entry| {
-            let open = entry
-                .storage
-                .upgrade()
-                .is_some_and(|storage| storage.attached() > 0);
-            (open, entry.close_timeout)
+        .map(|entry| match entry.state() {
+            LiveState::Open(storage) => (storage.attached() > 0, entry.wait(false)),
+            LiveState::Dropping => (false, entry.wait(true)),
+            _ => (false, entry.wait(false)),
         })
         .max_by_key(|(open, _)| *open)
 }
