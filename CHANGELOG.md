@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### S3 durability
+
+* Warm reopen: an open whose working copy is still the one a clean close of
+  the same database left skips the snapshot download and fetches only the
+  log written since (a 100 MB reopen took 220 ms instead of 690 ms on a
+  local SeaweedFS). Every doubt (another writer, a changed file, a copy
+  ahead of S3, a crash instead of a close) falls back to the full restore.
+
 ### Fixed
 
 * An S3 database whose working copy was removed right after its pool

@@ -191,12 +191,17 @@ pub fn restore(
 /// snapshot download: readers can't use the epoch until it is sealed. The
 /// seal's key taken means such an upload (or another writer's seal) landed
 /// after the listing: list again.
+///
+/// With `local`, the local copy already holds the snapshot and the log up to
+/// that state (see `super::warm`): only the log past it is downloaded, and
+/// appended to the local log.
 pub fn restore_and_seal(
     remote: &Remote,
     manifest: &Manifest,
     db_path: &Path,
     concurrency: usize,
     generation: u64,
+    local: Option<LogState>,
 ) -> Result<LogState> {
     let point = Point {
         record: manifest.current(),
@@ -206,7 +211,7 @@ pub fn restore_and_seal(
         let (segments, log) = fetch_log_from(
             remote,
             manifest.epoch,
-            LogState::default(),
+            local.unwrap_or_default(),
             None,
             concurrency,
         )?;
@@ -223,7 +228,12 @@ pub fn restore_and_seal(
                 Err(err) => return Err(err),
             }
         }
-        install(remote, &point, db_path, &segments, None)?;
+        if local.is_some() {
+            remove_if_exists(&wal_path(db_path))?;
+            write_log(&log_path(db_path), &segments, true)?;
+        } else {
+            install(remote, &point, db_path, &segments, None)?;
+        }
         return Ok(log);
     }
     Err(S3Error::Corrupt(format!(

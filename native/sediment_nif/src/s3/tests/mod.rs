@@ -8,6 +8,7 @@ mod incremental;
 mod reopen;
 mod replica;
 mod seaweed;
+mod warm;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1280,7 +1280,52 @@ impl Drop for S3DurableStorage {
                 let _ = std::fs::remove_file(image);
             }
         }
+        // The lease goes first: whoever waits for this storage to go (an
+        // open, a destroy) finds it free. The sidecar is only a hint (the
+        // next open checks it against S3 and the files), so writing it after
+        // is safe.
+        let lapsed = self.lease.lapsed().is_some();
         self.lease.release();
+        if !lapsed {
+            self.leave_sidecar();
+        }
+    }
+}
+
+impl S3DurableStorage {
+    /// After a clean close, describes the local copy for the next open to
+    /// reuse (see `super::warm`): only when everything committed is in S3
+    /// and the manifest names this epoch. The caller checked that the lease
+    /// never lapsed.
+    fn leave_sidecar(&mut self) {
+        let pending = self
+            .uploads
+            .as_ref()
+            .is_some_and(|uploads| !uploads.0.lock().unwrap().queue.is_empty());
+        if pending || self.poisoned().is_some() || recorded_loss(&self.db_path).is_some() {
+            return;
+        }
+        let generation = self.lease.generation();
+        let log_offset = self.inner.logical_log_offset();
+        let encryption = self.encryption.clone();
+        let log_encryption = self.remote.log_encryption();
+        let Ok(state) = self.state.get_mut() else {
+            return;
+        };
+        if state.snapshot_pending || state.epoch != state.manifest.epoch {
+            return;
+        }
+        let closing = super::warm::Closing {
+            db_path: &self.db_path,
+            manifest: &state.manifest,
+            generation,
+            log_offset,
+            encryption: encryption.as_ref(),
+            log_encryption,
+        };
+        if let Err(err) = super::warm::write(&closing) {
+            tracing::warn!("s3: no warm reopen for {}: {err}", self.db_path.display());
+        }
     }
 }
 

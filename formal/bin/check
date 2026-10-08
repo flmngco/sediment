@@ -70,6 +70,15 @@ NegTrustRefused RefusedMeansIntact
 NegSeqFromManifest RestoreOK
 NegGCAnyGeneration RestoreOK
 NegAdoptUnchecked ReadsAfterDestroy
+WarmSole pass
+WarmAsync pass
+WarmTakeover pass
+WarmDestroy pass
+WarmAheadGuarded pass
+NegWarmAhead WarmEqualsFull
+NegWarmStale WarmEqualsFull
+NegWarmRecreate WarmEqualsFull
+NegWarmTrustSidecar WarmEqualsFull
 NegReadRecheckGeneration ShownDurable
 NegReadRecheckSeal ShownDurable
 NegNoTakeoverSeal ShownDurable

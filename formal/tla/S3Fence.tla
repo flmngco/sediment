@@ -29,6 +29,7 @@ CONSTANTS
     Async,           \* durability: :async (commit locally, upload in order later)
     Readers,         \* reads (replica refreshes, restores) next to the hosts, whole behaviour
     Retain,          \* retain_epochs: past epochs a manifest keeps (GC spares them)
+    Warm,            \* hosts close cleanly (leaving a sidecar) and reopen warm
     Destroys,        \* destroys per host
     ManifestLoss,    \* times manifest.json is deleted from outside (a user, a lifecycle rule)
     Patches          \* behaviours switched on by name; {} is the code
@@ -66,15 +67,24 @@ NoFrame == [e |-> [s |-> 0, g |-> 0], o |-> 0, kind |-> "none", hist |-> <<>>, g
 NoMan == [present |-> FALSE, e |-> [s |-> 0, g |-> 0], gen |-> 0, ret |-> <<>>, body |-> 0, ver |-> 0,
           tomb |-> FALSE, id |-> 0]
 
+\* Warm reopen (warm.rs). dk: a host's local working copy on disk, the database file (the
+\* history folded into it, base) and the local log on top (hist), which outlive the
+\* host's opens and kills. side: the sidecar a clean close leaves, describing the copy.
+NoSide == [on |-> FALSE, e |-> [s |-> 0, g |-> 0], gen |-> 0, id |-> 0, base |-> <<>>, hist |-> <<>>]
+NoDisk == [base |-> <<>>, hist |-> <<>>]
+
 \* db: the durable history (confirmed in S3); ldb: the local one, which is db
 \* in sync mode and runs ahead of it in async mode.
 R0 == [pc |-> "off", gen |-> 0, db |-> <<>>, ldb |-> <<>>, img |-> <<>>, e |-> [s |-> 0, g |-> 0], o |-> 1,
        mver |-> 0, poisoned |-> "no", orphans |-> {}, frame |-> NoFrame,
        seal |-> [on |-> FALSE, e |-> [s |-> 0, g |-> 0], o |-> 0],
        snapPend |-> FALSE, unconf |-> {}, nc |-> 0, ncp |-> 0, nopen |-> 0,
-       gcBelow |-> 0, gcKeep |-> {}, stalled |-> FALSE, nd |-> 0, tb |-> 0, dres |-> "none"]
+       gcBelow |-> 0, gcKeep |-> {}, stalled |-> FALSE, nd |-> 0, tb |-> 0, dres |-> "none",
+       base |-> <<>>, id |-> 0, pg |-> 0, pid |-> 0,
+       side |-> NoSide, got |-> NoSide, dk |-> NoDisk, wbad |-> FALSE, wused |-> FALSE]
 
 Patch(p) == p \in Patches
+
 CanFault == faults < MaxFaults
 
 IsPrefix(a, b) == Len(a) <= Len(b) /\ SubSeq(b, 1, Len(a)) = a
@@ -170,7 +180,8 @@ Open(n) ==
     /\ leaseGen' = leaseGen + 1
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.pc = "take", !.gen = leaseGen + 1,
                                         !.nopen = R[n].nopen + 1, !.nc = R[n].nc,
-                                        !.ncp = R[n].ncp, !.nd = R[n].nd]]
+                                        !.ncp = R[n].ncp, !.nd = R[n].nd, !.side = R[n].side,
+                                        !.dk = R[n].dk, !.wbad = R[n].wbad, !.wused = R[n].wused]]
     /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, kills, acked, committed>>
 
 \* With no manifest nothing was ever acknowledged: only epoch-0 snapshots, which only a
@@ -186,14 +197,19 @@ Refuse == objs # {} \/ snaps \ Leftovers # {} \/ (Patch("RefuseLeftovers") /\ sn
 \* holder exists: this open is stale and refuses ("TakeAnyGeneration": takes it anyway).
 Newer(n) == man.present /\ man.gen >= R[n].gen /\ ~Patch("TakeAnyGeneration")
 
+\* The open takes the sidecar (reads and deletes it) before it touches the local files
+\* ("KeepSidecar": leaves it), and remembers the manifest as it found it.
+Rt(n) == [R EXCEPT ![n].got = R[n].side, ![n].side.on = Patch("KeepSidecar") /\ R[n].side.on,
+                   ![n].pg = man.gen, ![n].pid = man.id]
+
 Take(n) ==
     /\ R[n].pc = "take"
     /\ IF Newer(n)
-       THEN /\ R' = [R EXCEPT ![n].pc = "off"]
+       THEN /\ R' = [Rt(n) EXCEPT ![n].pc = "off"]
             /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, acked, committed>>
        ELSE IF ~man.present /\ Refuse
        THEN \* objects without a manifest: refuse to build over them (the open fails)
-            /\ R' = [R EXCEPT ![n].pc = "off"]
+            /\ R' = [Rt(n) EXCEPT ![n].pc = "off"]
             /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, acked, committed>>
        ELSE IF ~man.present
        THEN \* bootstrap: snapshot of the empty database, create-only manifest. An
@@ -213,9 +229,10 @@ Take(n) ==
                                                      rec |-> NewMan(e, R[n].gen, <<>>, ctr + 1, R[n].gen)]}
                                 ELSE inflight
                  /\ R' = IF out = "ok"
-                         THEN [R EXCEPT ![n].pc = "run", ![n].e = e, ![n].o = 1,
-                                        ![n].mver = ctr + 1, ![n].db = <<>>, ![n].ldb = <<>>]
-                         ELSE [R EXCEPT ![n].pc = "off"]
+                         THEN [Rt(n) EXCEPT ![n].pc = "run", ![n].e = e, ![n].o = 1,
+                                        ![n].mver = ctr + 1, ![n].db = <<>>, ![n].ldb = <<>>,
+                                        ![n].base = <<>>, ![n].id = R[n].gen]
+                         ELSE [Rt(n) EXCEPT ![n].pc = "off"]
             /\ UNCHANGED <<objs, acked, committed>>
        ELSE IF man.tomb
        THEN \* a destroyed database: purge what the tombstone ended, then bootstrap a new one
@@ -228,7 +245,7 @@ Take(n) ==
             /\ objs' = ob
             /\ IF ob # {} \/ {x \in sn : x.e.s # e.s} # {}
                THEN /\ snaps' = sn
-                    /\ R' = [R EXCEPT ![n].pc = "off"]
+                    /\ R' = [Rt(n) EXCEPT ![n].pc = "off"]
                     /\ UNCHANGED <<man, inflight, ctr, faults, acked, committed>>
                ELSE /\ snaps' = sn \cup {[e |-> e, hist |-> <<>>]}
                     /\ \E out \in Outcomes(TRUE) :
@@ -240,12 +257,13 @@ Take(n) ==
                                         THEN inflight \cup {[k |-> "man", cond |-> man.ver, rec |-> rec]}
                                         ELSE inflight
                          /\ R' = IF out = "ok"
-                                 THEN [R EXCEPT ![n].pc = "run", ![n].e = e, ![n].o = 1,
-                                                ![n].mver = ctr + 1, ![n].db = <<>>, ![n].ldb = <<>>]
-                                 ELSE [R EXCEPT ![n].pc = "off"]
+                                 THEN [Rt(n) EXCEPT ![n].pc = "run", ![n].e = e, ![n].o = 1,
+                                                ![n].mver = ctr + 1, ![n].db = <<>>, ![n].ldb = <<>>,
+                                                ![n].base = <<>>, ![n].id = R[n].gen]
+                                 ELSE [Rt(n) EXCEPT ![n].pc = "off"]
                     /\ UNCHANGED <<acked, committed>>
        ELSE IF Patch("ListBeforeTakeover")
-       THEN /\ R' = [R EXCEPT ![n].pc = "restore", ![n].e = man.e, ![n].mver = man.ver]
+       THEN /\ R' = [Rt(n) EXCEPT ![n].pc = "restore", ![n].e = man.e, ![n].mver = man.ver]
             /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, acked, committed>>
        ELSE /\ \E out \in Outcomes(TRUE) :
                  /\ Charge(out)
@@ -257,28 +275,64 @@ Take(n) ==
                                                      rec |-> NewMan(man.e, R[n].gen, man.ret, ctr + 1, man.id)]}
                                 ELSE inflight
                  /\ R' = IF out = "ok"
-                         THEN [R EXCEPT ![n].pc = "restore", ![n].e = man.e,
-                                        ![n].mver = ctr + 1]
-                         ELSE [R EXCEPT ![n].pc = "off"]
+                         THEN [Rt(n) EXCEPT ![n].pc = "restore", ![n].e = man.e,
+                                        ![n].mver = ctr + 1, ![n].id = man.id]
+                         ELSE [Rt(n) EXCEPT ![n].pc = "off"]
             /\ UNCHANGED <<objs, snaps, acked, committed>>
     /\ UNCHANGED <<leaseGen, kills, committed>>
 
 \* restore::restore: list and verify the epoch, then fold it into a fresh epoch
 \* ("ContinueEpoch": keep appending to the restored one unless it is sealed). An
 \* unsealed epoch is sealed at the end just listed first ("NoTakeoverSeal": not).
+\* Warm reopen: the open reuses its local copy when the sidecar it took describes it and
+\* every check holds; it then lists the log from the copy's end only. The checks (patches
+\* switch them off): the same database (NoIdCheck); the manifest as the writer that left
+\* the copy left it, same generation and epoch (NoEpochCheck); the local files are what
+\* the sidecar says (NoContentCheck); the database file is the epoch's snapshot
+\* (NoFileCheck); S3's log holds the copy's log, an object ending where it ends with the
+\* same chain (NoPositionCheck).
+WarmOK(n) ==
+    LET S == R[n].got
+        D == R[n].dk
+        e == R[n].e
+        dp == Len(D.hist) - Len(D.base) + 1
+    IN /\ S.on
+       /\ Patch("NoIdCheck") \/ R[n].pid = S.id
+       /\ Patch("NoEpochCheck") \/ (R[n].pg = S.gen /\ e = S.e)
+       /\ Patch("NoContentCheck") \/ (D.base = S.base /\ D.hist = S.hist)
+       /\ Patch("NoFileCheck") \/ (SnapOf(e) # {} /\ D.base = The(SnapOf(e)).hist)
+       \* against the local log as it is (like the code), not as the sidecar says
+       /\ Patch("NoPositionCheck") \/ dp = 1
+          \/ (Taken(e, dp - 1) /\ The(At(e, dp - 1)).kind = "frame"
+              /\ The(At(e, dp - 1)).hist = D.hist)
+\* What the code restores from the local files (the real ones, whatever the sidecar says).
+WarmWalk(n) ==
+    LET D == R[n].dk
+        dp == Len(D.hist) - Len(D.base) + 1
+    IN Walk(R[n].e, dp, D.hist, dp - 1)
+
 RestoreStep(n) ==
     /\ R[n].pc = "restore"
-    /\ LET W == Restore([e |-> R[n].e]) IN
+    /\ LET Wf == Restore([e |-> R[n].e])
+           warm == WarmOK(n)
+           W == IF warm THEN WarmWalk(n) ELSE Wf
+           \* a warm restore must give exactly what the full one gives
+           bad == warm /\ (W.ok # Wf.ok \/ (Wf.ok /\ W.h # Wf.h))
+           base == IF warm THEN R[n].dk.base
+                   ELSE IF SnapOf(R[n].e) # {} THEN The(SnapOf(R[n].e)).hist ELSE <<>>
+           R1 == [R EXCEPT ![n].wbad = R[n].wbad \/ bad, ![n].wused = R[n].wused \/ warm,
+                           ![n].base = base]
+       IN
        IF ~W.ok
-       THEN R' = [R EXCEPT ![n].pc = "off"]
+       THEN R' = [R1 EXCEPT ![n].pc = "off"]
        ELSE IF Patch("ListBeforeTakeover")
-       THEN R' = [R EXCEPT ![n].pc = "latetake", ![n].db = W.h, ![n].ldb = W.h, ![n].o = W.n + 1]
+       THEN R' = [R1 EXCEPT ![n].pc = "latetake", ![n].db = W.h, ![n].ldb = W.h, ![n].o = W.n + 1]
        ELSE IF Patch("ContinueEpoch") /\ ~W.sealed
-       THEN R' = [R EXCEPT ![n].pc = "run", ![n].db = W.h, ![n].ldb = W.h, ![n].o = W.n + 1]
+       THEN R' = [R1 EXCEPT ![n].pc = "run", ![n].db = W.h, ![n].ldb = W.h, ![n].o = W.n + 1]
        ELSE IF ~W.sealed /\ ~Patch("NoTakeoverSeal")
-       THEN R' = [R EXCEPT ![n].pc = "tseal", ![n].db = W.h, ![n].ldb = W.h, ![n].o = W.n + 1]
+       THEN R' = [R1 EXCEPT ![n].pc = "tseal", ![n].db = W.h, ![n].ldb = W.h, ![n].o = W.n + 1]
        ELSE \* every open moves to an epoch of its own
-            R' = [R EXCEPT ![n].pc = "compact", ![n].db = W.h, ![n].ldb = W.h]
+            R' = [R1 EXCEPT ![n].pc = "compact", ![n].db = W.h, ![n].ldb = W.h]
     /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, faults, kills, acked, committed>>
 
 \* The takeover's seal: create-only at the end of the log it listed, so a late upload
@@ -332,7 +386,7 @@ Compact(n) ==
                            ELSE inflight
             /\ R' = IF out = "ok"
                     THEN [R EXCEPT ![n].pc = "run", ![n].e = e, ![n].o = 1,
-                                   ![n].mver = ctr + 1]
+                                   ![n].mver = ctr + 1, ![n].base = R[n].db]
                     ELSE [R EXCEPT ![n].pc = "off"]
     /\ UNCHANGED <<objs, leaseGen, kills, acked, committed>>
 
@@ -436,7 +490,7 @@ ConfirmFails(n) ==
 Checkpoint(n) ==
     /\ Running(n) /\ R[n].ncp < MaxCheckpoints
     /\ (~Async \/ Patch("NoDrain") \/ R[n].ldb = R[n].db)
-    /\ R' = [R EXCEPT ![n].ncp = R[n].ncp + 1, ![n].img = R[n].ldb,
+    /\ R' = [R EXCEPT ![n].ncp = R[n].ncp + 1, ![n].img = R[n].ldb, ![n].base = R[n].ldb,
                       ![n].seal = IF R[n].seal.on THEN R[n].seal
                                   ELSE [on |-> TRUE, e |-> R[n].e, o |-> R[n].o],
                       ![n].e = [s |-> R[n].e.s + 1, g |-> R[n].gen],
@@ -657,6 +711,23 @@ ReaderNext == (ReadMan \/ ReadList \/ ReadGet \/ ReadCheck \/ ReadAdopt)
               /\ UNCHANGED <<vars, tomb, mlost>>
 
 -----------------------------------------------------------------------------
+(* A clean close: S3DurableStorage::drop + warm::write *)
+
+\* Everything committed is durable and the manifest names the writer's epoch (nothing to
+\* seal or publish): the sidecar describes the local files ("CloseWithPending": also with
+\* async commits not uploaded yet, a copy ahead of S3).
+Close(n) ==
+    /\ Running(n) /\ ~R[n].snapPend /\ ~R[n].seal.on
+    /\ (~Async \/ R[n].ldb = R[n].db \/ Patch("CloseWithPending"))
+    /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.nc = R[n].nc, !.ncp = R[n].ncp, !.nopen = R[n].nopen,
+                                        !.nd = R[n].nd, !.wbad = R[n].wbad, !.wused = R[n].wused,
+                                        !.dk = [base |-> R[n].base, hist |-> R[n].ldb],
+                                        !.side = [on |-> TRUE, e |-> R[n].e, gen |-> R[n].gen,
+                                                  id |-> R[n].id, base |-> R[n].base,
+                                                  hist |-> R[n].ldb]]]
+    /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, faults, kills, acked, committed>>
+
+-----------------------------------------------------------------------------
 (* Destroying: destroy.rs *)
 
 \* The database ends: what was acknowledged, committed and shown goes with it, so the
@@ -683,7 +754,8 @@ DStart(n) ==
                                         !.gen = leaseGen + 1, !.mver = man.ver,
                                         !.e = [s |-> TombSeq, g |-> 0],
                                         !.nopen = R[n].nopen, !.nc = R[n].nc,
-                                        !.ncp = R[n].ncp, !.nd = R[n].nd + 1]]
+                                        !.ncp = R[n].ncp, !.nd = R[n].nd + 1, !.side = R[n].side,
+                                        !.dk = R[n].dk, !.wbad = R[n].wbad, !.wused = R[n].wused]]
     /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, kills, acked, committed, rvars>>
 
 \* The tombstone PUT. A lost answer is followed by a GET, which finds our tombstone
@@ -753,8 +825,12 @@ DestroyNext == (\E n \in Node : DStart(n) \/ DTomb(n) \/ DPurge(n)) \/ LoseManif
 Kill(n) ==
     /\ R[n].pc # "off" /\ kills < MaxKills
     /\ kills' = kills + 1
+    \* An open past its takeover has replaced the local files (atomically, at its restore).
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.nc = R[n].nc, !.ncp = R[n].ncp,
-                                        !.nopen = R[n].nopen, !.nd = R[n].nd]]
+                                        !.nopen = R[n].nopen, !.nd = R[n].nd, !.side = R[n].side,
+                                        !.dk = IF R[n].pc \in {"off", "take", "restore"} THEN R[n].dk
+                                               ELSE [base |-> R[n].base, hist |-> R[n].ldb],
+                                        !.wbad = R[n].wbad, !.wused = R[n].wused]]
     /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, faults, acked, committed>>
 
 \* A write the caller gave up on reaches the store; its precondition decides.
@@ -787,7 +863,7 @@ WriterNext ==
          \/ Open(n) \/ Take(n) \/ RestoreStep(n) \/ TakeSeal(n) \/ LateTake(n) \/ Compact(n)
          \/ CommitPut(n) \/ AsyncCommit(n) \/ Rewrite(n) \/ Confirm(n) \/ ConfirmFails(n)
          \/ Checkpoint(n) \/ PublishBegin(n) \/ Seal(n) \/ Adopt(n) \/ Snap(n) \/ Man(n) \/ GC(n)
-         \/ Kill(n)
+         \/ Kill(n) \/ (Warm /\ Close(n))
 
 Next == (WriterNext /\ UNCHANGED rvars) \/ ReaderNext \/ (\E w \in inflight : Land(w))
         \/ DestroyNext
@@ -886,6 +962,11 @@ NewAfterDestroy == Live(man) /\ tomb > 0 => man.e.g > tomb
 \* replace the manifest: its own tombstone isn't what the manifest holds.
 RefusedMeansIntact ==
     \A n \in Node : R[n].dres = "refused" => ~(man.tomb /\ man.body = R[n].tb)
+
+\* A warm restore gives exactly what a full restore of the same epoch would.
+WarmEqualsFull == \A n \in Node : ~R[n].wbad
+\* Witness: an open reused its local copy.
+WarmReused == \E n \in Node : R[n].wused
 
 \* Witnesses: a database created over a tombstone, and a commit acknowledged in it.
 OpenOverTomb == tomb > 0 /\ Live(man)

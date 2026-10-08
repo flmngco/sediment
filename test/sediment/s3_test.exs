@@ -216,6 +216,45 @@ defmodule Sediment.S3Test do
     assert {:ok, _} = S3.destroy(s3)
   end
 
+  test "a reopen after a clean close reuses the local copy", %{s3: s3, dir: dir} do
+    path = Path.join(dir, "a.db")
+    sidecar = Path.join(dir, ".a.db.s3-warm")
+
+    gets = fn ->
+      case S3.request_counts() do
+        %{"GetObject" => %{count: count}} -> count
+        _ -> 0
+      end
+    end
+
+    {:ok, db} = Engine.open(path, s3: s3)
+    :ok = Engine.execute(db, "CREATE TABLE t (x BLOB)")
+
+    # 50 sync commits: the epoch's log is 50 objects, which a full restore
+    # downloads one by one, after the snapshot.
+    for _ <- 1..50 do
+      :ok = Engine.execute(db, "INSERT INTO t VALUES (randomblob(2000))")
+    end
+
+    :ok = Engine.close(db)
+    assert File.exists?(sidecar)
+
+    before = gets.()
+    {:ok, db} = Engine.open(path, s3: s3)
+    reads = gets.() - before
+    refute File.exists?(sidecar)
+    assert count(db, "t") == 50
+    :ok = Engine.close(db)
+    assert reads < 10, "a warm open read #{reads} objects"
+    assert File.exists?(sidecar)
+
+    # Without the local copy: the full restore, same data.
+    for file <- [path, sidecar, Path.rootname(path) <> ".db-log"], do: File.rm!(file)
+    {:ok, db} = Engine.open(path, s3: s3)
+    assert count(db, "t") == 50
+    :ok = Engine.close(db)
+  end
+
   test "exists?/1 and must_exist: true", %{s3: s3, dir: dir} do
     refute S3.exists?(s3)
     strict = Keyword.put(s3, :must_exist, true)

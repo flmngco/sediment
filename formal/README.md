@@ -159,6 +159,35 @@ deletes (`NegTakeAnyGeneration`). And a database over a tombstone must not resta
 deletes the new database's first snapshot (`NegSeqFromZero`). The last two were found by
 the model while the destroy was designed.
 
+### Warm reopen
+
+`Warm = TRUE` gives each host a local working copy (`dk`: the database file's history
+`base` and the local log on top) and a sidecar (`side`), both outliving the host's opens
+and kills. `Close` (a clean close: nothing pending, nothing to seal or publish) writes
+the sidecar describing the copy. An open takes the sidecar first (`got`; on disk it is
+gone), remembers the manifest it took over, and in `RestoreStep` reuses the copy when
+every check holds: the same database (`id`), the manifest's generation and epoch the
+sidecar's, the local files the sidecar's, the database file the epoch's snapshot, and
+S3's log holding the local log (the object ending where it ends carries the same
+history). It then walks S3 from the copy's end on the copy's history. A kill after the
+takeover leaves the copy replaced by what the open restored. `WarmEqualsFull`: every
+warm restore gives exactly what a full restore of that epoch gives (a ghost flag set at
+the restore step).
+
+Each negative control switches off the checks that protect one case, and must break
+`WarmEqualsFull`. `NegWarmAhead`: a copy ahead of S3 (`CloseWithPending`: a sidecar
+although async commits were not uploaded) without the position check;
+`WarmAheadGuarded` keeps the position check and passes, so that check alone protects
+it. `NegWarmStale`: a stale copy (another writer took over and committed) without the
+epoch and file checks. `NegWarmRecreate`: a destroyed and recreated database without
+the identity and position checks. `NegWarmTrustSidecar`: a sidecar left behind by an
+open killed after its takeover (`KeepSidecar`) and trusted without the content, epoch
+and file checks. In each case one check alone is not enough to break it: the checks
+overlap. Like the code, the model checks the local files as they are (not as the
+sidecar says) against S3: the database file is the epoch's snapshot, and S3's log
+holds the local log. Those two alone keep a stale sidecar harmless; the sidecar and
+identity checks are a second line, which is what the code's tests show too.
+
 ### Bootstrap over leftovers
 
 Without a manifest, an open refuses to build over log objects or any snapshot except

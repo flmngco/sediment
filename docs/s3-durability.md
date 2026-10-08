@@ -232,6 +232,37 @@ Cost: one PUT plus one HEAD per commit.
 5. Return `S3DurableStorage`. The caller opens with it and turso's MVCC
    recovery replays the log.
 
+## Warm reopen
+
+`warm.rs`. A clean close (`S3DurableStorage::drop`: the last reference, so
+turso's Database and its files are closed) leaves `.<name>.s3-warm` when
+everything committed is in S3 (upload queue empty, not poisoned, no recorded
+loss, no snapshot pending, the epoch is the manifest's, the lease never
+lapsed): `{version, database_id, generation, epoch, log_len, log_end_crc,
+db_size, db_crc32c, encrypted, cipher}`. It syncs the database file and the
+log, verifies the log's chain, writes a temp file, syncs, renames and syncs
+the directory. The lease is released before (a waiting open or destroy finds
+it free): the sidecar is only a hint.
+
+An open takes the sidecar (reads and deletes it, syncs the directory) before
+anything touches the local files. After its takeover, it reuses the copy only
+if the manifest it took over has the sidecar's `database_id`, generation and
+epoch; the encryption choice matches; the database file's size and CRC32C are
+the sidecar's and the manifest's snapshot's; the local log's length and chain
+end are the sidecar's; and, for a non-empty log, an object of the epoch's log
+ends exactly where the local log does with the same bytes (S3 holds the local
+log; a copy ahead of S3 is never reused). Then `restore_and_seal` lists the
+epoch from the local log's end only, verifies the tail as a continuation of
+the chain, seals the epoch at the end it listed and appends the tail to the
+local log; the rest of the open is unchanged. Any failed check or error falls
+back to the full restore, which overwrites the local files.
+
+The content checks alone already exclude every case the identity checks
+catch (another writer's epoch has another snapshot, or S3 doesn't hold the
+local log); the identity checks stay as a second line. The model
+(`formal/`, "Warm reopen") checks that a warm restore always gives what a full
+restore of the same epoch gives.
+
 ## Destroy
 
 `destroy.rs` (`Sediment.S3.destroy/2`) ends a database:
@@ -436,9 +467,8 @@ SeaweedFS:
   delta of the changed 64 KiB segments unless the chain is due for a full
   snapshot, but finding the changes reads the whole local file. Tune with
   `checkpoint_threshold`.
-- Every open downloads the snapshot and uploads a new one (fresh epoch per
-  open, see "Open / restore"). A local-cache fast path would have to keep
-  that property.
+- Every open uploads a new snapshot (fresh epoch per open, see "Open /
+  restore"); a warm reopen (below) skips the download, not that.
 - A process holds one storage per path. Opening a path whose storage is
   poisoned fails until every connection to it is closed.
 - `owner` defaults to `<hostname>-<os pid>-<random>`. A restarted process waits one lease

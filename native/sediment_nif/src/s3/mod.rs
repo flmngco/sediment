@@ -19,6 +19,7 @@ pub mod replica;
 pub mod restore;
 mod snapshot;
 mod storage;
+pub(crate) mod warm;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -209,6 +210,9 @@ fn prepare_fresh(
     local_path: &Path,
     io: Arc<dyn IO>,
 ) -> Result<Arc<S3DurableStorage>> {
+    // Taken before anything touches the local files: an open that fails or
+    // crashes from here on leaves no sidecar to trust.
+    let sidecar = warm::take(local_path);
     let remote = cfg.remote()?;
     // Before anything is written (the probe, the lease): a mistyped bucket
     // or prefix gets nothing. Checked again under the lease below.
@@ -240,6 +244,14 @@ fn prepare_fresh(
             // stale writer can publish, or acknowledge a commit (see
             // `S3DurableStorage::confirm_ownership`).
             check_encryption(&decoded, cfg)?;
+            // Checked against the manifest as the previous writer left it.
+            let warm = sidecar.as_ref().and_then(|sidecar| {
+                warm::check(sidecar, &decoded, cfg, &remote, local_path)
+                    .map_err(|why| {
+                        tracing::info!("s3: full restore of {}: {why}", local_path.display())
+                    })
+                    .ok()
+            });
             let manifest = Manifest {
                 generation,
                 writer: owner,
@@ -252,14 +264,29 @@ fn prepare_fresh(
             let version = remote
                 .put(MANIFEST_KEY, manifest.encode(), Put::Update(object_version))
                 .map_err(fenced_on_conflict)?;
-            restore::restore_and_seal(
-                &remote,
-                &manifest,
-                local_path,
-                cfg.download_concurrency,
-                generation,
-            )
-            .map_err(|err| missing_key_hint(err, cfg))?;
+            let reused = warm.and_then(|local| {
+                restore::restore_and_seal(
+                    &remote,
+                    &manifest,
+                    local_path,
+                    cfg.download_concurrency,
+                    generation,
+                    Some(local),
+                )
+                .map_err(|err| tracing::warn!("s3: reusing {} failed: {err}", local_path.display()))
+                .ok()
+            });
+            if reused.is_none() {
+                restore::restore_and_seal(
+                    &remote,
+                    &manifest,
+                    local_path,
+                    cfg.download_concurrency,
+                    generation,
+                    None,
+                )
+                .map_err(|err| missing_key_hint(err, cfg))?;
+            }
             // The restored snapshot, before the log is replayed into it: the
             // new epoch's snapshot can be a delta on top of it.
             let restored = cfg

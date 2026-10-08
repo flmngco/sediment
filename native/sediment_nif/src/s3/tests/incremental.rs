@@ -190,7 +190,8 @@ fn a_damaged_or_missing_link_fails_the_restore() {
     let leftovers: Vec<_> = std::fs::read_dir(dir.db("y.db").parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.contains(".s3-"))
+        // The failed restore's files (the writer's sidecar is a.db's).
+        .filter(|name| name.contains(".s3-") && name.contains("y.db"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
