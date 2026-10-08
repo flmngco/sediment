@@ -106,6 +106,10 @@ delays commits. Checked: `AsyncSole` 77,213 states, `AsyncSoleDelays` 159,549, `
 | `NegWarmStale` | as `WarmTakeover` | `NoEpochCheck`, `NoFileCheck` | `WarmEqualsFull` violated |
 | `NegWarmRecreate` | as `WarmDestroy` | `NoIdCheck`, `NoEpochCheck`, `NoPositionCheck` | `WarmEqualsFull` violated |
 | `NegWarmTrustSidecar` | as `WarmSole` | `KeepSidecar`, `NoContentCheck`, `NoEpochCheck`, `NoFileCheck` | `WarmEqualsFull` violated |
+| `WarmOverlap` | as `WarmSole` | `SecondProcess` (another process opens the files while a close's sidecar is pending) | pass (137,984 states) |
+| `WarmOverlapAsync` | as `WarmAsync` | `SecondProcess` | pass (170,071 states) |
+| `WarmGenGuarded` | as `WarmAsync` | `SecondProcess`, `NoSeqCheck`, `NoFileCheck`, `NoContentCheck`, `NoPositionCheck` | pass: the generation check alone protects |
+| `NegWarmNoGen` | as `WarmAsync` | as `WarmGenGuarded`, and `NoGenCheck` | `WarmEqualsFull` violated |
 
 ### Destroy
 
@@ -172,8 +176,14 @@ the model while the destroy was designed.
 
 `Warm = TRUE` gives each host a local working copy (`dk`: the database file's history
 `base` and the local log on top) and a sidecar (`side`), both outliving the host's opens
-and kills. `Close` (a clean close: nothing pending, nothing to seal or publish) writes
-the sidecar describing the copy. An open takes the sidecar first (`got`; on disk it is
+and kills. A clean close (nothing pending, nothing to seal or publish) is two steps,
+as in `S3DurableStorage::drop`: `Close` releases the lease and leaves the sidecar
+pending (`ps`), and `WriteSide` later writes it (or fails), describing the files as they
+are then if the database file is still the closed epoch's snapshot and the log has the
+closed length (`warm::write`). An open of the same host waits for a pending sidecar,
+as an open (or destroy) in the same VM waits for the close to finish;
+`SecondProcess` lets it go ahead (another process on the host, which nothing
+serializes), so a sidecar can land after a newer writer's takeover. An open takes the sidecar first (`got`; on disk it is
 gone), remembers the manifest it took over, and in `RestoreStep` reuses the copy when
 every check holds: the same database (`id`), the manifest's generation and epoch the
 sidecar's, the local files the sidecar's, the database file the epoch's snapshot, and
@@ -196,6 +206,15 @@ overlap. Like the code, the model checks the local files as they are (not as the
 sidecar says) against S3: the database file is the epoch's snapshot, and S3's log
 holds the local log. Those two alone keep a stale sidecar harmless; the sidecar and
 identity checks are a second line, which is what the code's tests show too.
+With a second process, though, a late sidecar can describe the files a newer writer
+left under the old writer's generation: `NegWarmNoGen` switches off the epoch, file,
+content and position checks and the generation check, and breaks `WarmEqualsFull`;
+`WarmGenGuarded` keeps only the generation check and passes, and without
+`SecondProcess` the same patches pass too. `NoEpochCheck` switches off both the
+generation (`NoGenCheck`) and the epoch sequence (`NoSeqCheck`) comparisons. The
+model's digests are exact (the code compares SHA-256 for the local files), and it
+has no deletion of a single log object from outside (the code's contiguity check of
+the listing has a NIF test).
 
 ### Bootstrap over leftovers
 

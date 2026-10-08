@@ -70,6 +70,8 @@ NoMan == [present |-> FALSE, e |-> [s |-> 0, g |-> 0], gen |-> 0, ret |-> <<>>, 
 \* Warm reopen (warm.rs). dk: a host's local working copy on disk, the database file (the
 \* history folded into it, base) and the local log on top (hist), which outlive the
 \* host's opens and kills. side: the sidecar a clean close leaves, describing the copy.
+\* ps: a close that released its lease and hasn't written its sidecar yet (Drop runs
+\* leave_sidecar after lease.release()).
 NoSide == [on |-> FALSE, e |-> [s |-> 0, g |-> 0], gen |-> 0, id |-> 0, base |-> <<>>, hist |-> <<>>]
 NoDisk == [base |-> <<>>, hist |-> <<>>]
 
@@ -81,9 +83,14 @@ R0 == [pc |-> "off", gen |-> 0, db |-> <<>>, ldb |-> <<>>, img |-> <<>>, e |-> [
        snapPend |-> FALSE, unconf |-> {}, nc |-> 0, ncp |-> 0, nopen |-> 0,
        gcBelow |-> 0, gcKeep |-> {}, stalled |-> FALSE, nd |-> 0, tb |-> 0, dres |-> "none",
        base |-> <<>>, id |-> 0, pg |-> 0, pid |-> 0,
-       side |-> NoSide, got |-> NoSide, dk |-> NoDisk, wbad |-> FALSE, wused |-> FALSE]
+       side |-> NoSide, got |-> NoSide, ps |-> NoSide, dk |-> NoDisk, wbad |-> FALSE, wused |-> FALSE]
 
 Patch(p) == p \in Patches
+
+\* The local files as they are: an open past its takeover has replaced them (atomically,
+\* at its restore) and runs on them.
+Disk(n) == IF R[n].pc \in {"off", "take", "restore"} THEN R[n].dk
+           ELSE [base |-> R[n].base, hist |-> R[n].ldb]
 
 CanFault == faults < MaxFaults
 
@@ -174,13 +181,17 @@ Retained(m) == {m.e} \cup Range(m.ret)
 \* holds the lease, from its own open on, unless it was poisoned (its renewals lapsed),
 \* i.e. clocks agree within the lease TTL, so Lease::acquire refuses. A failed open's
 \* lease lingers until its TTL in the code; for liveness that is the same as released.
+\* An open waits for a close of the same files in this VM to finish (mod.rs
+\* wait_while_closing), sidecar and all. "SecondProcess": another process on the host
+\* opens them meanwhile, which nothing serializes.
 Open(n) ==
     /\ R[n].pc = "off" /\ R[n].nopen < MaxOpens
+    /\ ~R[n].ps.on \/ Patch("SecondProcess")
     /\ Patch("LeaseHolds") => \A m \in Node \ {n} : R[m].pc = "off" \/ R[m].poisoned # "no"
     /\ leaseGen' = leaseGen + 1
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.pc = "take", !.gen = leaseGen + 1,
                                         !.nopen = R[n].nopen + 1, !.nc = R[n].nc,
-                                        !.ncp = R[n].ncp, !.nd = R[n].nd, !.side = R[n].side,
+                                        !.ncp = R[n].ncp, !.nd = R[n].nd, !.side = R[n].side, !.ps = R[n].ps,
                                         !.dk = R[n].dk, !.wbad = R[n].wbad, !.wused = R[n].wused]]
     /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, kills, acked, committed>>
 
@@ -287,7 +298,9 @@ Take(n) ==
 \* Warm reopen: the open reuses its local copy when the sidecar it took describes it and
 \* every check holds; it then lists the log from the copy's end only. The checks (patches
 \* switch them off): the same database (NoIdCheck); the manifest as the writer that left
-\* the copy left it, same generation and epoch (NoEpochCheck); the local files are what
+\* the copy left it, same generation (NoGenCheck) and epoch (NoSeqCheck; NoEpochCheck:
+\* neither); the
+\* local files are what
 \* the sidecar says (NoContentCheck); the database file is the epoch's snapshot
 \* (NoFileCheck); S3's log holds the copy's log, an object ending where it ends with the
 \* same chain (NoPositionCheck).
@@ -298,7 +311,8 @@ WarmOK(n) ==
         dp == Len(D.hist) - Len(D.base) + 1
     IN /\ S.on
        /\ Patch("NoIdCheck") \/ R[n].pid = S.id
-       /\ Patch("NoEpochCheck") \/ (R[n].pg = S.gen /\ e = S.e)
+       /\ Patch("NoEpochCheck")
+          \/ ((Patch("NoGenCheck") \/ R[n].pg = S.gen) /\ (Patch("NoSeqCheck") \/ e = S.e))
        /\ Patch("NoContentCheck") \/ (D.base = S.base /\ D.hist = S.hist)
        /\ Patch("NoFileCheck") \/ (SnapOf(e) # {} /\ D.base = The(SnapOf(e)).hist)
        \* against the local log as it is (like the code), not as the sidecar says
@@ -714,17 +728,34 @@ ReaderNext == (ReadMan \/ ReadList \/ ReadGet \/ ReadCheck \/ ReadAdopt)
 (* A clean close: S3DurableStorage::drop + warm::write *)
 
 \* Everything committed is durable and the manifest names the writer's epoch (nothing to
-\* seal or publish): the sidecar describes the local files ("CloseWithPending": also with
-\* async commits not uploaded yet, a copy ahead of S3).
+\* seal or publish): the close releases the lease, and its sidecar is written later
+\* ("CloseWithPending": also with async commits not uploaded yet, a copy ahead of S3).
+\* In between, an open in this VM waits (see Open); another process doesn't.
 Close(n) ==
     /\ Running(n) /\ ~R[n].snapPend /\ ~R[n].seal.on
     /\ (~Async \/ R[n].ldb = R[n].db \/ Patch("CloseWithPending"))
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.nc = R[n].nc, !.ncp = R[n].ncp, !.nopen = R[n].nopen,
                                         !.nd = R[n].nd, !.wbad = R[n].wbad, !.wused = R[n].wused,
+                                        !.side = R[n].side,
                                         !.dk = [base |-> R[n].base, hist |-> R[n].ldb],
-                                        !.side = [on |-> TRUE, e |-> R[n].e, gen |-> R[n].gen,
-                                                  id |-> R[n].id, base |-> R[n].base,
-                                                  hist |-> R[n].ldb]]]
+                                        !.ps = [on |-> TRUE, e |-> R[n].e, gen |-> R[n].gen,
+                                                id |-> R[n].id, base |-> R[n].base,
+                                                hist |-> R[n].ldb]]]
+    /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, faults, kills, acked, committed>>
+
+\* warm::write, when the close gets to it: it describes the files as they are then, if
+\* the database file is still the closed epoch's snapshot and the log has the length the
+\* closing writer had uploaded; or it fails and writes nothing.
+WriteSide(n) ==
+    /\ R[n].ps.on
+    /\ LET P == R[n].ps
+           D == Disk(n)
+       IN \E written \in BOOLEAN :
+            R' = [R EXCEPT ![n].ps = NoSide,
+                           ![n].side = IF written /\ D.base = P.base
+                                          /\ Len(D.hist) - Len(D.base) = Len(P.hist) - Len(P.base)
+                                       THEN [P EXCEPT !.base = D.base, !.hist = D.hist]
+                                       ELSE R[n].side]
     /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, faults, kills, acked, committed>>
 
 -----------------------------------------------------------------------------
@@ -748,13 +779,14 @@ TombSeq ==
 \* means a newer lease holder: refuse.
 DStart(n) ==
     /\ R[n].pc = "off" /\ R[n].nd < Destroys
+    /\ ~R[n].ps.on \/ Patch("SecondProcess")
     /\ leaseGen' = leaseGen + 1
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.pc = IF man.present /\ man.gen >= leaseGen + 1
                                                  THEN "off" ELSE "dtomb",
                                         !.gen = leaseGen + 1, !.mver = man.ver,
                                         !.e = [s |-> TombSeq, g |-> 0],
                                         !.nopen = R[n].nopen, !.nc = R[n].nc,
-                                        !.ncp = R[n].ncp, !.nd = R[n].nd + 1, !.side = R[n].side,
+                                        !.ncp = R[n].ncp, !.nd = R[n].nd + 1, !.side = R[n].side, !.ps = R[n].ps,
                                         !.dk = R[n].dk, !.wbad = R[n].wbad, !.wused = R[n].wused]]
     /\ UNCHANGED <<man, objs, snaps, inflight, ctr, faults, kills, acked, committed, rvars>>
 
@@ -827,9 +859,8 @@ Kill(n) ==
     /\ kills' = kills + 1
     \* An open past its takeover has replaced the local files (atomically, at its restore).
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.nc = R[n].nc, !.ncp = R[n].ncp,
-                                        !.nopen = R[n].nopen, !.nd = R[n].nd, !.side = R[n].side,
-                                        !.dk = IF R[n].pc \in {"off", "take", "restore"} THEN R[n].dk
-                                               ELSE [base |-> R[n].base, hist |-> R[n].ldb],
+                                        !.nopen = R[n].nopen, !.nd = R[n].nd, !.side = R[n].side, !.ps = R[n].ps,
+                                        !.dk = Disk(n),
                                         !.wbad = R[n].wbad, !.wused = R[n].wused]]
     /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, faults, acked, committed>>
 
@@ -863,7 +894,7 @@ WriterNext ==
          \/ Open(n) \/ Take(n) \/ RestoreStep(n) \/ TakeSeal(n) \/ LateTake(n) \/ Compact(n)
          \/ CommitPut(n) \/ AsyncCommit(n) \/ Rewrite(n) \/ Confirm(n) \/ ConfirmFails(n)
          \/ Checkpoint(n) \/ PublishBegin(n) \/ Seal(n) \/ Adopt(n) \/ Snap(n) \/ Man(n) \/ GC(n)
-         \/ Kill(n) \/ (Warm /\ Close(n))
+         \/ Kill(n) \/ (Warm /\ (Close(n) \/ WriteSide(n)))
 
 Next == (WriterNext /\ UNCHANGED rvars) \/ ReaderNext \/ (\E w \in inflight : Land(w))
         \/ DestroyNext
@@ -967,6 +998,8 @@ RefusedMeansIntact ==
 WarmEqualsFull == \A n \in Node : ~R[n].wbad
 \* Witness: an open reused its local copy.
 WarmReused == \E n \in Node : R[n].wused
+\* A second process's open got past its restore while a close's sidecar was pending.
+CloseOverlapped == \E n \in Node : R[n].ps.on /\ R[n].pc = "run"
 
 \* Witnesses: a database created over a tombstone, and a commit acknowledged in it.
 OpenOverTomb == tomb > 0 /\ Live(man)
