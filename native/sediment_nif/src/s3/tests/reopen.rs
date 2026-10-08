@@ -175,3 +175,98 @@ fn a_plain_open_never_attaches_to_a_closing_storage() {
     assert!(started.elapsed() >= Duration::from_millis(150));
     released.join().unwrap();
 }
+
+/// A closed database whose storage something still holds for `held` (as the
+/// background pass does while it publishes the last close's snapshot),
+/// reopened meanwhile.
+fn reopen_while_held(held: Duration) -> (super::Db, Duration, u64, TempDir) {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    let mut cfg = config(&store, "a");
+    cfg.close_timeout = Duration::from_millis(200);
+    let db = open_db(&cfg, &path).unwrap();
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    db.exec("INSERT INTO t VALUES (1)").unwrap();
+    let generation = db.storage.info().generation;
+    drop(Attached::try_new(&db.storage).unwrap());
+    let holder = db.storage.clone();
+    drop(db);
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(held);
+        drop(holder);
+    });
+    let started = Instant::now();
+    let reopened = open_db(&cfg, &path).unwrap();
+    let took = started.elapsed();
+    released.join().unwrap();
+    assert_eq!(reopened.int("SELECT count(*) FROM t"), 1);
+    (reopened, took, generation, dir)
+}
+
+#[test]
+fn a_reopen_waits_out_a_long_closing_pass() {
+    // Before: refused "still closing from an earlier open" after the close
+    // timeout and a second (1.2 s).
+    let (db, took, generation, _dir) = reopen_while_held(Duration::from_millis(1_800));
+    assert!(took >= Duration::from_millis(1_700), "{took:?}");
+    assert!(db.storage.info().generation > generation);
+}
+
+#[test]
+fn a_reopen_goes_ahead_when_a_closing_pass_takes_too_long() {
+    let (db, took, generation, _dir) = reopen_while_held(Duration::from_millis(4_000));
+    // At the budget (twice the close timeout and the margin, 2.4 s in
+    // tests), not when the old storage went.
+    assert!(took < Duration::from_millis(3_700), "{took:?}");
+    assert!(db.storage.info().generation > generation);
+    // The old storage went meanwhile; the new writer keeps working.
+    db.exec("INSERT INTO t VALUES (2)").unwrap();
+    assert_eq!(db.int("SELECT count(*) FROM t"), 2);
+    assert!(db.storage.info().poisoned.is_none());
+}
+
+#[test]
+fn a_storage_whose_last_reference_goes_in_attach_live_drops_after_the_lock() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    let db = open_db(&config(&store, "a"), &path).unwrap();
+    drop(Attached::try_new(&db.storage).unwrap());
+    let holder = std::sync::Mutex::new(Some(db.storage.clone()));
+    drop(db);
+    // Its Drop is slow: the lease release is held up.
+    store.inject(
+        super::faulty::Op::Put,
+        "lease",
+        super::faulty::Fault::Delay(Duration::from_millis(1_000)),
+        1,
+    );
+    let holder = Arc::new(holder);
+    let opener = std::thread::spawn({
+        let holder = holder.clone();
+        let path = path.clone();
+        move || {
+            // The other reference goes while attach_live holds LIVE: the
+            // one it upgraded is the last.
+            crate::s3::ON_STATE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    holder.lock().unwrap().take();
+                }))
+            });
+            let found = attach_live(&path).unwrap();
+            crate::s3::ON_STATE.with(|hook| hook.borrow_mut().take());
+            found.is_none()
+        }
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    // Another file's lookup takes LIVE: it isn't held through that Drop.
+    let started = Instant::now();
+    assert!(crate::s3::live_storage(&dir.db("other.db")).is_none());
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(opener.join().unwrap());
+}

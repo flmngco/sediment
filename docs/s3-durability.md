@@ -422,13 +422,14 @@ running background pass first.
   A storage whose connections have all started closing is never handed to a
   new open (its last close may still be publishing a snapshot, and the file
   at the path may have been replaced meanwhile: inodes are reused at once);
-  the open waits for it to go (until its Drop has finished): while the
-  storage is still referenced, at most its close timeout and a second (then
-  the open fails, to be retried); once it is dropping, at most twice its
-  close timeout and 5 s (final uploads, lease release, the sidecar's hashing),
-  then the open goes ahead without it and restores in full (the late
-  sidecar names an older generation). Whether to wait and for which storage
-  is decided under one registry lock. An open counts as a connection from its
+  the open waits for it to go (until its Drop has finished), at most twice
+  its close timeout and 5 s (the snapshot publication the last close
+  queued, final uploads, lease release, the sidecar's hashing). Then the
+  open goes ahead without it and restores in full: its takeover fences the
+  old storage, and a sidecar the old one left names an older generation.
+  Whether to wait and for which storage is decided under one registry lock,
+  and a storage reference taken there is released after it (the last one
+  runs the whole Drop). An open counts as a connection from its
   prepare (`Attached`, handed on to the connection), and the count and the
   closing mark are one atomic word: the storage is marked closing only when
   the count drops to 0 with no open attached in between, and an open never
