@@ -43,8 +43,8 @@ Commits go on while the snapshot publication is pending (a failed snapshot uploa
 retried later); the snapshot is uploaded from the checkpoint's image of the DB file
 (`img`), which later commits and checkpoints don't change (`LiveSnapshot` uploads the live
 state instead and breaks `RestoreOK`). Backpressure (`max_lag_ms`, `max_pending_bytes`) bounds the lag and is not modelled; it only
-delays commits. Checked: `AsyncSole` 74,823 states, `AsyncSoleDelays` 155,958, `AsyncTakeover`
-9,977,074 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
+delays commits. Checked: `AsyncSole` 77,213 states, `AsyncSoleDelays` 159,549, `AsyncTakeover`
+10,443,594 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
 `RestoreCommitted` and `SoleNeverFenced`; the sync configs pass `RestoreCommitted` too.
 
 `Patches` switch on negative controls. Each must break a property; the table records it.
@@ -85,18 +85,27 @@ delays commits. Checked: `AsyncSole` 74,823 states, `AsyncSoleDelays` 155,958, `
 | `NegReadRecheckSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `RecheckSeal` (a log that ended at its seal passes the second read even if the epoch moved on) | `ShownDurable` violated |
 | `NegNoTakeoverSeal` | 2 (late writes, 1 fault), 2 reads, retain 1 | `NoTakeoverSeal` | `ShownDurable` violated |
 | `NegReadTransitional` | 2 (late writes, 1 fault), 2 reads, retain 1 | `ReadTransitional`, `NoTakeoverSeal` (use a takeover's manifest before its seal) | `ShownDurable` violated |
-| `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (6,704,792 states) |
-| `AsyncDestroy` | as `Destroy`, async | none | pass (12,054,213 states) |
-| `ReadDestroy` | as `Destroy`, no fault or kill, 2 reads | none | pass (1,586,375 states) |
+| `Destroy` | 2 (1 commit and 1 open each, late writes, 1 fault, 1 kill), 1 destroy each | none | pass (7,369,559 states) |
+| `AsyncDestroy` | as `Destroy`, async | none | pass (12,503,809 states) |
+| `ReadDestroy` | as `Destroy`, no fault or kill, 2 reads | none | pass (1,609,025 states) |
 | `NegDestroyDeletes` | 1 (late writes), 1 destroy | `DestroyDeletes` (delete the manifest instead of a tombstone) | `NewAfterDestroy` violated |
 | `NegPurgeAll` | 2 (late writes, 1 fault), 1 destroy each | `PurgeAll` (purge ignoring the generation) | `RestoreOK` violated |
 | `NegTakeAnyGeneration` | 2 (late writes, 1 fault), 1 destroy each | `TakeAnyGeneration` (an open builds on a manifest or tombstone of a newer lease) | `NewAfterDestroy` violated |
 | `NegSeqFromZero` | as `Destroy` | `SeqFromZero` (a database over a tombstone starts at epoch 0), `GCAnyGeneration` | `RestoreOK` violated |
-| `DestroyManifestLoss` | as `Destroy`, 2 checkpoints, no kill, `manifest.json` deleted once | none | pass (6,815,519 states) |
+| `DestroyManifestLoss` | as `Destroy`, 2 checkpoints, no kill, `manifest.json` deleted once | none | pass (6,873,494 states) |
 | `NegSeqFromManifest` | as `DestroyManifestLoss` | `SeqFromManifest` (the tombstone's sequence number from the manifest only, 0 without one), `GCAnyGeneration` | `RestoreOK` violated |
 | `NegGCAnyGeneration` | as `DestroyManifestLoss` | `GCAnyGeneration` (GC collects epochs of newer lease generations too) | `RestoreOK` violated |
 | `NegTrustRefused` | as `Destroy` | `TrustRefused` (a tombstone PUT reported refused is taken as refused) | `RefusedMeansIntact` violated |
 | `NegAdoptUnchecked` | as `ReadDestroy` | `AdoptUnchecked` (a replica connection adopts the shared generation without a manifest read) | `ReadsAfterDestroy` violated |
+| `WarmSole` | 1 (late writes, 1 fault, 1 kill), 3 opens, clean closes | none | pass (31,040 states) |
+| `WarmAsync` | as `WarmSole`, async | none | pass (42,432 states) |
+| `WarmTakeover` | 2, 2 opens each, clean closes | none | pass (4,633,272 states) |
+| `WarmDestroy` | 2, 1 destroy each, clean closes | none | pass (3,999,884 states) |
+| `WarmAheadGuarded` | as `WarmAsync` | `CloseWithPending` (a sidecar with async commits not uploaded) | pass: the position check alone protects |
+| `NegWarmAhead` | as `WarmAsync` | `CloseWithPending`, `NoPositionCheck` | `WarmEqualsFull` violated |
+| `NegWarmStale` | as `WarmTakeover` | `NoEpochCheck`, `NoFileCheck` | `WarmEqualsFull` violated |
+| `NegWarmRecreate` | as `WarmDestroy` | `NoIdCheck`, `NoEpochCheck`, `NoPositionCheck` | `WarmEqualsFull` violated |
+| `NegWarmTrustSidecar` | as `WarmSole` | `KeepSidecar`, `NoContentCheck`, `NoEpochCheck`, `NoFileCheck` | `WarmEqualsFull` violated |
 
 ### Destroy
 
@@ -284,7 +293,7 @@ so a read of a collected past epoch fails at the snapshot download; in the code 
 epoch's delta chain can keep that snapshot (the model has no chains), so the code checks
 past epochs too.
 
-Checked: `ReadTakeover` 38,480,211 states. `bin/tlc` runs without TLC's periodic
+Checked: `ReadTakeover` 39,079,596 states. `bin/tlc` runs without TLC's periodic
 checkpoints, which copy the state to disk. Run the reader configs with `JAVA_TOOL_OPTIONS=-Xmx3g` on a machine
 with less than 24 GB (`ReadTakeover` keeps millions of states queued).
 
