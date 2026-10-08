@@ -8,11 +8,13 @@
 //! (reads and deletes it) before anything touches the local files, so an
 //! open that crashes leaves none behind. After its takeover it reuses the
 //! copy only if the manifest still names the same database at the same epoch
-//! the same writer left, the local files are byte for byte what the sidecar
-//! says, the file is the epoch's snapshot, and S3's log holds the local log
-//! as a prefix (so the copy is never ahead of S3, as after async commits
-//! that never uploaded). Anything else, including any error while reusing,
-//! falls back to the full restore.
+//! the same writer left, the local files are what the sidecar says (their
+//! SHA-256), the file is the epoch's snapshot (its size and CRC32C, which the
+//! manifest records), and S3's log holds the local log as a prefix: objects
+//! cover it from offset 0 without a gap, and the last one ends where it does
+//! with the same bytes (so the copy is never ahead of S3, as after async
+//! commits that never uploaded). Anything else, including any error while
+//! reusing, falls back to the full restore.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,7 +29,8 @@ use super::logfmt::{verify_segments_from, LogState};
 use super::remote::Remote;
 use super::restore;
 
-const VERSION: u32 = 1;
+/// 2: the files' SHA-256. A sidecar of another version is never reused.
+const VERSION: u32 = 2;
 
 /// What a clean close records about the local working copy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +43,10 @@ pub struct Sidecar {
     pub log_end_crc: Option<u32>,
     pub db_size: u64,
     pub db_crc32c: u32,
+    /// SHA-256 (hex) of the database file and of the local log: CRC32C
+    /// catches damage, not a change made to keep it.
+    pub db_sha256: String,
+    pub log_sha256: String,
     pub encrypted: bool,
     pub cipher: Option<String>,
 }
@@ -101,18 +108,29 @@ fn local_log(db_path: &Path, encryption: Option<(usize, usize)>) -> Result<(Byte
     Ok((bytes, state))
 }
 
-fn file_digest(path: &Path) -> Result<(u64, u32)> {
+fn sha256(bytes: &[u8]) -> String {
+    hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes).as_ref())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The file's size, CRC32C and SHA-256.
+fn file_digest(path: &Path) -> Result<(u64, u32, String)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut crc = 0u32;
+    let mut sha = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
     let mut size = 0u64;
     let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
-            return Ok((size, crc));
+            return Ok((size, crc, hex(sha.finish().as_ref())));
         }
         crc = crc32c::crc32c_append(crc, &buf[..n]);
+        sha.update(&buf[..n]);
         size += n as u64;
     }
 }
@@ -147,12 +165,12 @@ pub fn write(closing: &Closing) -> Result<bool> {
                 .sync_all()?;
         }
     }
-    let (db_size, db_crc32c) = file_digest(closing.db_path)?;
+    let (db_size, db_crc32c, db_sha256) = file_digest(closing.db_path)?;
     let manifest = closing.manifest;
     if (db_size, db_crc32c) != (manifest.snapshot_size, manifest.snapshot_crc32c) {
         return Ok(false);
     }
-    let (_, log) = local_log(closing.db_path, closing.log_encryption)?;
+    let (log_bytes, log) = local_log(closing.db_path, closing.log_encryption)?;
     if log.len != closing.log_offset || log.sealed {
         return Ok(false);
     }
@@ -165,6 +183,8 @@ pub fn write(closing: &Closing) -> Result<bool> {
         log_end_crc: log.end_crc,
         db_size,
         db_crc32c,
+        db_sha256,
+        log_sha256: sha256(&log_bytes),
         encrypted: closing.encryption.is_some(),
         cipher: closing.encryption.map(|e| e.cipher.clone()),
     };
@@ -202,14 +222,18 @@ pub fn check(
     if (sidecar.encrypted, &sidecar.cipher) != (cfg.encryption.is_some(), &cipher) {
         return Err("another encryption choice".into());
     }
-    let digest = file_digest(db_path).map_err(|e| e.to_string())?;
-    if digest != (sidecar.db_size, sidecar.db_crc32c)
-        || digest != (manifest.snapshot_size, manifest.snapshot_crc32c)
+    let (size, crc, sha) = file_digest(db_path).map_err(|e| e.to_string())?;
+    if (size, crc, &sha) != (sidecar.db_size, sidecar.db_crc32c, &sidecar.db_sha256)
+        || (size, crc) != (manifest.snapshot_size, manifest.snapshot_crc32c)
     {
         return Err("the database file is not the epoch's snapshot".into());
     }
     let (bytes, log) = local_log(db_path, remote.log_encryption()).map_err(|e| e.to_string())?;
-    if log.len != sidecar.log_len || log.end_crc != sidecar.log_end_crc || log.sealed {
+    if log.len != sidecar.log_len
+        || log.end_crc != sidecar.log_end_crc
+        || log.sealed
+        || sha256(&bytes) != sidecar.log_sha256
+    {
         return Err("the local log is not the one the copy was closed with".into());
     }
     if log.len > 0 {
@@ -218,32 +242,49 @@ pub fn check(
     Ok(log)
 }
 
-/// S3's log of the epoch holds `local` as a prefix: an object ends exactly
-/// where the local log does, with the same bytes. Those carry the chain's
-/// CRCs, which a different history before them wouldn't produce.
+/// S3's log of the epoch holds `local` as a prefix: its objects cover the
+/// log from offset 0 without a gap or an overlap, and the last of them ends
+/// exactly where the local log does, with the same bytes. Those carry the
+/// chain's CRCs, which a different history before them wouldn't produce.
 fn s3_holds(
     remote: &Remote,
     manifest: &Manifest,
     local: &Bytes,
 ) -> std::result::Result<(), String> {
     let end = local.len() as u64;
-    let listed = remote
+    let mut below = Vec::new();
+    for object in remote
         .list(&manifest.epoch.log_dir())
-        .map_err(|e| e.to_string())?;
-    let last = listed
-        .iter()
-        .filter_map(|object| {
-            let (epoch, offset) = parse_segment_key(&object.key)?;
-            (epoch == manifest.epoch && offset < end && offset + object.size == end)
-                .then(|| (offset, object.key.clone()))
-        })
-        .next()
-        .ok_or("S3's log has no object ending where the local log does")?;
+        .map_err(|e| e.to_string())?
+    {
+        match parse_segment_key(&object.key) {
+            Some((epoch, offset)) if epoch == manifest.epoch => {
+                if offset < end {
+                    below.push((offset, object.size, object.key));
+                }
+            }
+            // The full restore refuses it too.
+            _ => return Err(format!("unexpected object {}", object.key)),
+        }
+    }
+    below.sort();
+    let mut next = 0;
+    for (offset, size, _) in &below {
+        if *offset != next {
+            return Err(format!(
+                "S3's log has a gap or an overlap at offset {next} (found {offset})"
+            ));
+        }
+        next = offset + size;
+    }
+    let Some((last, _, key)) = below.last().filter(|_| next == end) else {
+        return Err("S3's log has no object ending where the local log does".into());
+    };
     let object = remote
-        .get(&last.1)
+        .get(key)
         .map_err(|e| e.to_string())?
         .ok_or("the object ending where the local log does is gone")?;
-    if object.bytes[..] != local[last.0 as usize..] {
+    if object.bytes[..] != local[*last as usize..] {
         return Err("S3's log differs from the local log".into());
     }
     Ok(())

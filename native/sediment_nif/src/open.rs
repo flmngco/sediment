@@ -41,6 +41,9 @@ pub struct Opened {
     pub db: Arc<Database>,
     pub conn: Arc<Connection>,
     pub s3: Option<Arc<S3DurableStorage>>,
+    /// Counts this open among the S3 storage's connections (see
+    /// `crate::s3::Attached`), handed on to the connection's handle.
+    pub attached: Option<crate::s3::Attached>,
     pub replica: Option<crate::replica::Replica>,
 }
 
@@ -204,12 +207,13 @@ impl<'a> OpenConfig<'a> {
 
         // s3 hook: restore from S3 (or create), take the writer lease, and
         // attach the storage that uploads every commit.
-        let s3 = match self.s3 {
+        let attached = match self.s3 {
             Some(term) => Some(self.prepare_s3(term, io.clone())?),
             None if self.is_memory() => None,
             // A plain open of a file whose S3 database is open here shares it.
-            None => crate::s3::live_storage(std::path::Path::new(&self.path)),
+            None => crate::s3::attach_live(Path::new(&self.path)).map_err(|e| e.to_string())?,
         };
+        let s3 = attached.as_ref().map(|a| a.storage().clone());
         if self.s3.is_none() && s3.is_some() {
             if let Some(mode) = self.journal_mode.as_ref().filter(|m| !m.contains("mvcc")) {
                 return Err(format!(
@@ -285,11 +289,12 @@ impl<'a> OpenConfig<'a> {
             db,
             conn,
             s3,
+            attached,
             replica: None,
         })
     }
 
-    fn prepare_s3(&self, term: Term<'a>, io: Arc<dyn IO>) -> Result<Arc<S3DurableStorage>, String> {
+    fn prepare_s3(&self, term: Term<'a>, io: Arc<dyn IO>) -> Result<crate::s3::Attached, String> {
         if self.readonly {
             return Err(
                 "s3 durability does not support read-only opens; use s3: [mode: :replica]".into(),

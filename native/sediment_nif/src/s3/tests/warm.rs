@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::faulty::{Fault, FaultyStore, Op};
 use super::{
@@ -365,7 +366,7 @@ fn every_check_refuses_on_its_own() {
 
     type Change = Box<dyn Fn(&mut warm::Sidecar)>;
     let variants: Vec<(&str, Change)> = vec![
-        ("version", Box::new(|s| s.version = 2)),
+        ("version", Box::new(|s| s.version = 1)),
         (
             "database_id",
             Box::new(|s| s.database_id = "another".into()),
@@ -378,6 +379,14 @@ fn every_check_refuses_on_its_own() {
         ("encryption", Box::new(|s| s.encrypted = true)),
         ("db_size", Box::new(|s| s.db_size += 1)),
         ("db_crc32c", Box::new(|s| s.db_crc32c ^= 1)),
+        (
+            "db_sha256",
+            Box::new(|s| s.db_sha256.replace_range(0..1, "x")),
+        ),
+        (
+            "log_sha256",
+            Box::new(|s| s.log_sha256.replace_range(0..1, "x")),
+        ),
         ("log_len", Box::new(|s| s.log_len += 1)),
         (
             "log_end_crc",
@@ -406,4 +415,154 @@ fn a_failing_read_of_the_log_while_checking_falls_back() {
     store.clear_faults();
     assert!(gets > 0, "full restore");
     assert_eq!(db.int("SELECT count(*) FROM t"), 3);
+}
+
+#[test]
+fn an_open_waits_for_the_last_close_to_leave_its_sidecar() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    let cfg = config(&store, "a");
+    let db = open_db(&cfg, &path).unwrap();
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+        .unwrap();
+    for i in 0..20 {
+        db.exec(&format!("INSERT INTO t VALUES ({i}, randomblob(1000))"))
+            .unwrap();
+    }
+    let generation = db.storage.info().generation;
+    drop(crate::s3::Attached::try_new(&db.storage).unwrap());
+    // The close's lease release is slow: its Drop runs on another thread (a
+    // pool's deferred close) while the database is opened again.
+    store.inject(
+        Op::Put,
+        "lease",
+        Fault::Delay(Duration::from_millis(400)),
+        1,
+    );
+    let closing = std::thread::spawn(move || drop(db));
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    let (reopened, gets) = reopen(&store, &cfg, &path);
+    closing.join().unwrap();
+    // Before: the open went ahead at once, took the lease and restored in
+    // full, and the old Drop could leave a sidecar under the newer writer.
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert_eq!(gets, 0, "reused the copy the close left");
+    assert!(reopened.storage.info().generation > generation);
+    assert_eq!(reopened.int("SELECT count(*) FROM t"), 20);
+    drop(reopened);
+    assert!(sidecar(&path).exists());
+}
+
+/// Bytes to XOR into `file[at..at + 8]` that leave its CRC32C as it is: the
+/// change of the CRC is linear in the change of the bytes, so flip the first
+/// byte and solve for the other 7 bytes' bits over GF(2).
+fn crc_preserving_delta(file: &[u8], at: usize) -> [u8; 8] {
+    let crc = crc32c::crc32c(file);
+    let effect = |bit: usize| {
+        let mut changed = file.to_vec();
+        changed[at + bit / 8] ^= 1 << (bit % 8);
+        crc32c::crc32c(&changed) ^ crc
+    };
+    let target = effect(0);
+    // Gaussian elimination: rows (effect, which bits of bytes 1..8 make it).
+    let mut rows: Vec<(u32, u64)> = (8..64).map(|bit| (effect(bit), 1u64 << bit)).collect();
+    let mut pivots: Vec<(u32, u64)> = Vec::new();
+    for _ in 0..32 {
+        let Some(i) = rows.iter().position(|(e, _)| *e != 0) else {
+            break;
+        };
+        let (e, m) = rows.swap_remove(i);
+        let top = 31 - e.leading_zeros();
+        for row in rows.iter_mut().chain(pivots.iter_mut()) {
+            if row.0 >> top & 1 == 1 {
+                row.0 ^= e;
+                row.1 ^= m;
+            }
+        }
+        pivots.push((e, m));
+    }
+    let (mut left, mut mask) = (target, 1u64);
+    for (e, m) in &pivots {
+        let top = 31 - e.leading_zeros();
+        if left >> top & 1 == 1 {
+            left ^= e;
+            mask ^= m;
+        }
+    }
+    assert_eq!(left, 0, "solvable");
+    mask.to_le_bytes()
+}
+
+#[test]
+fn a_change_that_keeps_the_crc32c_is_restored_in_full() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    let cfg = config(&store, "a");
+    let db = open_db(&cfg, &path).unwrap();
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+        .unwrap();
+    db.exec("INSERT INTO t VALUES (1, X'5741524D424C4F42')")
+        .unwrap();
+    db.checkpoint();
+    drop(db);
+    assert!(sidecar(&path).exists());
+
+    // Another blob of the same length, and the file's size and CRC32C as
+    // the sidecar and the manifest say.
+    let mut file = std::fs::read(&path).unwrap();
+    let at = file
+        .windows(8)
+        .position(|w| w == b"WARMBLOB")
+        .expect("the blob is in the file");
+    let delta = crc_preserving_delta(&file, at);
+    let crc = crc32c::crc32c(&file);
+    for (i, d) in delta.iter().enumerate() {
+        file[at + i] ^= d;
+    }
+    assert_eq!(crc32c::crc32c(&file), crc);
+    assert_ne!(&file[at..at + 8], b"WARMBLOB");
+    std::fs::write(&path, &file).unwrap();
+
+    let (db, gets) = reopen(&store, &cfg, &path);
+    assert!(gets > 0, "full restore");
+    assert_eq!(
+        db.int("SELECT count(*) FROM t WHERE v = X'5741524D424C4F42'"),
+        1
+    );
+}
+
+#[test]
+fn a_missing_earlier_log_object_is_never_skipped() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    let cfg = config(&store, "a");
+    closed_with_rows(&store, &cfg, &path, 4);
+    let side: warm::Sidecar =
+        serde_json::from_slice(&std::fs::read(sidecar(&path)).unwrap()).unwrap();
+    let manifest = super::manifest(&store);
+    let remote = Remote::new(store.clone(), PREFIX);
+    let mut log: Vec<String> = remote
+        .list(&manifest.epoch.log_dir())
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    log.sort();
+    assert!(log.len() >= 3, "{log:?}");
+    assert!(warm::check(&side, &manifest, &cfg, &remote, &path).is_ok());
+    remote.delete(&log[0]).unwrap();
+
+    let why = warm::check(&side, &manifest, &cfg, &remote, &path).unwrap_err();
+    assert!(why.contains("gap"), "{why}");
+    // Before: the warm open succeeded where the full restore fails.
+    match open_db(&cfg, &path) {
+        Err(crate::s3::S3Error::Corrupt(msg)) => assert!(msg.contains("gap"), "{msg}"),
+        Err(other) => panic!("unexpected error {other}"),
+        Ok(_) => panic!("the full restore must fail"),
+    }
 }

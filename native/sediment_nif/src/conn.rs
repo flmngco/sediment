@@ -37,7 +37,7 @@ impl From<crate::open::Opened> for Handle {
             conn: opened.conn,
             _db: opened.db,
             _io: opened.io,
-            attached: opened.s3.as_ref().map(crate::s3::Attached::new),
+            attached: opened.attached,
             s3: opened.s3,
             replica: opened.replica,
         }

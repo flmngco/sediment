@@ -195,6 +195,7 @@ fn connect(replica: Replica) -> Result<Opened, String> {
         db: generation.db.clone(),
         conn,
         s3: None,
+        attached: None,
         replica: Some(replica),
     })
 }

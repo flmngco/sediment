@@ -54,16 +54,16 @@ fn scalar(term: Term<'_>) -> Result<String, ()> {
 }
 
 /// Restores `path` from S3 (or creates it) and returns the storage to open
-/// it with.
+/// it with, counting this open as one of its connections.
 pub fn prepare(
     term: Term<'_>,
     path: &str,
     encryption: Option<turso_core::EncryptionOpts>,
     io: Arc<dyn IO>,
-) -> Result<Arc<S3DurableStorage>, String> {
+) -> Result<s3::Attached, String> {
     let mut config = decode_config(term)?;
     config.encryption = encryption;
-    s3::prepare_with_io(&config, Path::new(path), io).map_err(|e| describe(&e))
+    s3::prepare_attached(&config, Path::new(path), io).map_err(|e| describe(&e))
 }
 
 fn describe(err: &S3Error) -> String {

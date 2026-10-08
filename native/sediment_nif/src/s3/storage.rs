@@ -95,28 +95,51 @@ pub struct S3Info {
     pub lost: Option<Loss>,
 }
 
-/// One connection counted in `S3DurableStorage::attached`, until dropped
-/// (when the connection starts closing).
+/// Set in `S3DurableStorage::attached` once every connection has started
+/// closing: from then on no open attaches to it.
+const CLOSING: usize = 1 << (usize::BITS - 1);
+
+/// One connection counted in `S3DurableStorage::attached`, from the open's
+/// prepare until dropped (when the connection starts closing).
 pub struct Attached(Arc<S3DurableStorage>);
 
 impl Attached {
-    pub fn new(storage: &Arc<S3DurableStorage>) -> Self {
+    /// Counts one more connection, unless every connection has started
+    /// closing: then the storage is on its way out and `None`.
+    pub fn try_new(storage: &Arc<S3DurableStorage>) -> Option<Self> {
         storage
             .attached
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(storage.clone())
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                (state & CLOSING == 0).then_some(state + 1)
+            })
+            .ok()
+            .map(|_| Self(storage.clone()))
+    }
+
+    pub fn storage(&self) -> &Arc<S3DurableStorage> {
+        &self.0
+    }
+
+    /// Gives the count back without closing the storage, for callers that
+    /// attach no connection to it (tests open turso on it directly).
+    pub fn into_storage(self) -> Arc<S3DurableStorage> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so the Arc is moved out once.
+        let storage = unsafe { std::ptr::read(&this.0) };
+        storage.attached.fetch_sub(1, Ordering::SeqCst);
+        storage
     }
 }
 
 impl Drop for Attached {
     fn drop(&mut self) {
-        if self
-            .0
-            .attached
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-            == 1
-        {
-            self.0.closing.store(true, Ordering::SeqCst);
+        // The last one closes it, unless an open attached in between (then
+        // the count isn't 0 anymore and the exchange fails).
+        if self.0.attached.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ =
+                self.0
+                    .attached
+                    .compare_exchange(0, CLOSING, Ordering::SeqCst, Ordering::SeqCst);
         }
     }
 }
@@ -129,10 +152,13 @@ pub struct S3DurableStorage {
     location: (String, String),
     settings: String,
     place: String,
-    /// Connections that have it open and haven't started closing.
+    /// Connections that have it open (or are opening it) and haven't
+    /// started closing, plus `CLOSING` once all of them have: never handed
+    /// to a new open from then on.
     attached: std::sync::atomic::AtomicUsize,
-    /// Every connection it had has started closing: never handed to a new open.
-    closing: AtomicBool,
+    /// Set when Drop has finished (lease released, sidecar written): until
+    /// then a new open of the file waits (see `super::wait_while_closing`).
+    gone: Arc<AtomicBool>,
     /// The key it was opened with: another open must give the same.
     encryption: Option<turso_core::EncryptionOpts>,
     retain_epochs: usize,
@@ -194,7 +220,7 @@ impl S3DurableStorage {
             settings: cfg.settings(),
             place: cfg.place(),
             attached: std::sync::atomic::AtomicUsize::new(0),
-            closing: AtomicBool::new(false),
+            gone: Arc::default(),
             encryption: cfg.encryption.clone(),
             retain_epochs: cfg.retain_epochs,
             group_commit: cfg.group_commit,
@@ -280,12 +306,17 @@ impl S3DurableStorage {
     /// `(bucket, prefix)` this storage writes to.
     /// Every connection that had it open has started closing.
     pub fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::SeqCst)
+        self.attached.load(Ordering::SeqCst) & CLOSING != 0
+    }
+
+    /// Set once this storage's Drop has finished.
+    pub fn gone(&self) -> Arc<AtomicBool> {
+        self.gone.clone()
     }
 
     /// Connections that have the database open and haven't started closing.
     pub fn attached(&self) -> usize {
-        self.attached.load(std::sync::atomic::Ordering::SeqCst)
+        self.attached.load(Ordering::SeqCst) & !CLOSING
     }
 
     /// See `S3Config::place`.
@@ -1249,6 +1280,14 @@ fn poison(state: &mut WriterState, err: S3Error) -> S3Error {
 
 impl Drop for S3DurableStorage {
     fn drop(&mut self) {
+        // Set when this returns (or unwinds): see `gone`.
+        struct Gone(Arc<AtomicBool>);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _gone = Gone(self.gone.clone());
         // The uploader only holds a weak reference: upload what is left here.
         if let Some(uploads) = self.uploads.clone() {
             let deadline = Instant::now() + self.close_timeout;
@@ -1280,10 +1319,9 @@ impl Drop for S3DurableStorage {
                 let _ = std::fs::remove_file(image);
             }
         }
-        // The lease goes first: whoever waits for this storage to go (an
-        // open, a destroy) finds it free. The sidecar is only a hint (the
-        // next open checks it against S3 and the files), so writing it after
-        // is safe.
+        // An open or a destroy of this database in this VM waits for `gone`,
+        // so it finds the lease free and the sidecar written. The sidecar is
+        // only a hint (the next open checks it against S3 and the files).
         let lapsed = self.lease.lapsed().is_some();
         self.lease.release();
         if !lapsed {

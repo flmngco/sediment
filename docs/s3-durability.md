@@ -238,20 +238,31 @@ Cost: one PUT plus one HEAD per commit.
 turso's Database and its files are closed) leaves `.<name>.s3-warm` when
 everything committed is in S3 (upload queue empty, not poisoned, no recorded
 loss, no snapshot pending, the epoch is the manifest's, the lease never
-lapsed): `{version, database_id, generation, epoch, log_len, log_end_crc,
-db_size, db_crc32c, encrypted, cipher}`. It syncs the database file and the
+lapsed): `{version: 2, database_id, generation, epoch, log_len, log_end_crc,
+db_size, db_crc32c, db_sha256, log_sha256, encrypted, cipher}`. A sidecar of
+another version (version 1 had no SHA-256) is never reused. It syncs the database file and the
 log, verifies the log's chain, writes a temp file, syncs, renames and syncs
-the directory. The lease is released before (a waiting open or destroy finds
-it free): the sidecar is only a hint.
+the directory. The lease is released before; an open or destroy of the
+database in the same VM waits until the whole Drop has finished (the storage
+stays in the registry, marked dropping, until then), so it finds the lease
+free and the sidecar written. Another process opening the files in between
+may meet a sidecar written after its takeover: the sidecar is only a hint,
+and the checks below reject it (its generation is older than the manifest's,
+and the content checks fail too).
 
 An open takes the sidecar (reads and deletes it, syncs the directory) before
 anything touches the local files. After its takeover, it reuses the copy only
 if the manifest it took over has the sidecar's `database_id`, generation and
 epoch; the encryption choice matches; the database file's size and CRC32C are
-the sidecar's and the manifest's snapshot's; the local log's length and chain
-end are the sidecar's; and, for a non-empty log, an object of the epoch's log
-ends exactly where the local log does with the same bytes (S3 holds the local
-log; a copy ahead of S3 is never reused). Then `restore_and_seal` lists the
+the sidecar's and the manifest's snapshot's, and its SHA-256 the sidecar's
+(CRC32C catches damage, not a change made to keep it); the local log's length,
+chain end and SHA-256 are the sidecar's; and, for a non-empty log, the epoch's
+objects below its length cover it from offset 0 without a gap or overlap, and
+the last ends exactly where the local log does with the same bytes (S3 holds
+the local log, as the full restore would find it; a copy ahead of S3 is never
+reused). The manifest records only the snapshot's CRC32C, so a change made
+before the close that keeps it isn't caught; S3-side authentication of
+snapshots is out of scope. Then `restore_and_seal` lists the
 epoch from the local log's end only, verifies the tail as a continuation of
 the chain, seals the epoch at the end it listed and appends the tail to the
 local log; the rest of the open is unchanged. Any failed check or error falls
@@ -410,7 +421,12 @@ running background pass first.
   A storage whose connections have all started closing is never handed to a
   new open (its last close may still be publishing a snapshot, and the file
   at the path may have been replaced meanwhile: inodes are reused at once);
-  the open waits for it to go, at most its close timeout and a second. Closing
+  the open waits for it to go (until its Drop has finished), at most its
+  close timeout and a second. An open counts as a connection from its
+  prepare (`Attached`, handed on to the connection), and the count and the
+  closing mark are one atomic word: the storage is marked closing only when
+  the count drops to 0 with no open attached in between, and an open never
+  attaches once it is marked. A plain open follows the same rule. Closing
   the last connection waits for the snapshot its checkpoint queued, within
   the close timeout. An S3 open's turso open never creates the file (the S3
   prepare restored or created it); one removed in between fails the open. Every

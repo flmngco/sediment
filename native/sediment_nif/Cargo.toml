@@ -28,6 +28,8 @@ tracing = "0.1"
 zstd = "0.13"
 twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_128"] }
 async-trait = "0.1"
+# SHA-256 for the warm-reopen sidecar; already built for object_store (same features).
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 
 [dev-dependencies]
 # Real SQLite, to check that exports (Sediment.export_sqlite) are SQLite files.

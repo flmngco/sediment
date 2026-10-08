@@ -18,7 +18,10 @@
   connection of the stopped pool that was still opening created a new file
   in its place. S3 opens no longer create the file in turso's open (the S3
   restore does), and a database whose connections have all closed is
-  never handed to a new open: the open waits for its close to finish.
+  never handed to a new open: the open waits for its close to finish
+  (including the lease release and what a warm reopen needs). An open
+  counts as a connection from its start, so one that overlaps the last
+  close keeps the database open.
   Closing the last connection now also waits for the snapshot its
   checkpoint queued (within `:close_timeout_ms`), so a reopen right after a
   close restores instead of waiting on that upload.

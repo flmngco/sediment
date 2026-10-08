@@ -127,7 +127,7 @@ fn destroy_refuses_a_database_open_in_this_vm() {
     let dir = TempDir::new();
     let db = open_db(&config(&store, "a"), &dir.db("a.db")).unwrap();
     // As a NIF connection does while it is open.
-    let attached = crate::s3::Attached::new(&db.storage);
+    let attached = crate::s3::Attached::try_new(&db.storage).unwrap();
     for force in [false, true] {
         let started = std::time::Instant::now();
         let err = destroy(&config(&store, "d"), force).unwrap_err();

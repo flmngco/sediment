@@ -26,6 +26,7 @@ pub(crate) mod tests;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use turso_core::mvcc::persistent_storage::Storage;
@@ -58,32 +59,32 @@ pub fn prepare(cfg: &S3Config, local_path: &Path) -> Result<Arc<S3DurableStorage
 }
 
 /// Like [`prepare`], using `io` for the local logical-log file.
+pub fn prepare_with_io(
+    cfg: &S3Config,
+    local_path: &Path,
+    io: Arc<dyn IO>,
+) -> Result<Arc<S3DurableStorage>> {
+    prepare_attached(cfg, local_path, io).map(Attached::into_storage)
+}
+
+/// Like [`prepare_with_io`], counting the open as one of the storage's
+/// connections from here on (a connection keeps the guard until it starts
+/// closing; an open that fails drops it).
 ///
 /// Within one process, opening the same path again while its storage is
 /// alive returns that storage (turso shares one `Database` per path too), so
 /// pooled connections don't restore over each other. Concurrent calls for
 /// one file must be serialized by the caller (the NIF's per-file open lock):
 /// the restore runs without any process-wide lock.
-pub fn prepare_with_io(
-    cfg: &S3Config,
-    local_path: &Path,
-    io: Arc<dyn IO>,
-) -> Result<Arc<S3DurableStorage>> {
+pub fn prepare_attached(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Attached> {
     prepare_at(cfg, local_path, io).map_err(|err| err.at(local_path))
 }
 
-fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Arc<S3DurableStorage>> {
+fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Attached> {
     refuse_symlink(local_path)?;
     cfg.validate()?;
-    wait_while_closing(local_path)?;
-    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let key = canonical_key(local_path)?;
-    live.retain(|_, storage| storage.strong_count() > 0);
-    if let Some(storage) = live
-        .get(&key)
-        .and_then(Weak::upgrade)
-        .filter(|storage| !storage.is_closing())
-    {
+    if let Some(attached) = attach_live(local_path)? {
+        let storage = attached.storage();
         // Before the settings: they name the cipher only, and this open
         // would share the storage's decrypted state.
         check_same_encryption(storage.encryption(), cfg)?;
@@ -102,41 +103,97 @@ fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Arc<
                 local_path.display()
             )));
         }
-        return Ok(storage);
+        return Ok(attached);
     }
-    // Not held across the restore (network I/O, possibly minutes): opens of
-    // other files look here too. The caller serializes opens of one file
-    // (the NIF's per-file open lock), so no other restore of it runs now.
-    drop(live);
+    // Not holding LIVE across the restore (network I/O, possibly minutes):
+    // opens of other files look there too. The caller serializes opens of
+    // one file (the NIF's per-file open lock), so no other restore of it
+    // runs now.
     let storage = prepare_fresh(cfg, local_path, io)?;
+    let attached = Attached::try_new(&storage).expect("a new storage isn't closing");
     // The restore put a new file in place: register its identity.
     LIVE.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(canonical_key(local_path)?, Arc::downgrade(&storage));
-    Ok(storage)
+        .insert(canonical_key(local_path)?, Live::of(&storage));
+    Ok(attached)
 }
 
-static LIVE: Mutex<BTreeMap<PathBuf, Weak<S3DurableStorage>>> = Mutex::new(BTreeMap::new());
+/// A storage in this process, from its open until its Drop has finished.
+struct Live {
+    storage: Weak<S3DurableStorage>,
+    gone: Arc<AtomicBool>,
+    place: String,
+    close_timeout: std::time::Duration,
+}
 
-/// A storage whose connections have all closed may still be finishing (a
-/// snapshot its last close queued). It is never handed to a new open: its
-/// file may have been replaced since (inodes are reused at once, and the
-/// registry keys by inode), and it would make the open wait for that work
-/// anyway. Wait for it to go, at most its close timeout and a second.
+impl Live {
+    fn of(storage: &Arc<S3DurableStorage>) -> Self {
+        Live {
+            storage: Arc::downgrade(storage),
+            gone: storage.gone(),
+            place: storage.place().to_string(),
+            close_timeout: storage.close_timeout(),
+        }
+    }
+
+    /// Every connection has started closing, or its Drop still runs (it
+    /// uploads what is left, releases the lease and leaves the sidecar).
+    fn closing(&self) -> bool {
+        match self.storage.upgrade() {
+            Some(storage) => storage.is_closing(),
+            None => !self.gone.load(Ordering::SeqCst),
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.storage.strong_count() == 0 && self.gone.load(Ordering::SeqCst)
+    }
+}
+
+static LIVE: Mutex<BTreeMap<PathBuf, Live>> = Mutex::new(BTreeMap::new());
+
+/// Attaches an open to the storage of `local_path` in this process, if one
+/// is open (`None`: none is, or the last one has finished closing). A
+/// storage that is closing is never handed to a new open (its file may have
+/// been replaced since: inodes are reused at once, and the registry keys by
+/// inode), so this waits for it to finish first.
+pub fn attach_live(local_path: &Path) -> Result<Option<Attached>> {
+    loop {
+        wait_while_closing(local_path)?;
+        let key = canonical_key(local_path)?;
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        live.retain(|_, entry| !entry.finished());
+        let Some(storage) = live.get(&key).and_then(|entry| entry.storage.upgrade()) else {
+            return Ok(None);
+        };
+        // Fails only if its last connection closed since the wait.
+        if let Some(attached) = Attached::try_new(&storage) {
+            return Ok(Some(attached));
+        }
+    }
+}
+
+/// Waits for a closing storage of `local_path` to finish (see
+/// [`Live::closing`]), at most its close timeout and a second.
 fn wait_while_closing(local_path: &Path) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
-        let closing = live_storage(local_path).filter(|storage| storage.is_closing());
-        let Some(storage) = closing else {
-            return Ok(());
+        let close_timeout = {
+            let Ok(key) = canonical_key(local_path) else {
+                return Ok(());
+            };
+            let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            match live.get(&key).filter(|entry| entry.closing()) {
+                Some(entry) => entry.close_timeout,
+                None => return Ok(()),
+            }
         };
-        if start.elapsed() > storage.close_timeout() + std::time::Duration::from_secs(1) {
+        if start.elapsed() > close_timeout + std::time::Duration::from_secs(1) {
             return Err(S3Error::Timeout(format!(
                 "s3: {} is still closing from an earlier open; try again",
                 local_path.display()
             )));
         }
-        drop(storage);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
@@ -149,7 +206,7 @@ pub fn flush_all(timeout: std::time::Duration) -> Vec<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter_map(|(key, weak)| weak.upgrade().map(|s| (key.clone(), s)))
+        .filter_map(|(key, entry)| entry.storage.upgrade().map(|s| (key.clone(), s)))
         .collect();
     let deadline = std::time::Instant::now() + timeout;
     storages
@@ -191,18 +248,24 @@ pub fn canonical_key(path: &Path) -> std::io::Result<PathBuf> {
 pub fn live_storage(local_path: &Path) -> Option<Arc<S3DurableStorage>> {
     let key = canonical_key(local_path).ok()?;
     let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    live.get(&key).and_then(Weak::upgrade)
+    live.get(&key).and_then(|entry| entry.storage.upgrade())
 }
 
 /// The database at `place` (see `S3Config::place`) in this process: whether
-/// a connection has it open (not only closing), and how long its close may
-/// take. `None`: not open here.
+/// a connection has it open (not only closing, or still finishing its
+/// Drop), and how long its close may take. `None`: not open here.
 fn open_at(place: &str) -> Option<(bool, std::time::Duration)> {
     let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     live.values()
-        .filter_map(Weak::upgrade)
-        .find(|storage| storage.place() == place)
-        .map(|storage| (storage.attached() > 0, storage.close_timeout()))
+        .filter(|entry| entry.place == place && !entry.finished())
+        .map(|entry| {
+            let open = entry
+                .storage
+                .upgrade()
+                .is_some_and(|storage| storage.attached() > 0);
+            (open, entry.close_timeout)
+        })
+        .max_by_key(|(open, _)| *open)
 }
 
 fn prepare_fresh(
