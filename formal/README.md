@@ -97,10 +97,10 @@ delays commits. Checked: `AsyncSole` 77,213 states, `AsyncSoleDelays` 159,549, `
 | `NegGCAnyGeneration` | as `DestroyManifestLoss` | `GCAnyGeneration` (GC collects epochs of newer lease generations too) | `RestoreOK` violated |
 | `NegTrustRefused` | as `Destroy` | `TrustRefused` (a tombstone PUT reported refused is taken as refused) | `RefusedMeansIntact` violated |
 | `NegAdoptUnchecked` | as `ReadDestroy` | `AdoptUnchecked` (a replica connection adopts the shared generation without a manifest read) | `ReadsAfterDestroy` violated |
-| `WarmSole` | 1 (late writes, 1 fault, 1 kill), 3 opens, clean closes | none | pass (31,040 states) |
-| `WarmAsync` | as `WarmSole`, async | none | pass (42,432 states) |
-| `WarmTakeover` | 2, 2 opens each, clean closes | none | pass (4,633,272 states) |
-| `WarmDestroy` | 2, 1 destroy each, clean closes | none | pass (3,999,884 states) |
+| `WarmSole` | 1 (late writes, 1 fault, 1 kill), 3 opens, clean closes | none | pass (68,085 states) |
+| `WarmAsync` | as `WarmSole`, async | none | pass (85,985 states) |
+| `WarmTakeover` | 2, 2 opens each, clean closes | none | pass (11,834,638 states) |
+| `WarmDestroy` | 2, 1 destroy each, clean closes | none | pass (28,384,737 states) |
 | `WarmAheadGuarded` | as `WarmAsync` | `CloseWithPending` (a sidecar with async commits not uploaded) | pass: the position check alone protects |
 | `NegWarmAhead` | as `WarmAsync` | `CloseWithPending`, `NoPositionCheck` | `WarmEqualsFull` violated |
 | `NegWarmStale` | as `WarmTakeover` | `NoEpochCheck`, `NoFileCheck` | `WarmEqualsFull` violated |
