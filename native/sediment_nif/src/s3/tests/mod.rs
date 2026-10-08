@@ -553,6 +553,8 @@ fn snapshot_failure_blocks_commits_until_it_succeeds() {
     let m = manifest(&store);
     assert_eq!(m.epoch.seq, old.epoch.seq + 1);
     assert!(!db.storage.info().snapshot_pending);
+    // GC runs on the background thread after the publication.
+    db.storage.wait_background(Duration::from_secs(10));
     assert_eq!(segments(&store), vec![m.epoch.segment_key(0)]);
     db.crash();
 
