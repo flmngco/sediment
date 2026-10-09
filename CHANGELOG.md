@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* Stopping a pool (`Supervisor.stop/3` on an Ecto repo, `GenServer.stop/1`
+  on a `Sediment.start_link/1` pool) with `db_connection` 2.10.1 returned
+  before its connections had closed: the S3 lease was released and the
+  warm-reopen file written a moment later, so a stop followed by
+  `System.halt/1` reopened cold. sediment now requires `db_connection`
+  2.10.2 or later, whose pool waits for its connections to close.
+
 ## 0.1.0-beta.5 (2026-10-08)
 
 ### S3 durability

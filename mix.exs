@@ -39,7 +39,7 @@ defmodule Sediment.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:db_connection, "~> 2.1"},
+      {:db_connection, "~> 2.10 and >= 2.10.2"},
       {:telemetry, "~> 0.4 or ~> 1.0"},
       {:rustler_precompiled, "~> 0.10"},
       {:rustler, "~> 0.38", runtime: false},

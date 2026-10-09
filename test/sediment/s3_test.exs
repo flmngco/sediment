@@ -2184,4 +2184,26 @@ defmodule Sediment.S3Test do
       assert_first_intact(dir)
     end
   end
+
+  # DBConnection 2.10.1's pool returned from a stop before its connections
+  # had closed (they closed moments later), so a stop followed by
+  # System.halt/1 lost the close's sidecar and anything checking right after
+  # saw a close in flight.
+  test "a pool's stop returns once its connections have closed", %{s3: s3, dir: dir} do
+    for {durability, pool_size} <- [{:sync, 1}, {:sync, 2}, {:async, 2}] do
+      name = "#{durability}#{pool_size}"
+      path = Path.join(dir, "#{name}.db")
+      s3 = Keyword.merge(s3, prefix: s3[:prefix] <> "/" <> name, durability: durability)
+      {:ok, pool} = Sediment.start_link(database: path, s3: s3, pool_size: pool_size)
+      {:ok, _} = Sediment.query(pool, "CREATE TABLE t (x)", [])
+      for i <- 1..20, do: {:ok, _} = Sediment.query(pool, "INSERT INTO t VALUES (?)", [i])
+
+      :ok = GenServer.stop(pool)
+      assert File.exists?(Path.join(dir, ".#{name}.db.s3-warm")), name
+      # The lease is released too: another owner opens at once.
+      {:ok, db} = Engine.open(Path.join(dir, "#{name}-b.db"), s3: Keyword.put(s3, :owner, "b"))
+      assert count(db, "t") == 20
+      :ok = Engine.close(db)
+    end
+  end
 end
