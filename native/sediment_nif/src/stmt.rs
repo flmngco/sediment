@@ -908,9 +908,24 @@ mod tests {
     use std::time::Duration;
     use turso_core::{Connection, Database, OpenOptions, PlatformIO, SqliteDialect, Value};
 
+    /// Clears this thread's test hooks when dropped. A hook left set is
+    /// dropped with the thread's locals, and what it holds (a connection, a
+    /// database) would then close while other thread locals are already
+    /// gone: a panic there aborts the whole test binary.
+    struct ClearHooks;
+
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            let hook = ON_BUSY_SLEEP.with(|hook| hook.borrow_mut().take());
+            let before = BEFORE_STEP.with(|hook| hook.borrow_mut().take());
+            drop((hook, before));
+        }
+    }
+
     /// An MVCC database where `b` holds the write lock (an IMMEDIATE
-    /// transaction) until `a` waits out a busy backoff for the first time.
-    fn locked_by_b(dir: &TempDir, schema: &[&str]) -> (Arc<Database>, Arc<Connection>) {
+    /// transaction) until `a` waits out a busy backoff for the first time
+    /// (`b` stays in the hook if `a` never waits: the guard drops it).
+    fn locked_by_b(dir: &TempDir, schema: &[&str]) -> (Arc<Database>, Arc<Connection>, ClearHooks) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = dir.db("j72.db");
         let db = Database::open(
@@ -939,7 +954,7 @@ mod tests {
                 }
             }))
         });
-        (db, a)
+        (db, a, ClearHooks)
     }
 
     fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
@@ -961,6 +976,7 @@ mod tests {
     ) -> Option<Result<Step, Step>> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let _hooks = ClearHooks;
             BEFORE_STEP.with(|before| *before.borrow_mut() = Some(Box::new(hook)));
             let mut stmt = conn.prepare(ENDLESS).unwrap();
             let _active = res.begin(admission);
@@ -1046,7 +1062,7 @@ mod tests {
     #[test]
     fn a_busy_autoincrement_insert_never_commits_part_of_its_transaction() {
         let dir = TempDir::new();
-        let (_db, a) = locked_by_b(&dir, &[]);
+        let (_db, a, _hooks) = locked_by_b(&dir, &[]);
         a.execute("BEGIN CONCURRENT").unwrap();
         a.execute("INSERT INTO p VALUES ('a')").unwrap();
         let res = ConnRes::detached();
@@ -1066,7 +1082,7 @@ mod tests {
     #[test]
     fn a_busy_autoincrement_insert_in_a_trigger_never_commits_part_of_its_transaction() {
         let dir = TempDir::new();
-        let (_db, a) = locked_by_b(
+        let (_db, a, _hooks) = locked_by_b(
             &dir,
             &[
                 "CREATE TABLE q(v INTEGER)",
@@ -1244,7 +1260,7 @@ mod tests {
     #[test]
     fn a_busy_autoincrement_insert_waits_in_a_deferred_transaction() {
         let dir = TempDir::new();
-        let (_db, a) = locked_by_b(&dir, &[]);
+        let (_db, a, _hooks) = locked_by_b(&dir, &[]);
         a.execute("BEGIN").unwrap();
         a.execute("SELECT 1").unwrap();
         let res = ConnRes::detached();
@@ -1265,7 +1281,7 @@ mod tests {
     #[test]
     fn a_busy_autoincrement_insert_waits_outside_a_transaction() {
         let dir = TempDir::new();
-        let (_db, a) = locked_by_b(&dir, &[]);
+        let (_db, a, _hooks) = locked_by_b(&dir, &[]);
         let res = ConnRes::detached();
         let mut stmt = a
             .prepare("INSERT INTO s(v) VALUES (1) RETURNING id")
