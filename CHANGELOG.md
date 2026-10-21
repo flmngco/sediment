@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-beta.6 (2026-10-21)
+
+### Engine
+
+* turso_core 0.8.3 (was 0.8.1). It brings upstream's MVCC fixes from 0.8.2
+  and 0.8.3, among them: the logical log's header upgrade is published only
+  after its write succeeds, late commits survive a TRUNCATE checkpoint,
+  B-tree deletion and conflict checks are atomic, and a retried `nextval`
+  inside `BEGIN CONCURRENT` no longer turns the COMMIT into a no-op. Every
+  workaround stays in place: the engine bugs they guard against still
+  reproduce on 0.8.3.
 
 ### Fixed
 
