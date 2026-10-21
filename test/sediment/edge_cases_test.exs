@@ -111,7 +111,7 @@ defmodule Sediment.EdgeCasesTest do
     assert :done = Engine.step(conn, stmt)
   end
 
-  # turso_core 0.8.1; when this starts passing without the unary plus, drop
+  # turso_core 0.8.3; when this starts passing without the unary plus, drop
   # the README caveat (and ecto_sediment's).
   test "FULL OUTER JOIN on an indexed column needs a unary plus", %{conn: conn} do
     :ok =
@@ -134,7 +134,7 @@ defmodule Sediment.EdgeCasesTest do
     assert {:ok, [[nil, 3], ["x", 1], ["z", nil]]} = Engine.fetch_all(conn, stmt)
   end
 
-  # turso_core 0.8.1; when the first drop starts working, drop the README
+  # turso_core 0.8.3; when the first drop starts working, drop the README
   # caveat (and ecto_sediment's).
   test "DROP COLUMN of a column with its own REFERENCES fails; a rebuild works", %{conn: conn} do
     :ok =
@@ -208,7 +208,7 @@ defmodule Sediment.EdgeCasesTest do
     assert [[100]] = rows(conn, "select x from c100")
   end
 
-  # turso_core 0.8.1 accepts the pragma but fires a trigger once, where
+  # turso_core 0.8.3 accepts the pragma but fires a trigger once, where
   # SQLite would recurse; pinned so an upgrade that changes it is noticed.
   test "recursive_triggers doesn't recurse", %{conn: conn} do
     :ok =

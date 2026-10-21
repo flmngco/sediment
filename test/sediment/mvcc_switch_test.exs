@@ -1,5 +1,5 @@
 defmodule Sediment.MvccSwitchTest do
-  # turso_core 0.8.1 reuses AUTOINCREMENT ids after an existing database
+  # turso_core 0.8.3 reuses AUTOINCREMENT ids after an existing database
   # switches to MVCC, silently overwriting rows: the switch is refused.
   use ExUnit.Case, async: true
 

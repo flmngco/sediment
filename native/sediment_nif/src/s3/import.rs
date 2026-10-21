@@ -4,7 +4,7 @@
 //! written to.
 //!
 //! A logical copy rather than switching a copy of the file to MVCC: in
-//! turso_core 0.8.1 that switch loses AUTOINCREMENT state (the next insert
+//! turso_core 0.8.3 that switch loses AUTOINCREMENT state (the next insert
 //! reuses id 1 and overwrites the row; files written by SQLite can't insert
 //! at all). Rows written in MVCC keep the sequences right.
 
@@ -66,7 +66,7 @@ pub(crate) const MAX_SNAPSHOT_BYTES: u64 = super::remote::MAX_OBJECT;
 
 /// Rows per transaction of the copy.
 const BATCH_ROWS: u64 = 10_000;
-/// Rows per transaction for AUTOINCREMENT tables: in turso_core 0.8.1 MVCC
+/// Rows per transaction for AUTOINCREMENT tables: in turso_core 0.8.3 MVCC
 /// each such insert walks the transaction's own sqlite_sequence updates, so
 /// a transaction costs O(rows^2) (measured by `tests::import::import_throughput`).
 const AUTOINCREMENT_BATCH_ROWS: u64 = 500;

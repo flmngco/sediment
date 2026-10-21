@@ -10,7 +10,7 @@ Sediment is an Elixir driver for [Turso](https://github.com/tursodatabase/turso)
 the SQLite-compatible database engine written in Rust.
 
 `sediment` is to Turso what [`exqlite`][exqlite] is to SQLite: a NIF
-(built with [Rustler][rustler] over `turso_core` 0.8.1) plus a
+(built with [Rustler][rustler] over `turso_core` 0.8.3) plus a
 [`DBConnection`][db_connection] implementation. The public API mirrors
 exqlite's module by module, so code written against exqlite ports over by
 renaming modules:
@@ -281,7 +281,7 @@ instead of faking it.
   with 256 KiB. Tables without `AUTOINCREMENT` go the other way, about 2x
   faster with 4 MiB, at the price of longer checkpoint pauses; see
   `bench/RESULTS.md`.
-* **Hot rows in long MVCC transactions.** In MVCC mode, turso_core 0.8.1
+* **Hot rows in long MVCC transactions.** In MVCC mode, turso_core 0.8.3
   keeps one row version per update, even for updates by the same
   transaction, and every access walks that chain. So a transaction that
   updates one row many times gets slower with each update. An
@@ -299,7 +299,7 @@ instead of faking it.
 * **Journal modes.** Turso stores data in WAL mode or MVCC mode.
   `journal_mode: :delete | :truncate | :persist | :memory | :off` are accepted
   and have no effect. `:mvcc` is Turso only.
-* **Switching an existing database to MVCC.** turso_core 0.8.1 doesn't carry
+* **Switching an existing database to MVCC.** turso_core 0.8.3 doesn't carry
   `AUTOINCREMENT` sequences over when an existing WAL database switches to
   MVCC: the next insert reuses id 1 and silently overwrites that row. So
   opening such a database with `journal_mode: :mvcc`, or running
@@ -342,13 +342,13 @@ instead of faking it.
   different (`"no such table: t"`, `"database is locked"`), but syntax errors
   read differently: `"unexpected token: a"` instead of
   `near "a": syntax error`.
-* **Constant-folded parameters.** turso_core 0.8.1 drops parameters that
+* **Constant-folded parameters.** turso_core 0.8.3 drops parameters that
   constant folding removed at the end of a statement (`WHERE 0 AND x = ?`)
   from the parameter count. `bind/2` accepts arguments for them when the SQL
   text has exactly that many placeholders, so queries such as Ecto's
   `where: p.id in ^[]` work. Named parameters are not covered by this.
 * **Prepared `PRAGMA` statements are not re-prepared after schema changes**
-  in turso_core 0.8.1: `PRAGMA table_info(t)` prepared before `DROP TABLE t`
+  in turso_core 0.8.3: `PRAGMA table_info(t)` prepared before `DROP TABLE t`
   keeps returning the old columns. Prepare such statements again after DDL.
   `Sediment.Connection`'s statement cache never caches `PRAGMA`s.
 * **Schema changes under a write transaction (MVCC).** Like SQLite, turso
@@ -357,11 +357,11 @@ instead of faking it.
   another connection's DDL can fail with `"Database schema changed"`.
   Roll back and retry the transaction, or run DDL, such as migrations,
   while nothing else writes.
-* **`FULL OUTER JOIN` on an indexed column** fails in turso_core 0.8.1 with
+* **`FULL OUTER JOIN` on an indexed column** fails in turso_core 0.8.3 with
   `FULL OUTER JOIN requires an equality condition in the ON clause` when the
   right-hand table's join column has an index (a primary key, say). A unary
   plus avoids the index: `ON +p.id = c.parent_id`.
-* **Dropping a column that has its own `REFERENCES`.** turso_core 0.8.1
+* **Dropping a column that has its own `REFERENCES`.** turso_core 0.8.3
   refuses `ALTER TABLE child DROP COLUMN parent_id` when `parent_id` was
   declared with a column-level `REFERENCES` (`unknown column "parent_id" in
   foreign key definition`); SQLite drops the constraint with the column.
@@ -379,7 +379,7 @@ instead of faking it.
   guide for symlinks, hard links, and `experimental: [:attach]`, which
   can't be combined with MVCC.
 * **Recursive triggers.** `PRAGMA recursive_triggers = on` is accepted, but
-  turso_core 0.8.1 fires a trigger once instead of recursing.
+  turso_core 0.8.3 fires a trigger once instead of recursing.
 * **Infinite floats** (`SELECT 1e999`) are returned as `:inf` and `:"-inf"`,
   like Postgrex; exqlite raises an `ArgumentError` for them.
 * **`file:` URIs** are translated to a path and mode (`mode=ro`, `rw`, `rwc`,

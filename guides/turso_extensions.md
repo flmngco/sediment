@@ -20,7 +20,7 @@ concurrent transactions. Conflicts are detected per row at write time.
 
 Choose MVCC when you create the database. An existing WAL database with
 `AUTOINCREMENT` tables refuses the switch with
-`"refusing to switch to MVCC: ..."` and is left unchanged: turso_core 0.8.1
+`"refusing to switch to MVCC: ..."` and is left unchanged: turso_core 0.8.3
 would reuse their ids after the switch, silently overwriting rows. Tables
 without `AUTOINCREMENT` switch fine. To move such a database to MVCC, copy
 its data into a new database opened with `journal_mode: :mvcc`.
@@ -38,14 +38,14 @@ An `INSERT` into an `AUTOINCREMENT` table inside `BEGIN CONCURRENT` that
 finds another connection holding the write lock (an exclusive transaction or
 a checkpoint) fails with `"Database is busy"` right away instead of waiting
 for `:busy_timeout`, and the transaction can then only be rolled back. This
-works around a turso_core 0.8.1 bug that would otherwise commit part of the
+works around a turso_core 0.8.3 bug that would otherwise commit part of the
 transaction ([the upstream report](../docs/upstream/turso-sequence-inner-tx-busy.md)). Retry the whole
 transaction, as after a conflict, or avoid `AUTOINCREMENT` in MVCC tables
 (see "Hot rows" in the README): concurrent `AUTOINCREMENT` inserts also
 conflict with each other on the table's sequence, so such transactions fail
 with `"Write-write conflict"` far more often than their rows would suggest.
 
-turso_core 0.8.1 can panic when a transaction that starts with DDL (it
+turso_core 0.8.3 can panic when a transaction that starts with DDL (it
 begins as `BEGIN IMMEDIATE`) runs at the same time as `BEGIN CONCURRENT`
 transactions on other connections that write the same tables. The driver
 catches the panic: the statement fails with

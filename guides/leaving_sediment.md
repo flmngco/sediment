@@ -57,7 +57,7 @@ config :my_app, MyApp.Repo,
    hard links is refused, since its WAL may be next to another name: export
    by the path its writers use.
 4. Opens that copy (with the key), checkpoints it and, if it is in MVCC
-   mode, switches it to WAL. In turso_core 0.8.1, `VACUUM INTO` from an MVCC
+   mode, switches it to WAL. In turso_core 0.8.3, `VACUUM INTO` from an MVCC
    database writes an MVCC header SQLite can't read, resets
    `sqlite_sequence` to the largest id (SQLite would hand out the ids of
    deleted rows again), and copies every row in one transaction, which is

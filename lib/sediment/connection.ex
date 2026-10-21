@@ -416,7 +416,7 @@ defmodule Sediment.Connection do
 
   defp used_now, do: System.unique_integer([:monotonic])
 
-  # turso_core 0.8.1 computes PRAGMA results such as table_info when the
+  # turso_core 0.8.3 computes PRAGMA results such as table_info when the
   # statement is prepared and doesn't re-prepare it after schema changes, so
   # a reused PRAGMA statement would return stale results.
   defp cacheable?(sql), do: first_keyword(sql) != "PRAGMA"

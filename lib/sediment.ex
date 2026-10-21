@@ -194,7 +194,7 @@ defmodule Sediment do
 
   The source is never written to: it is copied (or restored from S3) into
   a private (0700) staging directory next to `dest`, switched from MVCC to
-  WAL there (turso_core 0.8.1's `VACUUM INTO` from MVCC writes a header
+  WAL there (turso_core 0.8.3's `VACUUM INTO` from MVCC writes a header
   SQLite can't read, resets `sqlite_sequence` and is quadratic for
   AUTOINCREMENT tables), and exported with `VACUUM INTO`; Turso FTS indexes
   are dropped only with `drop_fts: true`. Before the file appears at `dest`

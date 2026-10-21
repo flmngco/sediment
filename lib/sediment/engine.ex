@@ -38,7 +38,7 @@ defmodule Sediment.Engine do
     * `:journal_mode` - journal mode applied right after opening, for
       example `:wal` or `:mvcc`. MVCC is required for `BEGIN CONCURRENT`
       and S3 durability. Switching an existing database that has
-      `AUTOINCREMENT` tables to `:mvcc` is refused, because turso_core 0.8.1
+      `AUTOINCREMENT` tables to `:mvcc` is refused, because turso_core 0.8.3
       would reuse their ids and overwrite rows (see the README).
 
     * `:encryption` - `[cipher: "aegis256", key: "<hex key>"]` opens an

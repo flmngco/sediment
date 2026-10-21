@@ -2,7 +2,7 @@
 //! one whose MVCC log another database file would share, or one opened with
 //! `experimental: [:attach]` (see `log_guard`).
 //!
-//! turso_core 0.8.1 doesn't carry an AUTOINCREMENT table's sequence over when
+//! turso_core 0.8.3 doesn't carry an AUTOINCREMENT table's sequence over when
 //! an existing database switches to MVCC: the next insert reuses id 1 and
 //! silently replaces that row. Databases created in MVCC mode (every S3
 //! database) are unaffected, and so are plain `INTEGER PRIMARY KEY` tables.
@@ -89,7 +89,7 @@ pub fn check_switch(res: &ConnRes, conn: &Arc<Connection>) -> Result<(), Step> {
     }
     Err(Step::Error(format!(
         "refusing to switch to MVCC: the database has AUTOINCREMENT tables ({}), and \
-         turso_core 0.8.1 would reuse their ids after the switch, silently overwriting \
+         turso_core 0.8.3 would reuse their ids after the switch, silently overwriting \
          existing rows. The database is unchanged. Keep its current journal mode, or copy \
          the data into a new database opened with journal_mode mvcc from the start",
         tables.join(", ")

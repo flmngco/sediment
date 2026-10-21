@@ -1,6 +1,6 @@
 //! Exporting a database to a plain SQLite file (`Sediment.export_sqlite/3`).
 //!
-//! `VACUUM INTO` alone isn't enough in turso_core 0.8.1: from an MVCC database it
+//! `VACUUM INTO` alone isn't enough in turso_core 0.8.3: from an MVCC database it
 //! writes an MVCC header and resets `sqlite_sequence` to max(id), and copies
 //! every row in one transaction, which is quadratic for AUTOINCREMENT tables;
 //! a Turso FTS index makes the whole file unreadable by SQLite. So the private

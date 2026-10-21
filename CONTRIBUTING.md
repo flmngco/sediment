@@ -105,7 +105,7 @@ It needs a JDK and `tla2tools.jar` plus `CommunityModules-deps.jar` in
 - Keep a pull request to one change, with tests that fail without it.
 - `mix ci` must pass. For S3 changes run `--only s3` too, and the Rust tests.
 - Add user-visible changes to `CHANGELOG.md` and the guides.
-- Workarounds for turso_core bugs name the engine version (0.8.1) and say
+- Workarounds for turso_core bugs name the engine version (0.8.3) and say
   what they guard, so they can be removed when upstream fixes them.
 - The S3 object layout and the manifest and lease formats are persistent:
   changes to them need a migration story.

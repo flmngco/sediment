@@ -317,7 +317,7 @@ fn commits_inner_tx(stmt: &Statement) -> bool {
 }
 
 /// A busy statement is retried at the instruction that got busy. turso_core
-/// 0.8.1 gets that wrong for the commit of an AUTOINCREMENT inner
+/// 0.8.3 gets that wrong for the commit of an AUTOINCREMENT inner
 /// transaction: the failed commit already switched the connection back to
 /// the surrounding transaction, and the retry commits that one instead, with
 /// whatever it wrote so far (docs/upstream/turso-sequence-inner-tx-busy.md).
@@ -785,7 +785,7 @@ fn bind_parameter_count(env: Env<'_>, stmt: ResourceArc<StmtRes>) -> Term<'_> {
 /// Number of parameters written in the SQL text, counted like SQLite does:
 /// `?` takes the next index, `?NNN` its own, and each distinct name one.
 ///
-/// turso_core 0.8.1 drops trailing parameters that constant folding
+/// turso_core 0.8.3 drops trailing parameters that constant folding
 /// eliminated (`WHERE 0 AND x = ?`) from `parameters_count`, so this is the
 /// count callers actually have to supply.
 fn declared_parameter_count(sql: &str) -> usize {
