@@ -38,8 +38,11 @@
   commit, and a crash before the publication leaves the old key current.
   Only `{:ok, _}` is an outcome: after any error, run the rekey again, and
   keep both keys in the rings until it succeeds. It keeps the epochs it ended (pinned, whatever
-  `retain_epochs` is) and retires the old key: a rekey back to it needs
-  `allow_reuse: true` and its epochs released first.
+  `retain_epochs` is) and retires the old key: a rekey back to it, by id or
+  by key under any id, needs `allow_reuse: true` and its epochs released
+  first. Like `destroy/2`, it refuses while the database is open in this
+  VM; it also refuses while its local file is (without `:s3`, or with
+  another prefix).
 * `Sediment.S3.release_key/4` drops the retained epochs under a key and
   deletes their objects; it refuses the current key.
   `Sediment.S3.key_census/1` reads which keys a database still depends on.
@@ -59,6 +62,16 @@
 
 ### Fixed
 
+* A pool (`Sediment.start_link/1`, `Sediment.child_spec/1`) and a
+  connection's state keep the `:encryption` option hidden: crash and
+  termination reports, `:sys.get_status/1` and `inspect` show
+  `#Sediment.S3.Keys.Hidden<redacted>`, never a key.
+* `Sediment.S3.restore/3`, `import/3`, `refresh/2`,
+  `Sediment.export_sqlite/3` and `Sediment.Engine.deserialize/3` ran turso on the dirty
+  scheduler's small stack: a schema with a deep expression (a `CHECK` of
+  90 chained additions) could overflow it and kill the VM. They now run
+  on turso's own stack, like opens and statements, and a turso panic is
+  returned as an error. `rekey/3` and `release_key/4` do the same.
 * `Sediment.Engine.open(path, mode: :readonly)` of an MVCC database with
   rows in an `AUTOINCREMENT` table (a restored S3 copy, say) failed with
   "attempt to write a readonly database": turso_core 0.8.3 rewrites each

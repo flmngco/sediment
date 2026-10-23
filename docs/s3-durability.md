@@ -392,7 +392,9 @@ is reused only under the same key.
 followed by a clean close:
 
 1. Like a destroy, it refuses when the database is open in this VM, and any
-   unexpired lease, this owner's too, unless `force`.
+   unexpired lease, this owner's too, unless `force`. It also refuses when
+   its local file is open in this VM, without S3 or with another prefix
+   (it restores over the file).
 2. After its takeover, restore and checkpoint under the old key (log folded,
    WAL empty), it re-encrypts the file page by page: each page is decrypted
    with the old key's context and encrypted with the new one into a file
@@ -418,9 +420,13 @@ the PUT had landed).
 The advance pins the epoch it ends and every retained epoch
 (`history[i].pinned`), and adds the old key to `retired_keys` (id,
 fingerprint, time). A rekey to a retired key (its id or its fingerprint) is
-refused unless `allow_reuse`, and then only once no history record under it
-remains, so every key has at most one pinned run, and a key id is current
-for one contiguous run. A reused key leaves `retired_keys`.
+refused unless `allow_reuse`, and then only once no history record under
+the target's id or fingerprint, or under a retired key it matches, remains,
+so every key has at most one pinned run, and a key id is current for one
+contiguous run. A rekey to the current key under another id is refused. A
+reused key leaves `retired_keys` only as that exact pair: a retired key
+matched by id alone or by fingerprint alone stays retired (its material
+needs `allow_reuse` again under any id).
 
 ### Lost answers on the epoch advance
 

@@ -280,8 +280,10 @@ impl Manifest {
                 record.pinned = true;
             }
             // A reused key (`allow_reuse`) is current again, no more retired.
+            // Only that key, by id and fingerprint: another key retired under
+            // its id, or its material retired under another id, stays retired.
             if let Some(new) = &key {
-                retired_keys.retain(|r| r.id != new.id && r.fingerprint != new.fingerprint);
+                retired_keys.retain(|r| !(r.id == new.id && r.fingerprint == new.fingerprint));
             }
             if let Some(old) = &self.key {
                 retired_keys.retain(|r| !(r.id == old.id && r.fingerprint == old.fingerprint));

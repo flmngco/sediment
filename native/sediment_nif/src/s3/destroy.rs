@@ -15,7 +15,10 @@ use super::layout::{
 };
 use super::lease::Lease;
 use super::remote::{Put, Remote};
-use super::{default_owner, open_at, probe, purge, refuse_newer, Result, S3Config, S3Error};
+use super::{
+    default_owner, file_open, open_at, probe, purge, refuse_newer, Result, S3Config, S3Error,
+};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// What a destroy deleted.
@@ -53,21 +56,48 @@ pub fn destroy(cfg: &S3Config, force: bool) -> Result<Destroyed> {
 /// long as an open would wait for it. An owner's death reaches the NIF
 /// asynchronously, so connections still open get a moment to start closing.
 pub(crate) fn wait_until_closed(cfg: &S3Config) -> Result<()> {
+    wait_for(
+        || open_at(&cfg.place()),
+        || {
+            format!(
+                "the database at s3://{}/{} is open in this VM; close every connection to it \
+                 first",
+                cfg.bucket, cfg.prefix
+            )
+        },
+    )
+}
+
+/// Like [`wait_until_closed`], for the local file at `local_path`, whatever
+/// S3 prefix it is open with; a file open without S3 here is refused.
+/// Maintenance replaces the file: never under a connection to it.
+pub(crate) fn wait_until_file_closed(local_path: &Path) -> Result<()> {
+    let refused = || {
+        format!(
+            "{} is open in this VM; close every connection to it first",
+            local_path.display()
+        )
+    };
+    if crate::open::plain_open(local_path) {
+        return Err(S3Error::Config(refused()));
+    }
+    wait_for(|| file_open(local_path), refused)
+}
+
+fn wait_for(
+    open: impl Fn() -> Option<(bool, Duration)>,
+    refused: impl Fn() -> String,
+) -> Result<()> {
     const GRACE: Duration = Duration::from_millis(250);
-    let place = cfg.place();
     let start = Instant::now();
     loop {
-        let waiting = match open_at(&place) {
+        let waiting = match open() {
             None => return Ok(()),
             Some((true, _)) => start.elapsed() < GRACE,
             Some((false, wait)) => start.elapsed() < wait,
         };
         if !waiting {
-            return Err(S3Error::Config(format!(
-                "the database at s3://{}/{} is open in this VM; close every connection to it \
-                 first",
-                cfg.bucket, cfg.prefix
-            )));
+            return Err(S3Error::Config(refused()));
         }
         std::thread::sleep(Duration::from_millis(10));
     }

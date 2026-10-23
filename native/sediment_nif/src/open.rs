@@ -372,7 +372,7 @@ impl<'a> OpenConfig<'a> {
         }
         self.check_s3()?;
         // Restoring would replace the file under those connections.
-        if plain_open(&self.path) {
+        if plain_open(Path::new(&self.path)) {
             return Err(format!(
                 "{} is open without :s3 in this VM; close those connections before opening it with :s3",
                 self.path
@@ -438,8 +438,8 @@ fn plain_encryption(path: &str) -> Option<Option<EncryptionOpts>> {
         .map(|(_, _, encryption)| encryption.clone())
 }
 
-fn plain_open(path: &str) -> bool {
-    let Ok(key) = crate::s3::canonical_key(std::path::Path::new(path)) else {
+pub(crate) fn plain_open(path: &std::path::Path) -> bool {
+    let Ok(key) = crate::s3::canonical_key(path) else {
         return false;
     };
     let mut plain = crate::conn::lock(&PLAIN);

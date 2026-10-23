@@ -201,6 +201,67 @@ defmodule Sediment.S3RotationTest do
     :ok = Engine.close(db)
   end
 
+  test "rekey and release_key refuse a local file open in this VM, whatever its prefix", %{
+    s3: s3,
+    dir: dir
+  } do
+    seed(s3, dir, ["a"])
+    other = s3_opts(s3[:prefix] <> "-other")
+    other_dir = Path.join(dir, "other")
+    File.mkdir_p!(other_dir)
+    seed(other, other_dir, ["b"])
+    path = Path.join(dir, "busy.db")
+
+    # Open with S3 under another prefix: the maintenance would restore over it.
+    db = open!(path, s3, ["r1"])
+    :ok = Engine.execute(db, "INSERT INTO t (v) VALUES ('c')")
+    assert {:error, message} = S3.rekey(path, other, encryption: ring(["r2", "r1"]))
+    assert message =~ "#{path} is open in this VM"
+
+    assert {:error, message} =
+             S3.release_key(path, other, "r1", encryption: ring(["r2", "r1"]))
+
+    assert message =~ "#{path} is open in this VM"
+    assert rows(db) == ["a", "c"]
+    :ok = Engine.close(db)
+
+    # Open without S3.
+    {:ok, plain} = Engine.open(path, encryption: ring(["r1"]))
+    assert {:error, message} = S3.rekey(path, other, encryption: ring(["r2", "r1"]))
+    assert message =~ "#{path} is open in this VM"
+    assert rows(plain) == ["a", "c"]
+    :ok = Engine.close(plain)
+
+    # Closed: it goes ahead.
+    assert {:ok, %{from: "r1", to: "r2"}} = S3.rekey(path, other, encryption: ring(["r2", "r1"]))
+  end
+
+  test "a deep CHECK expression rekeys and restores: turso runs on its own stack", %{
+    s3: s3,
+    dir: dir
+  } do
+    # integrity_check and the schema parse compile every CHECK recursively:
+    # on a dirty scheduler's stack, 90 terms would overflow it (and kill the
+    # VM), under turso's expression depth limit.
+    sum = Enum.map_join(1..90, " + ", fn _ -> "1" end)
+    path = Path.join(dir, "deep.db")
+    db = open!(path, s3, ["r1"])
+    :ok = Engine.execute(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT CHECK (#{sum} > 0))")
+    :ok = Engine.execute(db, "INSERT INTO t (v) VALUES ('deep')")
+    :ok = Engine.close(db)
+
+    assert {:ok, %{from: "r1", to: "r2"}} = S3.rekey(path, s3, encryption: ring(["r2", "r1"]))
+    db = open!(path, s3, ["r2"])
+    assert rows(db) == ["deep"]
+    :ok = Engine.close(db)
+
+    assert {:ok, "r2", ["deep"]} =
+             restored_rows(Path.join(dir, "deep-restored.db"), s3, ["r2"], [])
+
+    assert {:ok, %{key: "r1", epochs: [_ | _]}} =
+             S3.release_key(path, s3, "r1", encryption: ring(["r2", "r1"]))
+  end
+
   defp paused_rekey(path, s3, ring) do
     :armed = Native.s3_test_hook(s3, "publish", :pause)
     task = Task.async(fn -> S3.rekey(path, s3, encryption: ring) end)

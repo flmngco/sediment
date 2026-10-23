@@ -683,7 +683,11 @@ fn export_sqlite<'a>(
         encryption,
         drop_fts,
     };
-    match export(source, Path::new(&dest), &opts) {
+    let exported = match crate::stmt::on_turso_stack(|| export(source, Path::new(&dest), &opts)) {
+        Ok(exported) => exported,
+        Err(reason) => return crate::conn::error_tuple(env, reason),
+    };
+    match exported {
         Ok(exported) => {
             let pairs = [
                 ("objects", exported.objects.encode(env)),

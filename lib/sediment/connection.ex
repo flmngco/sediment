@@ -33,8 +33,8 @@ defmodule Sediment.Connection do
     :before_disconnect,
     pending_begin: false,
     s3_generation: 0,
-    # The :encryption option: a replica's refresh resolves keys through its
-    # key_for, if it has one.
+    # The :encryption option, hidden (Sediment.S3.Keys.hide/1): a replica's
+    # refresh resolves keys through its key_for, if it has one.
     encryption: nil,
     generation_key: nil,
     stmt_cache: %{}
@@ -956,7 +956,7 @@ defmodule Sediment.Connection do
         status: :idle,
         chunk_size: Keyword.get(options, :chunk_size),
         s3_generation: S3.generation(database),
-        encryption: options[:encryption],
+        encryption: Sediment.S3.Keys.hide(options[:encryption]),
         generation_key: S3.generation_key(database),
         before_disconnect: Keyword.get(options, :before_disconnect, nil)
       }

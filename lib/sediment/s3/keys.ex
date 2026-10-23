@@ -26,12 +26,37 @@ defmodule Sediment.S3.Keys do
           key_for: (String.t() -> term()) | {module(), atom(), list()} | nil
         }
 
+  defmodule Hidden do
+    @moduledoc false
+    # The `:encryption` option out of sight, in a closure: a pool's options
+    # and a connection's state hold this, and neither inspect (a crash or
+    # termination report, `:sys.get_status/1`, an inspected struct) nor
+    # Erlang's `~p` prints what a closure captured.
+    @enforce_keys [:get]
+    defstruct [:get]
+
+    @type t :: %__MODULE__{get: (-> term())}
+
+    defimpl Inspect do
+      def inspect(_hidden, _opts), do: "#Sediment.S3.Keys.Hidden<redacted>"
+    end
+  end
+
   @doc false
-  @spec normalize(keyword() | map() | false | nil) :: ring() | false | nil
+  # The option as kept in a process: every function taking `:encryption`
+  # takes it hidden too.
+  @spec hide(term()) :: Hidden.t() | false | nil
+  def hide(encryption) when encryption in [nil, false], do: encryption
+  def hide(%Hidden{} = hidden), do: hidden
+  def hide(encryption), do: %Hidden{get: fn -> encryption end}
+
+  @doc false
+  @spec normalize(keyword() | map() | Hidden.t() | false | nil) :: ring() | false | nil
   def normalize(encryption), do: scrubbed(fn -> do_normalize(encryption) end)
 
   defp do_normalize(nil), do: nil
   defp do_normalize(false), do: false
+  defp do_normalize(%Hidden{get: get}), do: do_normalize(get.())
   defp do_normalize(%{} = opts), do: opts |> Map.to_list() |> do_normalize()
 
   defp do_normalize(opts) when is_list(opts) do

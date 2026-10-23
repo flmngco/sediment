@@ -132,7 +132,8 @@ fn deserialize<'a>(
     if database != "main" {
         return error_tuple(env, "only the main database can be deserialized");
     }
-    match open_image(image.as_slice()) {
+    let opened = crate::stmt::on_turso_stack(|| open_image(image.as_slice()));
+    match opened.and_then(|opened| opened) {
         Ok(handle) => {
             *lock(&res.interrupt) = Some(handle.conn.clone());
             // Statements of the replaced database can't run against the new one.

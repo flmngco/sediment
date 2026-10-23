@@ -18,7 +18,16 @@ defmodule Sediment do
   """
   @spec start_link([Connection.connection_opt()]) :: {:ok, pid()} | {:error, Error.t()}
   def start_link(opts) do
-    DBConnection.start_link(Connection, with_s3_shutdown(opts))
+    DBConnection.start_link(Connection, opts |> hide_keys() |> with_s3_shutdown())
+  end
+
+  # The pool's processes keep their options (and supervisors their child
+  # specs): the keys in them are hidden from crash reports and inspection.
+  defp hide_keys(opts) do
+    case Keyword.fetch(opts, :encryption) do
+      {:ok, encryption} -> Keyword.put(opts, :encryption, Sediment.S3.Keys.hide(encryption))
+      :error -> opts
+    end
   end
 
   # Closing an async S3 connection drains pending uploads; the pool must wait
@@ -167,7 +176,7 @@ defmodule Sediment do
   """
   @spec child_spec([Connection.connection_opt()]) :: :supervisor.child_spec()
   def child_spec(opts) do
-    opts = with_s3_shutdown(opts)
+    opts = opts |> hide_keys() |> with_s3_shutdown()
     spec = DBConnection.child_spec(Connection, opts)
 
     # The pool's supervisor must wait as long as the pool waits for its

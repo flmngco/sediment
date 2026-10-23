@@ -224,6 +224,15 @@ pub fn panic_reason(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
+/// Runs work outside a connection that calls into turso_core (an S3
+/// restore, import, rekey or refresh, an export, a deserialize: they parse
+/// schemas, checkpoint and run `PRAGMA integrity_check`) like an open: on
+/// the turso stack, with a panic returned as an error.
+pub fn on_turso_stack<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    with_turso_stack(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)))
+        .map_err(|panic| format!("internal turso error: {}", panic_reason(&*panic)))
+}
+
 /// Runs a call into turso_core, turning a panic into an error. The
 /// connection's state is unknown after a panic, so it is closed.
 pub fn guarded<T>(res: &ConnRes, f: impl FnOnce() -> T) -> Result<T, Step> {

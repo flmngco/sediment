@@ -383,6 +383,52 @@ fn a_released_key_leaves_a_gap_that_is_refused_never_filled() {
 }
 
 #[test]
+fn a_retired_key_stays_retired_by_id_and_by_material() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    seeded(&store, &dir, &["a"]);
+    // r1 (11) -> r2 (22), r1 released: retired (r1, 11) and (r2, 22).
+    let r2 = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    rekey(&r2, &path, None, false, false).unwrap();
+    assert_eq!(
+        release_key(&r2, &path, "r1", false).unwrap().epochs.len(),
+        1
+    );
+
+    // The id r1 again, with new material: a reuse of the id.
+    let fresh = keyed(&store, "a", &[("r1", "44"), ("r2", "22")]);
+    let message = err_text(rekey(&fresh, &path, None, false, false));
+    assert!(message.contains("was retired"), "{message}");
+    assert!(matches!(
+        rekey(&fresh, &path, None, false, true).unwrap(),
+        Rekeyed::Done { .. }
+    ));
+    let m = manifest(&store);
+    assert_eq!(m.key.as_ref().unwrap().id, "r1");
+    // The old r1 key stays retired: its material can't come back under
+    // another id without allow_reuse.
+    assert_eq!(m.retired_keys.len(), 2, "{:?}", m.retired_keys);
+    let old_as_r4 = keyed(&store, "a", &[("r4", "11"), ("r1", "44")]);
+    let message = err_text(rekey(&old_as_r4, &path, None, false, false));
+    assert!(message.contains("was retired"), "{message}");
+    assert!(message.contains("as key r1"), "{message}");
+
+    // r1 (44) -> r3 (33): retired (r1, 11), (r2, 22), (r1, 44). The
+    // material of the released r1 under the id of the retained r2: refused,
+    // with allow_reuse too (the id r2 still names r2's epochs).
+    let r3 = keyed(&store, "a", &[("r3", "33"), ("r1", "44")]);
+    rekey(&r3, &path, None, false, false).unwrap();
+    let r2_with_old = keyed(&store, "a", &[("r2", "11"), ("r3", "33")]);
+    let message = err_text(rekey(&r2_with_old, &path, None, false, true));
+    assert!(
+        message.contains("key r2 still has retained epochs"),
+        "{message}"
+    );
+    assert_eq!(manifest(&store).key.unwrap().id, "r3");
+}
+
+#[test]
 fn retain_epochs_zero_keeps_exactly_the_rekeyed_epoch_until_release() {
     let store = FaultyStore::new();
     let dir = TempDir::new();

@@ -239,6 +239,12 @@ fn s3_replica_info(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
 /// learned keys through `key_for`, say), for this refresh and later ones.
 #[rustler::nif(schedule = "DirtyIo")]
 fn s3_refresh<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, encryption: Term<'a>) -> Term<'a> {
+    // Opening a new generation parses its schema.
+    crate::stmt::on_turso_stack(|| refresh(env, &res, encryption))
+        .unwrap_or_else(|reason| error_tuple(env, reason))
+}
+
+fn refresh<'a>(env: Env<'a>, res: &ResourceArc<ConnRes>, encryption: Term<'a>) -> Term<'a> {
     let ring = match crate::s3_nif::decode_ring(encryption) {
         Ok(ring) => ring,
         Err(reason) => return error_tuple(env, reason),

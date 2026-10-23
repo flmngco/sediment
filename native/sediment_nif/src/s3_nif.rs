@@ -10,6 +10,7 @@ use turso_core::IO;
 
 use crate::conn::{closed, error_tuple, ok_tuple, ConnRes};
 use crate::s3::{self, S3Config, S3DurableStorage, S3Error, Target};
+use crate::stmt::on_turso_stack;
 
 /// Turns the `s3:` keyword list or map into a config. Values may be strings,
 /// atoms, integers or booleans.
@@ -358,7 +359,11 @@ fn s3_restore<'a>(
         },
         Err(_) => Target::Latest,
     };
-    match s3::restore_to(&config, Path::new(&path), target) {
+    let restored = match on_turso_stack(|| s3::restore_to(&config, Path::new(&path), target)) {
+        Ok(restored) => restored,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match restored {
         Ok(restored) => {
             let map = Term::map_from_pairs(
                 env,
@@ -423,7 +428,11 @@ fn s3_import<'a>(
         verify,
         source_encryption: source_key,
     };
-    match s3::import(&config, Path::new(&path), &import_opts) {
+    let imported = match on_turso_stack(|| s3::import(&config, Path::new(&path), &import_opts)) {
+        Ok(imported) => imported,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match imported {
         Ok(imported) => {
             let map = Term::map_from_pairs(
                 env,
@@ -505,7 +514,13 @@ fn s3_rekey<'a>(
     };
     let lock = crate::conn::path_lock(&path);
     let _opening = lock.as_deref().map(crate::conn::lock);
-    match s3::rekey(&config, Path::new(&path), to.as_deref(), force, allow_reuse) {
+    let rekeyed =
+        on_turso_stack(|| s3::rekey(&config, Path::new(&path), to.as_deref(), force, allow_reuse));
+    let rekeyed = match rekeyed {
+        Ok(rekeyed) => rekeyed,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match rekeyed {
         Ok(s3::Rekeyed::Current) => ok_tuple(env, Atom::from_str(env, "current").unwrap()),
         Ok(s3::Rekeyed::Done { from, to, epoch }) => {
             let map = Term::map_from_pairs(
@@ -538,7 +553,12 @@ fn s3_release_key<'a>(
     };
     let lock = crate::conn::path_lock(&path);
     let _opening = lock.as_deref().map(crate::conn::lock);
-    match s3::release_key(&config, Path::new(&path), &key, force) {
+    let released = match on_turso_stack(|| s3::release_key(&config, Path::new(&path), &key, force))
+    {
+        Ok(released) => released,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match released {
         Ok(released) => {
             let map = Term::map_from_pairs(
                 env,

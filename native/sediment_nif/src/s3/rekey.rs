@@ -101,6 +101,7 @@ fn maintain(cfg: &S3Config, local_path: &Path, op: &Op) -> Result<Fresh> {
             ));
         }
         destroy::wait_until_closed(cfg)?;
+        destroy::wait_until_file_closed(local_path)?;
         let _log = crate::log_guard::claim(local_path, crate::log_guard::Use::New)
             .map_err(S3Error::Config)?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);

@@ -79,6 +79,71 @@ defmodule Sediment.S3KeysTest do
     assert [{Sediment.Native, :open, 2, _} | _] = stacktrace
   end
 
+  # Every way a process's state is printed: inspect and Erlang's ~p, of the
+  # status (:sys.get_status/1) and of the state a termination report shows.
+  defp refute_in_process(pid) do
+    status = :sys.get_status(pid)
+    printed = [inspect(status, limit: :infinity), to_string(:io_lib.format(~c"~tp", [status]))]
+
+    terminate =
+      case :sys.get_state(pid) do
+        {_state, %{mod: _, state: _} = data} ->
+          [DBConnection.Connection.format_status(:terminate, [[], :no_state, data])]
+
+        _ ->
+          []
+      end
+
+    for term <- terminate,
+        text <- [inspect(term, limit: :infinity), to_string(:io_lib.format(~c"~tp", [term]))] do
+      refute text =~ @k1
+      refute text =~ @k2
+    end
+
+    for text <- printed do
+      refute text =~ @k1
+      refute text =~ @k2
+    end
+  end
+
+  # A pool's processes: the pool, and its connections' supervisors (which
+  # keep their child specs) and connections, started under DBConnection's
+  # application supervisor. Every pool's: any pool open now.
+  defp pool_processes(pool) do
+    supervisors =
+      for {_, pid, _, _} <- Supervisor.which_children(DBConnection.ConnectionPool.Supervisor),
+          is_pid(pid),
+          do: pid
+
+    connections =
+      for supervisor <- supervisors,
+          {_, pid, _, _} <- Supervisor.which_children(supervisor),
+          is_pid(pid),
+          do: pid
+
+    [pool | supervisors] ++ connections
+  end
+
+  test "a connection's state and a pool's processes never show a key" do
+    path = Temp.path!()
+
+    {:ok, state} = Sediment.Connection.connect(database: path, encryption: ring())
+
+    for text <- [inspect(state, limit: :infinity), to_string(:io_lib.format(~c"~tp", [state]))] do
+      refute text =~ @k1
+      refute text =~ @k2
+    end
+
+    :ok = Sediment.Connection.disconnect(%RuntimeError{}, state)
+
+    {:ok, pool} = Sediment.start_link(database: path, encryption: ring(), pool_size: 2)
+    assert {:ok, _} = Sediment.query(pool, "SELECT 1", [])
+    processes = pool_processes(pool)
+    assert length(processes) >= 4
+    Enum.each(processes, &refute_in_process/1)
+    GenServer.stop(pool)
+  end
+
   test "an invalid key is named by its id, never shown" do
     for bad <- [String.slice(@k1, 0, 62), String.duplicate("zz", 32)] do
       assert {:error, message} =

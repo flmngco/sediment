@@ -311,13 +311,24 @@ pub fn live_storage(local_path: &Path) -> Option<Arc<S3DurableStorage>> {
 /// Drop), and how long to wait for its close (see `Live::wait`). `None`: not
 /// open here.
 fn open_at(place: &str) -> Option<(bool, std::time::Duration)> {
+    open_where(|_, entry| entry.place == place)
+}
+
+/// Like [`open_at`], for the S3 database (of any prefix) whose local file
+/// is `local_path`.
+fn file_open(local_path: &Path) -> Option<(bool, std::time::Duration)> {
+    let key = canonical_key(local_path).ok()?;
+    open_where(|at, _| *at == key)
+}
+
+fn open_where(matches: impl Fn(&PathBuf, &Live) -> bool) -> Option<(bool, std::time::Duration)> {
     // Dropped after the lock (see `Live::state`).
     let mut held = Vec::new();
     let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let found = live
-        .values()
-        .filter(|entry| entry.place == place && !entry.finished())
-        .map(|entry| match entry.state() {
+        .iter()
+        .filter(|(key, entry)| matches(key, entry) && !entry.finished())
+        .map(|(_, entry)| match entry.state() {
             LiveState::Open(storage) => {
                 let open = storage.attached() > 0;
                 held.push(storage);
@@ -652,11 +663,24 @@ fn rekey_target(
             current.cipher()
         )));
     }
-    if let Some(retired) = manifest
+    if target.fingerprint() == current.fingerprint() {
+        return Err(S3Error::Config(format!(
+            "rekey: key {} is the database's key {} under another id; a rekey moves to \
+             another key",
+            target.id(),
+            current.id()
+        )));
+    }
+    // Retired by id or by key material: a key comes back, under any id,
+    // only with allow_reuse.
+    let same =
+        |id: &str, fingerprint: &str| id == target.id() || fingerprint == target.fingerprint();
+    let retired: Vec<_> = manifest
         .retired_keys
         .iter()
-        .find(|r| r.id == target.id() || r.fingerprint == target.fingerprint())
-    {
+        .filter(|r| same(&r.id, &r.fingerprint))
+        .collect();
+    if let Some(first) = retired.first() {
         if !allow_reuse {
             return Err(S3Error::Config(format!(
                 "rekey: key {} (fingerprint {}) was retired from this database at {} (unix ms) \
@@ -664,23 +688,31 @@ fn rekey_target(
                  its retained epochs are released)",
                 target.id(),
                 target.fingerprint(),
-                retired.retired_at_ms,
-                retired.id
+                first.retired_at_ms,
+                first.id
             )));
         }
-        // Each key has at most one pinned run: its old one must be gone.
-        if manifest.history.iter().any(|record| {
-            record
-                .key
-                .as_ref()
-                .is_some_and(|key| key.id == retired.id || key.fingerprint == retired.fingerprint)
-        }) {
-            return Err(S3Error::Config(format!(
-                "rekey: key {} still has retained epochs from when it was current; release them \
-                 first (Sediment.S3.release_key/4), then reuse it",
-                retired.id
-            )));
-        }
+    }
+    // Each key has at most one pinned run, and an id names one key in the
+    // history: no retained epoch may be under the target's id or material,
+    // or under a retired key it reuses.
+    let clashing = manifest
+        .history
+        .iter()
+        .filter_map(|record| record.key.as_ref())
+        .find(|key| {
+            same(&key.id, &key.fingerprint)
+                || retired
+                    .iter()
+                    .any(|r| r.id == key.id && r.fingerprint == key.fingerprint)
+        });
+    if let Some(key) = clashing {
+        return Err(S3Error::Config(format!(
+            "rekey: key {} still has retained epochs from when it was current; release them \
+             first (Sediment.S3.release_key/4), then reuse {}",
+            key.id,
+            target.id()
+        )));
     }
     Ok(Some(target.clone()))
 }

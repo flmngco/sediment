@@ -521,7 +521,8 @@ defmodule Sediment.S3 do
 
     1. takes the writer lease; like `destroy/2`, it refuses while the
        database is open in this VM, and any unexpired lease (this owner's
-       too) unless `force: true`;
+       too) unless `force: true`; it also refuses while `path` is open in
+       this VM (without `:s3`, or with another prefix);
     2. takes the database over, resolves its current key from the ring (by
        id and fingerprint), and restores and checkpoints it under that key;
     3. re-encrypts the file page by page under the new key, checks that
