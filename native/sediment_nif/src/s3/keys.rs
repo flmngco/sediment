@@ -177,7 +177,9 @@ pub struct KeyRing {
 
 impl KeyRing {
     /// Ids are unique, and so is key material. Without `active`, the first
-    /// key is.
+    /// key is. An active key the ring lacks is refused when it is needed
+    /// ([`Self::active`]): a ring whose `key_for` had no key for an id still
+    /// gets the error that names that id.
     pub fn new(keys: Vec<Key>, active: Option<String>, resolvable: bool) -> Result<Self> {
         for (i, key) in keys.iter().enumerate() {
             for other in &keys[..i] {
@@ -205,11 +207,6 @@ impl KeyRing {
                 .map(|key| key.id.clone())
                 .ok_or_else(|| S3Error::Config("the key ring is empty".into()))?,
         };
-        if !resolvable && !keys.iter().any(|key| key.id == active) {
-            return Err(S3Error::Config(format!(
-                "the active key {active} is not in the ring"
-            )));
-        }
         Ok(Self {
             keys,
             active,
@@ -233,7 +230,10 @@ impl KeyRing {
     /// The active key.
     pub fn active(&self) -> Result<&Key> {
         self.need(&self.active.clone(), |ring| {
-            format!("the active key {} is not in the ring ({ring})", self.active)
+            format!(
+                "the active key {} is not in the ring (ring: {ring})",
+                self.active
+            )
         })
     }
 
@@ -358,7 +358,8 @@ mod tests {
         let same = Key::new("r3", "aegis256", A).unwrap();
         assert!(err(KeyRing::new(vec![a(), same], None, false)).contains("are the same key"));
         assert!(err(KeyRing::new(vec![], None, false)).contains("empty"));
-        assert!(err(KeyRing::new(vec![a()], Some("r2".into()), false)).contains("not in the ring"));
+        let lacking = KeyRing::new(vec![a()], Some("r2".into()), false).unwrap();
+        assert!(err(lacking.active()).contains("the active key r2 is not in the ring (ring: r1)"));
         let ring = KeyRing::new(vec![b(), a()], None, false).unwrap();
         assert_eq!(ring.active().unwrap().id(), "r2");
         assert_eq!(ring.ids(), "r2, r1");
