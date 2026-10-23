@@ -47,6 +47,8 @@ delays commits. Checked: `AsyncSole` 77,213 states, `AsyncSoleDelays` 159,549, `
 10,443,594 (two writers, late writes, a fault), all passing `AckedDurable`, `RestoreOK`,
 `RestoreCommitted` and `SoleNeverFenced`; the sync configs pass `RestoreCommitted` too.
 
+`tla/KeyRotation.tla`, a second spec, models key rotation: see "Key rotation" below.
+
 `Patches` switch on negative controls. Each must break a property; the table records it.
 
 | Config | Hosts | Patches | Expect |
@@ -373,6 +375,138 @@ Model-found bugs so far, both fixed in the code, with a regression test each:
 - A replica refresh that compared only the manifest's generation took a late upload into
   a collected epoch for a new commit (see "Readers").
 
+## Key rotation
+
+`tla/KeyRotation.tla` models key rotation inside one prefix (bead td-9qug, its design note
+with amendments 1 and 2), at S3Fence's request grain, for the
+parts that matter to keys. Each epoch is encrypted with one key, which its manifest record
+names: its snapshot and every log frame. The parts:
+
+- the lease (any clock: a host may always take over) and the manifest (`If-Match`,
+  create-only, every write may succeed, be refused, lose its answer, not land, or land late);
+- the open: takeover, then the key id is resolved from the manifest it took over, under its
+  lease; a ring that lacks it refuses before writing anything (`key_for` turns that into a
+  new open); restore with the record's key, takeover seal, fold into a fresh epoch;
+- commits: a frame under the writer's key, acknowledged after the manifest-etag confirm
+  (sync durability; no checkpoints, so every epoch comes from an open, whose epoch advance
+  is the same `If-Match` manifest PUT a checkpoint publishes);
+- rekey (`Sediment.S3.rekey/3`, then a clean close): an open whose fold re-encrypts (the
+  page-by-page copy is abstracted as exact) and whose epoch advance names the new key, pins
+  every record it keeps (A1) and adds the old key to `retired_keys` (A3). A rekey to a
+  retired key is refused, or with `allow_reuse` (`AllowReuse`) allowed once no pinned record
+  under it remains (A7);
+- release_key: an open whose advance drops the records under a key, refused while that key
+  is current; retention keeps the pinned records and the newest `Retain` unpinned ones;
+- the epoch advance PUT's errors: a GET follows; our manifest is adopted, a foreign one is
+  Fenced, the one we still hold makes the open resend the same body (A4'), a failed GET is
+  indeterminate;
+- point-in-time restore at every past T: the record whose `[started_at, ended_at)` covers
+  T, with its key, and the frames of its log that landed by T, or a refusal.
+
+Time is one store clock (`now`, ticked between steps); a frame's `last_modified` is when it
+lands. Epoch boundaries come from that clock, as in the code (A5'): the Last-Modified of the
+seal that closed the predecessor (taken when the open seals it, or when it finds it
+sealed), the first snapshot's for epoch 0. The writers' clocks are modelled apart (`Skew`,
+their offset from the store's) and nothing reads them except the control `WriterClock`
+(the design before A5: `started_at` from the writer's clock), which breaks `PitrExact`
+with a writer ahead (`NegKrWriterClock`) or behind (`NegKrWriterClockBehind`) by one tick.
+So a writer's skew can't make a restore at T return another state; T is exact up to the
+store's timestamp resolution (1 s), and a T in the same second as a boundary is resolved
+to the newer epoch (the half-open range).
+
+Properties:
+
+- `AckedDurable`: every acknowledged commit is in a restore of the current manifest, with
+  the key it names, across rekeys, including a rekey that lost its lease mid-copy
+  (`RekeyFenced` witnesses that case in `KrTakeover`).
+- `KeyConsistent`: every epoch the manifest names (current and retained) restores with the
+  key its record names: the snapshot and every frame are encrypted with it.
+- `PitrExact`: a restore at T returns the database as of T (the ghost `hist[T]`: what a
+  restore of the current manifest returned at the end of tick T), or refuses.
+- `CensusSound`: every key the data of the current or a retained epoch is encrypted with
+  is in `key_census`, so a key the census doesn't list can leave the ring.
+- `ManifestForward`: as in S3Fence.
+
+Added, with the reason:
+
+- `OutcomeFinal`: no epoch advance of an open that reported failure (Fenced or failed)
+  ever becomes the manifest. A rekey reported failed must not switch the key later: an
+  operator would take the census at its word and drop the target key. This is the property
+  amendment A4 asks for; it found A4's open case (below).
+- `RetiredStaysRetired` (A3): a key rotated away from is never current again, unless a
+  rekey reused it with `allow_reuse`.
+- `SourceKept` (A1): every retired key not released since has a pinned record, whatever
+  `Retain` is: a rekey keeps the state it re-encrypted until `release_key`.
+- `HistoryBound` (A1, A7): at most `Retain` unpinned records, no pinned record under the
+  current key, and at most `Retain + 1` pinned records per key: the stated bound on the
+  history.
+- `RestoreCommitted`: as in S3Fence, a check on the model itself.
+
+| Config | Hosts | Patches | Expect | States |
+|---|---|---|---|---|
+| `KrSole` | 1 (late writes, 1 fault, 1 kill), 3 opens, 2 commits, keys k1 k2, retain 0 | none | pass | 944,750 |
+| `KrSoleRetain` | 1, 5 opens, 2 commits, retain 1, no faults | none | pass | 852,105 |
+| `KrSoleKeys` | 1, 5 opens, 1 commit, keys k1 k2 k3, 2 rekeys, 1 release, retain 0, no faults | none | pass | 1,012,946 |
+| `KrReuse` | 1, 5 opens, 3 rekeys, 1 release, `AllowReuse`, no faults | none | pass | 413,561 |
+| `KrTakeover` | 2 (late writes, 1 fault), 2 opens and 1 commit each, rings {k1, k2} and {k1}, rekey to k2, release of k1 | none | pass (19 min) | 14,836,553 |
+| `NegKrNoIfMatchSwitch` | 2, no faults | `NoIfMatchSwitch` (a rekey publishes unconditionally) | `AckedDurable` violated | 69,034 |
+| `NegKrKeyBeforeLease` | 2, no faults | `KeyBeforeLease` (an opener writes under the key id it read before its takeover) | `KeyConsistent` violated | 41,024 |
+| `NegKrNoCoverageCheck` | 1, 4 opens, retain 0, no faults | `NoCoverageCheck` (PITR picks the newest epoch started by T) | `PitrExact` violated | 7,415 |
+| `NegKrReleaseCurrent` | 1, 2 opens, no faults | `ReleaseCurrent` (a release of the current key drops it) | `KeyConsistent` violated (and `CensusSound`) | 466 |
+| `NegKrTrimPinned` | 1, 2 opens, retain 0, no faults | `TrimPinned` (retention by key, before A1) | `SourceKept` violated | 408 |
+| `NegKrNoRetiredCheck` | 1, 3 opens, 2 rekeys, no faults | `NoRetiredCheck` (a rekey may target a retired key) | `RetiredStaysRetired` violated | 2,601 |
+| `NegKrReuseWithPins` | as `NegKrNoRetiredCheck`, `AllowReuse` | `ReuseWithPins` (allow_reuse ignores pinned records) | `HistoryBound` violated | 2,465 |
+| `NegKrNoAdopt` | 1, 2 opens, 1 fault | `NoAdopt` (an error on the epoch advance fails the open, before A4) | `OutcomeFinal` violated | 930 |
+| `NegKrFailUnlanded` | 1, 2 opens, 1 fault, late writes | `FailUnlanded` (A4 as first written: a GET showing the manifest held reports failure) | `OutcomeFinal` violated | 2,881 |
+| `NegKrWriterClock` | 1, 2 opens, retain 1, writers' clocks ahead by 1 | `WriterClock` (started_at from the writer's clock, before A5) | `PitrExact` violated | 586 |
+| `NegKrWriterClockBehind` | as `NegKrWriterClock`, clocks behind by 1 | `WriterClock` | `PitrExact` violated | 507 |
+
+Positive configs list, under `_POSSIBLE`, a commit acknowledged under a rotated key
+(`AckAfterRekey`), an old key's epoch retained (`OldKeyRetained`), a restore at T of an
+epoch under an old key (`PitrOldKey`), a T no record covers although an older one started
+before it (`PitrGap`, the case `NoCoverageCheck` gets wrong), a release (`Released`), a
+late landing, an adopted manifest after an error (`Adopted`) and a resend (`Resent`), a
+rekey fenced after its takeover was overtaken (`RekeyFenced`), an open refused for a key
+its ring lacked (`KeyNeeded`), and a reuse and a refused reuse (`Reused`, `ReuseRefused`),
+as each config can reach them.
+
+Each negative control is the smallest setting that reaches its violation (no faults
+unless it needs one). `NoIfMatchSwitch` (a rekey publishes unconditionally) is checked
+against `AckedDurable` alone: with every invariant on, `KeyConsistent` fails first, one step
+earlier. The overtaken rekey's unconditional switch brings back the pinned source epoch,
+and the writer that overtook it, collecting garbage for the manifest it published, deletes
+that epoch's snapshot. `KeyBeforeLease` (an opener writes under the key id it read before
+its takeover, while another host rekeyed in between, and its record carries the manifest's
+key): its new epoch's snapshot is under the old key and its record names the new one.
+`NoCoverageCheck` (the newest retained epoch that started by T): after `retain_epochs: 0`
+trims the unpinned epochs behind a rekey, a T inside the trimmed range gets the pinned
+source epoch's final state. `ReleaseCurrent` (a release of the current key drops it from the
+record too): the data stays under that key, the record names none. `TrimPinned` (retention
+by key, the design before A1): with `retain_epochs: 0`, the rekey drops its source at once.
+`NoRetiredCheck` and `ReuseWithPins` take away A3's refusal and A7's condition.
+`NoAdopt` (the design before A4: any error on the advance fails the open) reports failure
+for a manifest that landed with its answer lost.
+
+Found by the model (decision bead td-9qug.15, now amendment A4'): A4 said what to do when
+the GET after an error shows our manifest, a foreign one, or nothing, but not when it shows
+the manifest the open still holds (its takeover). That is a PUT that timed out on the client
+and is still in flight, `If-Match` on exactly that version, so it can land after the GET.
+Reporting failure there (`FailUnlanded`) breaks `OutcomeFinal`: bootstrap under k1, a rekey
+to k2 whose publication times out, the GET shows the takeover manifest, the rekey returns
+an error, the PUT lands, and the database is under k2 while a census taken in between said
+k2 wasn't needed. The design now resends the same body `If-Match` on the version held and
+reads again (ours: adopt; foreign: Fenced, since our first PUT can no longer land; still
+held or unreadable after the bounded retries: indeterminate). In the model the resends are
+bounded by the fault budget.
+
+Not in this model (S3Fence or tests cover them): async durability and checkpoints, readers'
+manifest recheck (a restore here is one atomic read; S3Fence's `Readers` checks the
+recheck), replicas, warm reopen and its fingerprint check, destroy, snapshot chains (a
+rekey always publishes a full snapshot), key material (the model has key ids; a ring entry
+whose fingerprint doesn't match is a refusal like a missing key, checked by tests), the
+re-encryption itself (abstracted as exact; the code checks every page's plaintext and runs
+`integrity_check`), and `Retain` differing between hosts.
+
 ## Trace validation
 
 `trace/` checks that what the code really sends is a behaviour of the model. A workload
@@ -455,7 +589,7 @@ snapshot and per commit, and no costs. These properties are checked by tests ins
 | Clocks: lease expiry and point-in-time restore cutoffs | the lease accepts any clock (safety must not depend on it); `LeaseHolds` is only a liveness assumption | the S3 guide ("Clocks", point-in-time restore); "restore/3 rebuilds a past state"; the Tigris soak found a 227 s host skew this way |
 | Costs and request counts | not a behaviour property | the request meter and its independent check (`s3_meter_test.exs`) |
 | Bytes: incremental snapshot chains, compression, multipart and its part sizes, encryption | one abstract object per snapshot | CRC32C and size checks at every restore; `incremental.rs`, `incremental_snapshot_sizes_probe`; `a_snapshot_larger_than_its_parts_allow_at_8_mib_still_uploads`; the crash-torture test |
-| The encryption choice and the manifest's `encrypted` flag | checked before any write, or a manifest field the model abstracts: an open with the wrong choice is refused before the lease's first manifest write, the takeover keeps the flag as it was, and only the epoch advance after a successful restore records it | `an_s3_database_needs_a_key_or_an_explicit_opt_out`, `a_key_on_an_unencrypted_prefix_is_refused_and_writes_nothing`, `an_unrecorded_encryption_is_recorded_only_by_an_open_that_reads_the_database`, `a_second_open_of_a_database_open_here_needs_the_same_encryption`; S3 tests in `s3_test.exs` |
+| The encryption choice and the manifest's `encrypted` flag (S3Fence; key ids, rings, rekey and release are in `KeyRotation.tla`) | checked before any write, or a manifest field the model abstracts: an open with the wrong choice is refused before the lease's first manifest write, the takeover keeps the flag as it was, and only the epoch advance after a successful restore records it | `an_s3_database_needs_a_key_or_an_explicit_opt_out`, `a_key_on_an_unencrypted_prefix_is_refused_and_writes_nothing`, `an_unrecorded_encryption_is_recorded_only_by_an_open_that_reads_the_database`, `a_second_open_of_a_database_open_here_needs_the_same_encryption`; S3 tests in `s3_test.exs` |
 | Import | the model's bootstrap with a non-empty first snapshot (the model doesn't look at snapshot contents); the same create-only manifest is the commit point | trace validation (`workload_import.exs`), `tests/import.rs` (failure paths, lost manifest race, re-runs) |
 | Group commit | a batch uses the same create-only upload and ownership confirm as one frame | `group_commit.rs`, incl. `failed_batch_upload_acknowledges_nothing_it_lost` (after a leader's failed batch, turso let a waiting commit sync the written prefix, so `sync` must keep failing once poisoned) |
 | Coalesced async segments (incl. `upload_interval_ms`) | one model frame per upload; a segment is uploaded and retried as one object, and how long the uploader waits before it (the interval) is timing, which the model leaves out: any wait is one of its interleavings | `async_durability.rs`; crash torture (async, prefix oracle) |
@@ -468,5 +602,6 @@ Running (JDK from `mise.toml`, `tla2tools.jar` in `~/tools` or `$TLA_TOOLS`):
 
 ```sh
 cd formal/tla && ../bin/tlc S3Fence.tla -config Sole.cfg
-formal/bin/check        # every config, compared with the table's expectation (~15 min)
+formal/bin/check        # every config, compared with the table's expectation
+formal/bin/check Kr     # only the configs whose name matches (here: KeyRotation's)
 ```
