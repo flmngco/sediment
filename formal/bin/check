@@ -97,6 +97,7 @@ KrSoleRetain pass KeyRotation
 KrSoleKeys pass KeyRotation
 KrReuse pass KeyRotation
 KrTakeover pass KeyRotation
+KrTakeoverFaults pass KeyRotation
 NegKrNoIfMatchSwitch AckedDurable KeyRotation
 NegKrKeyBeforeLease KeyConsistent KeyRotation
 NegKrNoCoverageCheck PitrExact KeyRotation
@@ -108,6 +109,8 @@ NegKrNoAdopt OutcomeFinal KeyRotation
 NegKrFailUnlanded OutcomeFinal KeyRotation
 NegKrWriterClock PitrExact KeyRotation
 NegKrWriterClockBehind PitrExact KeyRotation
+NegKrFencedNoKey OutcomeFinal KeyRotation
+NegKrCensusResolves IndetCensus KeyRotation
 LIST
 
 exit $status

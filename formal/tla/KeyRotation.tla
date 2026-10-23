@@ -14,12 +14,13 @@
 (* old key; a release_key is an open whose advance drops the records under *)
 (* a key that isn't current. Retention trims unpinned records to Retain.   *)
 (* An error on an epoch advance PUT is followed by a GET: our manifest is  *)
-(* adopted, a foreign one is Fenced, the one we hold makes us resend the   *)
-(* same body (amendment A4'). A restore at a time T picks the              *)
-(* record whose [started_at, ended_at) covers T, with its key. Every store *)
-(* write may succeed, be refused (412, only when its precondition is       *)
-(* false), land with its answer lost, not land, or stay in flight and land *)
-(* later if its precondition still holds then.                            *)
+(* adopted, a foreign one is Fenced (the report names its key, A9), the    *)
+(* one we hold makes us resend the same body (A4'), a failed GET is        *)
+(* indeterminate, which only a later open resolves (A8). A restore at a    *)
+(* time T picks the record whose [started_at, ended_at) covers T, with its *)
+(* key. Every store write may succeed, be refused (412, only when its     *)
+(* precondition is false), land with its answer lost, not land, or stay in *)
+(* flight and land later if its precondition still holds then.            *)
 (*                                                                         *)
 (* Time is the store's clock (now). Epoch boundaries come from it, as in  *)
 (* the code (amendment A5'): the Last-Modified of the seal that closed the *)
@@ -70,11 +71,16 @@ VARIABLES
     \* ---- ghosts
     acked,      \* histories some commit was acknowledged for
     committed,  \* histories some host attempted to commit
-    disowned,   \* manifest versions of epoch advances whose open reported failure
+    disowned,   \* epochs whose advance must never become current: its open reported it
+                \* failed, or Fenced while another epoch was current
+    indet,      \* epochs whose open's outcome is unclear (indeterminate, or a crash
+                \* while its advance was unanswered), not resolved yet
+    settled,    \* epochs of unclear outcomes that a later open resolved: never current
     moved       \* a step since the last tick (two ticks in a row add nothing)
 
 vars == <<man, objs, snaps, leaseGen, inflight, R, ctr, faults, kills, nrk, nrl, now, hist,
-          acked, committed, disowned, moved>>
+          acked, committed, disowned, indet, settled, moved>>
+outs == <<disowned, indet, settled>>
 
 -----------------------------------------------------------------------------
 NoKey == "none"
@@ -104,11 +110,15 @@ Body(x) == [x EXCEPT !.t = 0]
 \* ek: the key the epoch's record names (the restore decrypts with it); wk: the key the
 \* writer encrypts with. tm: the manifest its takeover wrote. bt: the boundary, the
 \* Last-Modified of the seal that closed the restored epoch. sent: its epoch advance
-\* (for the GET after an error). res: how its last open ended (a ghost).
+\* (for the GET after an error). res: how its last open ended, and told: the key that
+\* report names (a Fenced report names the foreign manifest's key, amendment A9).
+\* seen: the unclear outcomes reported before its takeover, which its publication
+\* resolves.
 R0 == [pc |-> "off", gen |-> 0, op |-> "open", tgt |-> NoKey, ring |-> {}, pre |-> NoKey,
        ek |-> NoKey, wk |-> NoKey, tm |-> NoMan, bt |-> 0, sent |-> NoMan, db |-> <<>>,
        e |-> NoEpoch, o |-> 1, mver |-> 0, poisoned |-> "no", orphans |-> {}, frame |-> NoFrame,
-       nc |-> 0, nopen |-> 0, gcBelow |-> 0, gcKeep |-> {}, res |-> "none"]
+       nc |-> 0, nopen |-> 0, gcBelow |-> 0, gcKeep |-> {}, res |-> "none", told |-> NoKey,
+       seen |-> {}]
 
 Patch(p) == p \in Patches
 
@@ -235,7 +245,7 @@ Newer(n) == man.present /\ man.gen >= R[n].gen
 
 \* An open ends: only what outlives it is kept.
 Off(n, why) == [R EXCEPT ![n] = [R0 EXCEPT !.nc = R[n].nc, !.nopen = R[n].nopen, !.op = R[n].op,
-                                           !.res = why]]
+                                           !.tgt = R[n].tgt, !.res = why, !.told = R[n].told]]
 
 \* GET manifest; resolve its key id from the ring (refuse by name before writing anything:
 \* "unknown key id", which key_for turns into a retry, i.e. a new open); a release of
@@ -290,7 +300,7 @@ Take(n) ==
                                                           any |-> FALSE, rec |-> rec]}
                                      ELSE inflight
                       /\ R' = IF out = "ok"
-                              THEN [R EXCEPT ![n].pc = "restore", ![n].e = man.e,
+                              THEN [R EXCEPT ![n].pc = "restore", ![n].e = man.e, ![n].seen = indet,
                                              ![n].mver = ctr + 1, ![n].ek = man.key,
                                              ![n].wk = wk, ![n].tm = rec]
                               ELSE Off(n, "failed")
@@ -367,11 +377,31 @@ Published(n, rec) ==
     [R EXCEPT ![n].pc = "gc", ![n].e = rec.e, ![n].o = 1, ![n].mver = rec.ver,
               ![n].wk = NewKey(n), ![n].ek = rec.key, ![n].gcBelow = rec.e.s,
               ![n].gcKeep = Retained(rec), ![n].sent = NoMan, ![n].tm = NoMan, ![n].bt = 0,
+              ![n].told = rec.key, ![n].seen = {},
               ![n].res = IF R[n].op = "rekey" /\ R[n].tgt \in R[n].tm.retired THEN "reused" ELSE "ok"]
-\* The open reports failure (fenced or failed): its epoch advance must never land later.
+\* A publication resolves every unclear outcome reported before its takeover: that
+\* takeover moved the manifest version, so no advance PUT sent before it can land.
+Resolve(n) ==
+    /\ settled' = settled \cup R[n].seen
+    /\ indet' = indet \ R[n].seen
+    /\ UNCHANGED disowned
+\* An unclear outcome. "CensusResolves": the caller takes a key_census read at the report
+\* for the outcome (the guidance before amendment A8), i.e. the advance as not landed
+\* when the census shows another epoch.
+Unclear(e) ==
+    /\ indet' = indet \cup {e}
+    /\ settled' = IF Patch("CensusResolves") /\ man.e # e THEN settled \cup {e} ELSE settled
+\* The open ends without its advance published. "failed" says nothing switched; Fenced
+\* names the key of the foreign manifest it read (A9), which may already carry our epoch
+\* (ours landed with its answer lost and another writer took over), so only another
+\* epoch there says ours never will ("FencedNoKey": Fenced says nothing switched, the
+\* reading before A9); "indeterminate" is unclear.
 Disown(n, why, rec) ==
-    /\ R' = Off(n, why)
-    /\ disowned' = IF why \in {"fenced", "failed"} THEN disowned \cup {rec.ver} ELSE disowned
+    /\ R' = [Off(n, why) EXCEPT ![n].told = IF why = "fenced" /\ ~Patch("FencedNoKey")
+                                           THEN man.key ELSE NoKey]
+    /\ disowned' = IF why = "failed" \/ (why = "fenced" /\ (Patch("FencedNoKey") \/ man.e # rec.e))
+                  THEN disowned \cup {rec.e} ELSE disowned
+    /\ IF why = "indeterminate" THEN Unclear(rec.e) ELSE UNCHANGED <<indet, settled>>
 
 \* PUT the epoch advance rec (If-Match on what we hold). On an error or a 412, GET it
 \* ("NoAdopt": the design before amendment A4, the open fails).
@@ -384,10 +414,10 @@ PutAdvance(n, rec) ==
                       THEN inflight \cup {[k |-> "man", cond |-> R[n].mver, any |-> any, rec |-> rec]}
                       ELSE inflight
        /\ IF out = "ok"
-          THEN R' = Published(n, rec) /\ UNCHANGED disowned
+          THEN R' = Published(n, rec) /\ Resolve(n)
           ELSE IF Patch("NoAdopt")
           THEN Disown(n, IF out = "refused" THEN "fenced" ELSE "failed", rec)
-          ELSE R' = [R EXCEPT ![n].pc = "verify", ![n].sent = rec] /\ UNCHANGED disowned
+          ELSE R' = [R EXCEPT ![n].pc = "verify", ![n].sent = rec] /\ UNCHANGED outs
 
 Compact(n) ==
     /\ R[n].pc = "compact"
@@ -413,10 +443,10 @@ Verify(n) ==
           /\ Disown(n, "indeterminate", R[n].sent)
        \/ /\ faults' = faults
           /\ IF man = R[n].sent
-             THEN R' = [Published(n, R[n].sent) EXCEPT ![n].res = "adopted"] /\ UNCHANGED disowned
+             THEN R' = [Published(n, R[n].sent) EXCEPT ![n].res = "adopted"] /\ Resolve(n)
              ELSE IF man.ver = R[n].mver
              THEN IF Patch("FailUnlanded") THEN Disown(n, "failed", R[n].sent)
-                  ELSE R' = [R EXCEPT ![n].pc = "resend"] /\ UNCHANGED disowned
+                  ELSE R' = [R EXCEPT ![n].pc = "resend"] /\ UNCHANGED outs
              ELSE Disown(n, "fenced", R[n].sent)
     /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, kills, nrk, nrl, now, hist, acked,
                    committed>>
@@ -501,10 +531,14 @@ Close(n) ==
 -----------------------------------------------------------------------------
 (* Environment *)
 
+\* A crash while the advance is unanswered (between its PUT and a clear answer) leaves
+\* an unclear outcome: the caller gets no report.
 Kill(n) ==
     /\ R[n].pc # "off" /\ kills < MaxKills
     /\ kills' = kills + 1
     /\ R' = [R EXCEPT ![n] = [R0 EXCEPT !.nc = R[n].nc, !.nopen = R[n].nopen, !.res = "killed"]]
+    /\ IF R[n].pc \in {"verify", "resend"} THEN Unclear(R[n].sent.e) ELSE UNCHANGED <<indet, settled>>
+    /\ UNCHANGED disowned
     /\ UNCHANGED <<man, objs, snaps, leaseGen, inflight, ctr, faults, nrk, nrl, now, hist, acked,
                    committed>>
 
@@ -536,17 +570,18 @@ Init ==
     /\ R = [n \in Node |-> R0]
     /\ ctr = 0 /\ faults = 0 /\ kills = 0 /\ nrk = 0 /\ nrl = 0
     /\ now = 1 /\ hist = <<>>
-    /\ acked = {} /\ committed = {<<>>} /\ disowned = {} /\ moved = TRUE
+    /\ acked = {} /\ committed = {<<>>} /\ disowned = {} /\ indet = {} /\ settled = {}
+    /\ moved = TRUE
 
 Next ==
-    \/ /\ \/ \E n \in Node : Compact(n) \/ Resend(n) \/ Verify(n)
+    \/ /\ \/ \E n \in Node : Compact(n) \/ Resend(n) \/ Verify(n) \/ Kill(n)
           \/ /\ \/ \E n \in Node :
                      \/ Open(n) \/ Take(n) \/ RestoreStep(n) \/ TakeSeal(n) \/ GC(n)
-                     \/ CommitPut(n) \/ Confirm(n) \/ ConfirmFails(n) \/ Close(n) \/ Kill(n)
+                     \/ CommitPut(n) \/ Confirm(n) \/ ConfirmFails(n) \/ Close(n)
                 \/ \E w \in inflight : Land(w)
-             /\ UNCHANGED disowned
+             /\ UNCHANGED outs
        /\ moved' = TRUE
-    \/ Tick /\ moved /\ moved' = FALSE /\ UNCHANGED disowned
+    \/ Tick /\ moved /\ moved' = FALSE /\ UNCHANGED outs
 
 Spec == Init /\ [][Next]_vars
 
@@ -582,9 +617,17 @@ PitrExact == \A T \in 1..(now - 1) : Pitr(T).ok => Pitr(T).h = hist[T]
 DataKeys(e) == {s.key : s \in SnapOf(e)} \cup {x.key : x \in {y \in objs : y.e = e /\ y.kind = "frame"}}
 CensusSound == Live(man) => \A e \in Retained(man) : DataKeys(e) \subseteq Census(man)
 
-\* An open that reported failure (Fenced, or failed) never has its epoch advance land
-\* later: a rekey reported failed never switched the key (amendment A4).
-OutcomeFinal == Live(man) => man.ver \notin disowned
+\* What an open reports about its epoch advance stays true: one reported failed never
+\* becomes current, and one reported Fenced while the foreign manifest named another
+\* epoch never does either (our PUT can no longer land), so the key a Fenced report names
+\* changes only by a later operation (amendments A4, A9). Keyed on the epoch id, unique
+\* per open: a takeover of our landed epoch is a new version of the same epoch.
+OutcomeFinal == Live(man) => man.e \notin disowned
+
+\* An unclear outcome (indeterminate, or a crash before a clear answer) is resolved only
+\* by a later open's publication (a re-run, amendment A8): after it, the unclear advance
+\* never becomes current. A census read alone resolves nothing ("CensusResolves").
+IndetCensus == Live(man) => man.e \notin settled
 
 \* A key rotated away from is never current again, unless a rekey reused it with
 \* allow_reuse (amendment A3).
@@ -627,6 +670,11 @@ ReuseRefused == \E n \in Node : R[n].res = "retired"
 Reused == \E n \in Node : R[n].res = "reused"
 Adopted == \E n \in Node : R[n].res = "adopted"
 Resent == \E n \in Node : R[n].pc = "resend"
+\* An unclear outcome was resolved by a later open.
+IndetResolved == settled # {}
+\* A rekey reported Fenced although its switch had landed (another writer took over our
+\* epoch): the report names the new key.
+FencedSwitched == \E n \in Node : R[n].op = "rekey" /\ R[n].res = "fenced" /\ R[n].told = R[n].tgt
 LateLanding == inflight # {}
 
 StateConstraint == ctr <= 12
