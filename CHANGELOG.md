@@ -10,6 +10,20 @@
   such table's sequence when it opens the file. Such a file is now opened
   read-write (never created) with `query_only`; the open needs write access
   to the file and its log, and user data isn't changed.
+* `Sediment.S3.import/3` gave the rows of a table with an inline
+  `INTEGER PRIMARY KEY DESC` column new rowids: that column doesn't alias
+  the rowid, and the copy treated it as if it did. Every table's rowids are
+  now copied, and the import compares each table of the new database with
+  the source's (every row with its rowid) and refuses the import, naming
+  the tables, if one differs. A table with columns named `rowid`,
+  `_rowid_` and `oid` is refused.
+* `Sediment.S3.import/3` checks the new database's `AUTOINCREMENT`
+  sequences against the source's `sqlite_sequence` after the copy, and
+  refuses the import, naming the tables, if one is missing or behind.
+  sediment 0.1.0-beta.5 (turso_core 0.8.2) imported a sequence standing at
+  exactly 1 as never used, so the next insert reused id 1 and replaced the
+  row that had it; 0.1.0-beta.6 imports it correctly, and the check refuses
+  any future engine regression of that kind.
 
 ## 0.1.0-beta.6 (2026-10-21)
 
