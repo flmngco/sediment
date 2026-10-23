@@ -100,9 +100,33 @@ fn describe(err: &S3Error) -> String {
 }
 
 /// `{:error, message}`, `{:error, {:key_needed, id}}` for a key a `key_for`
-/// ring must add, or `{:error, {:indeterminate, message}}`.
+/// ring must add, `{:error, {:indeterminate, message}}`, or `{:error,
+/// {:fenced, %{current_key:, fingerprint:, message:}}}` when another
+/// writer's manifest replaced the one an epoch advance held.
 pub fn error_term<'a>(env: Env<'a>, err: &S3Error) -> Term<'a> {
     match err {
+        S3Error::Overtaken { key, .. } => {
+            let pairs = [
+                (
+                    "current_key",
+                    key.as_ref().map(|k| k.id.clone()).encode(env),
+                ),
+                (
+                    "fingerprint",
+                    key.as_ref().map(|k| k.fingerprint.clone()).encode(env),
+                ),
+                ("message", err.to_string().encode(env)),
+            ]
+            .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v));
+            match Term::map_from_pairs(env, &pairs) {
+                Ok(map) => (
+                    crate::atoms::error(),
+                    (Atom::from_str(env, "fenced").unwrap(), map),
+                )
+                    .encode(env),
+                Err(_) => error_tuple(env, describe(err)),
+            }
+        }
         S3Error::KeyNeeded(id) => (
             crate::atoms::error(),
             (crate::atoms::key_needed(), id.as_str()),

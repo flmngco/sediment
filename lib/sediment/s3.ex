@@ -530,10 +530,20 @@ defmodule Sediment.S3 do
        manifest record names the new key, with `If-Match` on its takeover.
 
   A writer that took the database over meanwhile makes the last step fail
-  (`"s3 writer fenced: ..."`) with nothing switched, and keeps everything it
-  committed. A crash or error before it leaves the database under the old
-  key, working; run the rekey again (`force: true`, or after the lease's
-  TTL, when the crashed run still holds it).
+  with `{:error, {:fenced, %{current_key: id, fingerprint: fp, message:
+  message}}}`, naming the key the manifest has now; everything that writer
+  committed is kept. A crash or error before the last step leaves the
+  database under the old key, working.
+
+  **Only `{:ok, _}` is an outcome.** After any other result (fenced,
+  `{:error, {:indeterminate, message}}`, a store error) the switch may have
+  happened, or may still happen: a manifest write in flight can land after
+  the error is reported, and a `key_census/1` taken in between shows the
+  old key. The only way to know is to run `rekey/3` again (`force: true`,
+  or after the lease's TTL, when a crashed run still holds the lease): its
+  takeover ends any write still in flight, and it returns `{:ok, :current}`
+  or completes the rekey. Until a run returns `{:ok, _}`, keep both keys in
+  every ring.
 
   The epoch it ends and every epoch retained then are kept, whatever
   `retain_epochs` is, until `release_key/4`: point-in-time restore still
@@ -556,10 +566,10 @@ defmodule Sediment.S3 do
     * `:allow_reuse` - allow a retired key (see above).
 
   Returns `{:ok, %{from: id, to: id, epoch: epoch}}`, `{:ok, :current}` when
-  the database is under that key already (nothing is written), or
-  `{:error, reason}`. When the publication's answer was lost and the
-  manifest couldn't be read back, the outcome is unknown: `{:error,
-  {:indeterminate, message}}`; `key_census/1` tells which key is current.
+  the database is under that key already (nothing is written),
+  `{:error, {:fenced, map}}`, `{:error, {:indeterminate, message}}` when the
+  publication's answer was lost and the manifest couldn't be read back, or
+  `{:error, message}`. See above: run it again after any error.
   """
   @spec rekey(Path.t(), keyword() | map(), keyword()) ::
           {:ok, %{from: String.t(), to: String.t(), epoch: String.t()} | :current}
@@ -592,7 +602,11 @@ defmodule Sediment.S3 do
   copies under the old key: after a key leaked, purge those too.
 
   Returns `{:ok, %{key: id, epochs: [epoch]}}` (no epochs, and nothing
-  written, when none was under the key) or `{:error, reason}`.
+  written, when none was under the key) or `{:error, reason}`, with the same
+  forms as `rekey/3`'s. As with `rekey/3`, only `{:ok, _}` is an outcome:
+  after an error the release may still happen, so run it again; keep the
+  key in the rings until a run returns `{:ok, _}` and the census no longer
+  lists it.
   """
   @spec release_key(Path.t(), keyword() | map(), String.t(), keyword()) ::
           {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
@@ -628,6 +642,10 @@ defmodule Sediment.S3 do
   (`current: nil` for an unencrypted database), `{:ok, :no_database}`
   when the location holds none (also after `destroy/2`), or
   `{:error, reason}`.
+
+  It is an observation, not a resolution: a rekey or release that returned
+  an error may still switch the manifest after the census read it. Only a
+  re-run of the operation resolves that.
   """
   @spec key_census(keyword() | map()) ::
           {:ok, %{current: String.t() | nil, retained: %{String.t() => [String.t()]}}}

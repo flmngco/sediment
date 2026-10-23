@@ -32,10 +32,12 @@
   writing anything, and refuses an unknown id or another key under the id
   by name. Errors never contain key material.
 * `Sediment.S3.rekey/3` re-encrypts a database page by page under another
-  key of the ring and publishes it as a new epoch (a full snapshot), with
-  `If-Match` on its takeover: a writer that took over meanwhile gets it
-  fenced with nothing switched, and a crash before the publication leaves
-  the old key current. It keeps the epochs it ended (pinned, whatever
+  key of the ring and publishes it as a new epoch (always a full snapshot),
+  with `If-Match` on its takeover: a writer that took over meanwhile gets it
+  fenced (`{:error, {:fenced, %{current_key: ...}}}`), keeping every
+  commit, and a crash before the publication leaves the old key current.
+  Only `{:ok, _}` is an outcome: after any error, run the rekey again, and
+  keep both keys in the rings until it succeeds. It keeps the epochs it ended (pinned, whatever
   `retain_epochs` is) and retires the old key: a rekey back to it needs
   `allow_reuse: true` and its epochs released first.
 * `Sediment.S3.release_key/4` drops the retained epochs under a key and

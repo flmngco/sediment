@@ -172,6 +172,12 @@ pub struct Published {
 /// Uploads the database file at `path` as `epoch`'s snapshot: a delta on
 /// top of `previous` (the current snapshot and the digests of the file it
 /// holds) when that is worth it, else a full snapshot.
+/// Uploads the file at `path` as a full snapshot of `epoch`, never a delta:
+/// the start of a new chain (a rekey's epoch: a chain is under one key).
+pub fn publish_full(remote: &Remote, epoch: Epoch, path: &Path) -> Result<Published> {
+    publish(remote, epoch, path, None)
+}
+
 pub fn publish(
     remote: &Remote,
     epoch: Epoch,

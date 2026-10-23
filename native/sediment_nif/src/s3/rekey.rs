@@ -2,14 +2,15 @@
 //!
 //! Both are a writer open (`super::prepare_fresh`) that changes what the
 //! new epoch is, followed by a clean close. A rekey re-encrypts the folded
-//! database under the new key (the import's logical copy, checked against
-//! the source) and publishes it as a full snapshot: the new epoch, and every
-//! later one, is under the new key, while the retained epochs keep theirs.
-//! A release drops the retained epochs under a key from the history, and GC
-//! deletes their objects. Either switch is the epoch-advance manifest PUT,
-//! `If-Match` on this open's takeover: a writer that took over since gets
-//! the operation fenced with nothing switched, and a crash before it leaves
-//! the database as it was (a re-run starts over).
+//! database page by page under the new key (checked against the source)
+//! and publishes it as a full snapshot: the new epoch, and every later one,
+//! is under the new key, while the retained epochs keep theirs. A release
+//! drops the retained epochs under a key from the history, and GC deletes
+//! their objects. Either switch is the epoch-advance manifest PUT,
+//! `If-Match` on this open's takeover, and a crash before it leaves the
+//! database as it was. Any result but success (fenced, indeterminate, a
+//! store error) is resolved only by running the operation again: its
+//! takeover ends a PUT still in flight.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -228,8 +228,13 @@ defmodule Sediment.S3RotationTest do
     insert(s3, dir, ["r1"], "during")
 
     Native.s3_test_hook(s3, "publish", :release)
-    assert {:error, message} = Task.await(task, 30_000)
-    assert message =~ "fenced"
+    # Fenced, naming the key the manifest has now; only a re-run resolves it.
+    assert {:error, {:fenced, %{current_key: "r1", fingerprint: fingerprint, message: message}}} =
+             Task.await(task, 30_000)
+
+    assert is_binary(fingerprint)
+    assert refute_keys(message) =~ "s3 writer fenced"
+    assert {:ok, :current} = S3.rekey(Path.join(dir, "r.db"), s3, encryption: ring(["r1", "r2"]))
     assert {:ok, %{current: "r1", retained: %{}}} = S3.key_census(s3)
     db = open!(Path.join(dir, "check.db"), s3, ["r1"])
     assert rows(db) == ["before", "during"]

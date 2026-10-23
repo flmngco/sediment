@@ -520,12 +520,18 @@ fn prepare_under_lease(
             }
             let epoch = manifest.epoch.next(generation);
             let record = manifest.current();
-            let published = snapshot::publish(
-                &remote,
-                epoch,
-                local_path,
-                restored.as_ref().map(|d| (&record, d)),
-            )?;
+            let published = if target.is_some() {
+                // A delta never spans two keys: the new key's epoch starts
+                // a new chain, whatever the delta heuristic would pick.
+                snapshot::publish_full(&remote, epoch, local_path)?
+            } else {
+                snapshot::publish(
+                    &remote,
+                    epoch,
+                    local_path,
+                    restored.as_ref().map(|d| (&record, d)),
+                )?
+            };
             let key = target.or(key);
             let mut fresh = manifest.advance(
                 epoch,
@@ -706,29 +712,22 @@ fn publish_manifest(
             {
                 last = format!("{err}, and the manifest is still the one this open holds");
             }
-            // Another writer's manifest that still names our epoch: ours
-            // landed, and that writer took over after it.
-            Ok(Some(object))
-                if Manifest::decode(&object.bytes).is_ok_and(|current| {
-                    current
-                        .retained()
-                        .any(|record| record.epoch == manifest.epoch)
-                }) =>
-            {
-                return Err(S3Error::Fenced(format!(
-                    "this open's manifest (epoch {}, key {}) landed, then another writer took \
-                     the database over",
-                    manifest.epoch,
-                    manifest.key.as_ref().map_or("none", |key| key.id.as_str())
-                )))
-            }
-            Ok(_) => {
-                return Err(fenced_on_conflict(match err {
-                    S3Error::Conflict(msg) => S3Error::Conflict(msg),
-                    other => {
-                        S3Error::Conflict(format!("{other}, and the manifest is another writer's"))
-                    }
-                }))
+            // Another writer moved the manifest: ours can't land anymore, but
+            // it may have landed before (and that writer taken over after
+            // it). Say which key the manifest names now.
+            Ok(foreign) => {
+                let key = foreign
+                    .and_then(|object| Manifest::decode(&object.bytes).ok())
+                    .and_then(|current| current.key);
+                return Err(S3Error::Overtaken {
+                    message: format!(
+                        "{err}; another writer has the database now (its manifest names key \
+                         {}), and this open's write of epoch {} may have landed before it",
+                        key.as_ref().map_or("none", |key| key.id.as_str()),
+                        manifest.epoch
+                    ),
+                    key,
+                });
             }
             Err(read) => last = format!("{err}, and reading it back failed too ({read})"),
         }

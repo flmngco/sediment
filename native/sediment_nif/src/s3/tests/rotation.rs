@@ -437,8 +437,19 @@ fn a_takeover_during_a_rekey_fences_it_with_nothing_switched_and_no_commit_lost(
     drop(other);
 
     hook::release(&both.place());
-    let message = err_text(run.join().unwrap());
-    assert!(message.contains("fenced"), "{message}");
+    // Fenced, naming the key the manifest has now (this rekey's write could
+    // have landed first: only a re-run tells).
+    match run.join().unwrap() {
+        Err(err @ S3Error::Overtaken { .. }) => {
+            let S3Error::Overtaken { key, .. } = &err else {
+                unreachable!()
+            };
+            assert_eq!(key.as_ref().unwrap(), &key_as("r1", "11").record());
+            let message = err_text(Err::<(), _>(err));
+            assert!(message.contains("names key r1"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
     let m = manifest(&store);
     assert_eq!(m.key.as_ref().unwrap().id, "r1");
     assert!(m.retired_keys.is_empty());
@@ -583,4 +594,51 @@ fn manifests_of_older_versions_are_refused_clearly() {
         .unwrap();
     let message = err_text(open_encrypted(&cfg, &dir.db("old.db")).map(drop));
     assert!(message.contains("manifest version 2 was written by sediment 0.1.0-beta.6 or older"));
+}
+
+#[test]
+fn a_rekey_publishes_a_full_snapshot_and_later_deltas_chain_on_it_only() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = dir.db("a.db");
+    let mut cfg = seeded(&store, &dir, &["a"]);
+    cfg.retain_epochs = 3;
+    // A chain under r1 first: a file large enough for small changes to
+    // be deltas.
+    let db = open_encrypted(&cfg, &path).unwrap();
+    db.exec("CREATE TABLE pad(x BLOB)").unwrap();
+    for _ in 0..8 {
+        db.exec("INSERT INTO pad SELECT randomblob(1000) FROM generate_series(1, 100)")
+            .unwrap();
+    }
+    db.checkpoint();
+    for i in 0..3 {
+        db.exec(&format!("INSERT INTO t (v) VALUES ('{i}')"))
+            .unwrap();
+        db.checkpoint();
+    }
+    drop(db);
+    assert!(!manifest(&store).snapshot_base.is_empty(), "r1 has a chain");
+
+    let mut both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    both.retain_epochs = 3;
+    rekey(&both, &path, None, false, false).unwrap();
+    let rekeyed = manifest(&store);
+    assert!(rekeyed.snapshot.ends_with(".db"), "{}", rekeyed.snapshot);
+    assert!(rekeyed.snapshot_base.is_empty());
+
+    let db = open_encrypted(&both, &path).unwrap();
+    db.exec("INSERT INTO t (v) VALUES ('after')").unwrap();
+    db.checkpoint();
+    drop(db);
+    let m = manifest(&store);
+    let chain = m.current().chain();
+    assert!(m.snapshot.ends_with(".delta"), "{}", m.snapshot);
+    assert_eq!(
+        chain[0].key, rekeyed.snapshot,
+        "the chain starts at the rekey"
+    );
+    assert_eq!(m.key.as_ref().unwrap().id, "r2");
+    let db = open_encrypted(&both, &dir.db("b.db")).unwrap();
+    assert_eq!(db.int("SELECT count(*) FROM t"), 5);
 }

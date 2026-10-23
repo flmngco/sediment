@@ -401,10 +401,12 @@ followed by a clean close:
    wrote is in it), and every page's plaintext must hash like the old
    file's. A cipher change is refused: both keys use the same reserved
    bytes per page.
-3. The file replaces the local copy and is uploaded as a full snapshot (a
-   delta never spans two keys), and the epoch-advance manifest names the
-   new key. That PUT is `If-Match` on the takeover: a writer that took over
-   since gets the rekey fenced with nothing switched, and its commits stay.
+3. The file replaces the local copy and is uploaded as a full snapshot,
+   explicitly, not by the delta heuristic (a chain never spans two keys),
+   and the epoch-advance manifest names the new key. That PUT is `If-Match`
+   on the takeover: a writer that took over since gets the rekey fenced,
+   and its commits stay (see "Lost answers on the epoch advance" for what
+   a fenced rekey can and can't tell).
 4. The clean close leaves the copy warm under the new key.
 
 Nothing the database uses changes before step 3's manifest PUT: a crash
@@ -429,8 +431,16 @@ hold (our takeover) means the PUT may still be in flight, so the same body
 is sent again on that version; another writer's manifest means ours can't
 land anymore (fenced; if that manifest still names our epoch, ours landed
 first and the message says so). Still the version held, or unreadable,
-after 4 attempts: `Indeterminate` (`{:error, {:indeterminate, ...}}`), and
-`key_census/1` tells which key is current. The model's `OutcomeFinal`
+after 4 attempts: `Indeterminate` (`{:error, {:indeterminate, ...}}`).
+Another writer's manifest gives `Overtaken` (`{:error, {:fenced,
+%{current_key: ..., fingerprint: ...}}}` from a rekey or release), naming
+the key that manifest records; it doesn't tell whether ours landed before
+it (with `retain_epochs` 0 an overtaking writer may already have trimmed
+our epoch from the history). So any result of a rekey or release but
+`{:ok, _}` is resolved only by running it again: its takeover ends any PUT
+still in flight, and it then returns `:current` or completes. A
+`key_census/1` in between observes, and resolves nothing; both keys stay in
+every ring until a re-run succeeds. The model's `OutcomeFinal`
 checks that no advance an open reported as failed ever becomes the
 manifest (`NegKrFailUnlanded`).
 

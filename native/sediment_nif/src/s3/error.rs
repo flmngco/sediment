@@ -29,6 +29,12 @@ pub enum S3Error {
     /// `key_for`) doesn't hold yet: the caller adds it and opens again.
     /// Returned before anything was written to S3 but the lease.
     KeyNeeded(String),
+    /// Fenced at an epoch advance: another writer's manifest is in place,
+    /// naming `key`. This open's advance may have landed before it.
+    Overtaken {
+        message: String,
+        key: Option<super::keys::KeyRecord>,
+    },
     /// A manifest PUT whose outcome is unknown: it failed, and the manifest
     /// couldn't be read back to tell whether it landed.
     Indeterminate(String),
@@ -70,6 +76,7 @@ impl fmt::Display for S3Error {
             S3Error::Turso(msg) => write!(f, "s3 bootstrap: {msg}"),
             S3Error::Timeout(msg) => write!(f, "{msg}"),
             S3Error::Lost(msg) => write!(f, "{msg}"),
+            S3Error::Overtaken { message, .. } => write!(f, "s3 writer fenced: {message}"),
             S3Error::Indeterminate(msg) => write!(f, "s3 indeterminate: {msg}"),
             S3Error::KeyNeeded(id) => {
                 write!(f, "s3 config: needs key {id}, which is not in the ring")
