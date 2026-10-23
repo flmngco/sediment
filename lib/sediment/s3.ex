@@ -517,7 +517,9 @@ defmodule Sediment.S3 do
   `path` is a local working copy (like an open's path; the database's files
   there are replaced). The rekey is a writer open that re-encrypts what it
   restored, then a clean close, which leaves the copy warm under the new
-  key, so the next open of `path` downloads nothing. It:
+  key, so the next open of `path` downloads nothing. Stop the pool (every
+  writer) first rather than letting it fail meanwhile: opens of `path` wait
+  on its lock until the rekey ends, each holding a dirty I/O scheduler. It:
 
     1. takes the writer lease; like `destroy/2`, it refuses while the
        database is open in this VM, and any unexpired lease (this owner's

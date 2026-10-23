@@ -73,9 +73,18 @@ pub fn decode_ring(term: Term<'_>) -> Result<Option<s3::KeyRing>, String> {
         S3Error::Config(message) => format!("encryption: {message}"),
         other => other.to_string(),
     };
+    // An entry is named by its position: its id isn't checked yet.
     let keys = entries
         .iter()
-        .map(|(id, cipher, hex)| s3::Key::new(id, cipher, hex))
+        .enumerate()
+        .map(|(i, (id, cipher, hex))| {
+            s3::Key::new(id, cipher, hex).map_err(|err| match err {
+                S3Error::Config(message) => {
+                    S3Error::Config(format!("ring entry {}: {message}", i + 1))
+                }
+                other => other,
+            })
+        })
         .collect::<s3::Result<Vec<_>>>()
         .map_err(invalid)?;
     s3::KeyRing::new(keys, active, resolvable)

@@ -151,6 +151,35 @@ defmodule Sediment.S3KeysTest do
     GenServer.stop(pool)
   end
 
+  test "an entry given as {key, id} is refused without showing the key" do
+    # aegis256: a 64-hex key in the id's place; aes128gcm: a 32-hex key,
+    # which is a valid id.
+    for {cipher, key} <- [{"aegis256", @k1}, {"aes128gcm", String.slice(@k2, 0, 32)}] do
+      ring = [keys: [{key, "r2"}], cipher: cipher]
+      secrets = [key, String.slice(key, 0, 16)]
+
+      assert {:error, message} = Engine.open(Temp.path!(), encryption: ring)
+      assert message =~ "ring entry 1"
+      for secret <- secrets, do: refute(message =~ secret)
+
+      assert {:error, %Sediment.Error{message: message}} =
+               Sediment.Connection.connect(database: Temp.path!(), encryption: ring)
+
+      for secret <- secrets, do: refute(message =~ secret)
+
+      # A pool logs every failed connect.
+      log =
+        ExUnit.CaptureLog.capture_log([level: :error], fn ->
+          {:ok, pool} = Sediment.start_link(database: Temp.path!(), encryption: ring)
+          Process.sleep(300)
+          GenServer.stop(pool)
+        end)
+
+      assert log =~ "ring entry 1"
+      for secret <- secrets, do: refute(log =~ secret)
+    end
+  end
+
   test "an invalid key is named by its id, never shown" do
     for bad <- [String.slice(@k1, 0, 62), String.duplicate("zz", 32)] do
       assert {:error, message} =

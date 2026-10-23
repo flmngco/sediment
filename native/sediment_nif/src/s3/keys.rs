@@ -43,20 +43,23 @@ impl std::fmt::Debug for Key {
 
 impl Key {
     /// Checks the id, the cipher and the key (hex, of the cipher's size).
-    /// Errors name the id, never the key.
+    /// Errors never show the key, nor an id that could be one (see
+    /// [`named`]).
     pub fn new(id: &str, cipher: &str, hexkey: &str) -> Result<Self> {
         check_id(id)?;
         let mode = turso_core::CipherMode::try_from(cipher)
-            .map_err(|_| S3Error::Config(format!("key {id}: unknown cipher {cipher:?}")))?;
+            .map_err(|_| S3Error::Config(format!("{}: unknown cipher {cipher:?}", named(id))))?;
         let size = mode.required_key_size();
         let bytes = decode_hex(hexkey).ok_or_else(|| {
             S3Error::Config(format!(
-                "key {id}: must be hex encoded (an even number of 0-9a-f digits)"
+                "{}: must be hex encoded (an even number of 0-9a-f digits)",
+                named(id)
             ))
         })?;
         if bytes.len() != size {
             return Err(S3Error::Config(format!(
-                "key {id}: {mode} needs a {size}-byte key ({} hex characters), got {} bytes",
+                "{}: {mode} needs a {size}-byte key ({} hex characters), got {} bytes",
+                named(id),
                 2 * size,
                 bytes.len()
             )));
@@ -126,8 +129,20 @@ impl Key {
     }
 }
 
-/// Key ids: short, lowercase, safe in messages and file names.
-fn check_id(id: &str) -> Result<()> {
+/// `key <id>` for a message about a key that was refused, unless the id
+/// could be key material: an entry given as `{key, id}` has its key as the
+/// id, and an AES-128 key (32 hex digits) is a valid id.
+fn named(id: &str) -> String {
+    if id.len() >= 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        "a key whose id looks like a key (an entry given as {key, id}?)".into()
+    } else {
+        format!("key {id}")
+    }
+}
+
+/// Key ids: short, lowercase, safe in messages and file names. The error
+/// never shows the id refused: it may be a key given in its place.
+pub(crate) fn check_id(id: &str) -> Result<()> {
     let mut bytes = id.bytes();
     let first_ok = bytes
         .next()
@@ -137,8 +152,14 @@ fn check_id(id: &str) -> Result<()> {
     if first_ok && rest_ok && id.len() <= 32 {
         Ok(())
     } else {
+        let swapped = if id.len() >= 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            " (it looks like a key: an entry given as {key, id}?)"
+        } else {
+            ""
+        };
         Err(S3Error::Config(format!(
-            "invalid key id {id:?}: ids match [a-z0-9][a-z0-9_-]{{0,31}}"
+            "invalid key id ({} characters){swapped}: ids match [a-z0-9][a-z0-9_-]{{0,31}}",
+            id.chars().count()
         )))
     }
 }
@@ -321,6 +342,29 @@ mod tests {
             assert!(!message.contains(secret), "{message}");
         }
         message
+    }
+
+    #[test]
+    fn an_entry_given_as_key_then_id_never_shows_the_key() {
+        // aegis256: the 64-hex key in the id's place is not a valid id.
+        let message = err(Key::new(A, "aegis256", "r2"));
+        assert!(
+            message.contains("invalid key id (64 characters)"),
+            "{message}"
+        );
+        assert!(message.contains("{key, id}"), "{message}");
+        // aes128gcm: the 32-hex key is a valid id; the hex check fails on "r2".
+        let message = err(Key::new(&A[..32], "aes128gcm", "r2"));
+        assert!(!message.contains(&A[..32]), "{message}");
+        assert!(message.contains("must be hex encoded"), "{message}");
+        assert!(message.contains("{key, id}"), "{message}");
+        let message = err(Key::new(&A[..32], "aes128gcm", "abab"));
+        assert!(message.contains("16-byte key"), "{message}");
+        // Neither cipher's error names the rejected id.
+        for id in ["R1", "-r", &A[..40]] {
+            let message = err(Key::new(id, "aegis256", B));
+            assert!(!message.contains(id), "{message}");
+        }
     }
 
     #[test]

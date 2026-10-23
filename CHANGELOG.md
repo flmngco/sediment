@@ -42,7 +42,8 @@
   by key under any id, needs `allow_reuse: true` and its epochs released
   first. Like `destroy/2`, it refuses while the database is open in this
   VM; it also refuses while its local file is (without `:s3`, or with
-  another prefix).
+  another prefix). Stop the pool first: opens of the path wait until the
+  rekey ends.
 * `Sediment.S3.release_key/4` drops the retained epochs under a key and
   deletes their objects; it refuses the current key.
   `Sediment.S3.key_census/1` reads which keys a database still depends on.
@@ -62,6 +63,9 @@
 
 ### Fixed
 
+* A key ring entry given as `{key, id}` is refused without showing the
+  key: errors about a ring entry name it by its position, and never show
+  an id that was refused or that could be a key.
 * A pool (`Sediment.start_link/1`, `Sediment.child_spec/1`) and a
   connection's state keep the `:encryption` option hidden: crash and
   termination reports, `:sys.get_status/1` and `inspect` show

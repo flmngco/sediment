@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use turso_core::{PlatformIO, IO};
 
-use super::keys::Key;
+use super::keys::{check_id, Key};
 use super::{
     destroy, layout::Epoch, prepare_fresh, refuse_symlink, restore, Fresh, Op, Result, S3Config,
     S3Error,
@@ -52,6 +52,9 @@ pub fn rekey(
     force: bool,
     allow_reuse: bool,
 ) -> Result<Rekeyed> {
+    if let Some(to) = to {
+        check_id(to)?;
+    }
     let op = Op::Rekey {
         to: to.map(str::to_string),
         force,
@@ -74,6 +77,7 @@ pub fn rekey(
 /// history (point-in-time restore no longer reaches them), so the key can
 /// leave the ring. Refuses the current key.
 pub fn release_key(cfg: &S3Config, local_path: &Path, key: &str, force: bool) -> Result<Released> {
+    check_id(key)?;
     let op = Op::Release {
         key: key.to_string(),
         force,
