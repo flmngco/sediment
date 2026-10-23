@@ -323,7 +323,11 @@ instead of faking it.
 * **Read-only connections.** Turso shares one database instance per file in
   the VM. A read-only open of a file that is already open read-write is
   enforced per connection (`query_only`); writes fail with
-  `"attempt to write a readonly database"` as in SQLite.
+  `"attempt to write a readonly database"` as in SQLite. turso_core 0.8.3
+  rewrites the `AUTOINCREMENT` sequences of an MVCC database when it opens
+  one, which a read-only open refuses; such a file is opened read-write
+  (never created) with `query_only`, so a `:readonly` open of it needs
+  write access to the file and its log. User data isn't changed.
 * **`close/1` finalizes the connection's prepared statements**, so it
   releases the database, its file locks and an S3 lease right away even if
   statement references are still alive (for example cached by Ecto in client

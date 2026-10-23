@@ -537,6 +537,40 @@ defmodule Sediment.S3Test do
     :ok = Engine.close(db)
   end
 
+  defp rows(db, sql) do
+    {:ok, stmt} = Engine.prepare(db, sql)
+    {:ok, rows} = Engine.fetch_all(db, stmt)
+    :ok = Engine.release(db, stmt)
+    rows
+  end
+
+  # turso_core 0.8.3's MVCC open writes the AUTOINCREMENT sequences, so the
+  # read-only open of a restored copy failed: "attempt to write a readonly
+  # database".
+  test "a restored copy with AUTOINCREMENT rows opens read-only", %{s3: s3, dir: dir} do
+    for enc <- [false, [cipher: "aegis256", key: S3.generate_key()]] do
+      s3 =
+        s3
+        |> Keyword.delete(:encryption)
+        |> Keyword.put(:prefix, s3[:prefix] <> "-#{enc != false}")
+
+      {:ok, db} = Engine.open(Path.join(dir, "live-#{enc != false}.db"), s3: s3, encryption: enc)
+      :ok = Engine.execute(db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+      :ok = Engine.execute(db, "INSERT INTO t (v) VALUES ('a'), ('b')")
+      :ok = Engine.close(db)
+
+      copy = Path.join(dir, "copy-#{enc != false}.db")
+      {:ok, _} = S3.restore(copy, s3, encryption: enc)
+      {:ok, ro} = Engine.open(copy, mode: :readonly, encryption: enc)
+      assert rows(ro, "SELECT id, v FROM t ORDER BY id") == [[1, "a"], [2, "b"]]
+
+      assert {:error, "attempt to write a readonly database"} =
+               Engine.execute(ro, "INSERT INTO t (v) VALUES ('c')")
+
+      :ok = Engine.close(ro)
+    end
+  end
+
   test "restore refuses to replace an existing file, a running writer's database included",
        %{s3: s3, dir: dir} do
     live = Path.join(dir, "live.db")

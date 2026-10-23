@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* `Sediment.Engine.open(path, mode: :readonly)` of an MVCC database with
+  rows in an `AUTOINCREMENT` table (a restored S3 copy, say) failed with
+  "attempt to write a readonly database": turso_core 0.8.3 rewrites each
+  such table's sequence when it opens the file. Such a file is now opened
+  read-write (never created) with `query_only`; the open needs write access
+  to the file and its log, and user data isn't changed.
+
 ## 0.1.0-beta.6 (2026-10-21)
 
 ### Engine
