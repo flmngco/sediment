@@ -240,14 +240,10 @@ defmodule Sediment do
     ring = Sediment.S3.Keys.normalize(opts[:encryption])
 
     Sediment.Telemetry.span([:export], %{source: source, dest: dest}, fn ->
-      ring
-      |> export_ring(from_s3)
-      |> Sediment.S3.Keys.native()
-      |> then(fn ring ->
-        Sediment.S3.Keys.scrubbed(fn ->
-          Sediment.Native.export_sqlite(source, dest, from_s3, ring, opts[:drop_fts] == true)
-        end)
-      end)
+      ring = ring |> export_ring(from_s3) |> Sediment.S3.Keys.native()
+      drop_fts = opts[:drop_fts] == true
+      export = fn -> Sediment.Native.export_sqlite(source, dest, from_s3, ring, drop_fts) end
+      Sediment.S3.Keys.scrubbed(export)
     end)
   end
 
