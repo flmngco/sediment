@@ -350,6 +350,13 @@ impl KeyRing {
     }
 }
 
+/// A fingerprint as messages and results show it: its first 16 hex digits
+/// (64 bits, enough to tell keys apart), so no message holds a run of 32
+/// hex digits, which the net ([`crate::redact`]) would take for a key.
+pub fn short_fingerprint(fingerprint: &str) -> &str {
+    fingerprint.get(..16).unwrap_or(fingerprint)
+}
+
 /// The ring's key under the recorded id must be the recorded key.
 pub fn check_matches(key: &Key, record: &KeyRecord) -> Result<()> {
     if key.fingerprint != record.fingerprint {
@@ -357,8 +364,8 @@ pub fn check_matches(key: &Key, record: &KeyRecord) -> Result<()> {
             "key {} in the ring is not the key that encrypted this database (fingerprint {}, \
              recorded {})",
             shown(&record.id),
-            key.fingerprint,
-            record.fingerprint
+            short_fingerprint(&key.fingerprint),
+            short_fingerprint(&record.fingerprint)
         )));
     }
     if key.cipher != record.cipher {
@@ -526,7 +533,12 @@ mod tests {
         .unwrap();
         let message = err(swapped.resolve(&a.record()));
         assert!(message.contains("key r1 in the ring is not the key that encrypted this database"));
-        assert!(message.contains(a.fingerprint()) && message.contains(b.fingerprint()));
+        assert!(
+            message.contains(short_fingerprint(a.fingerprint()))
+                && message.contains(short_fingerprint(b.fingerprint()))
+                && !message.contains(a.fingerprint()),
+            "{message}"
+        );
         let lazy = KeyRing::new(vec![], Some("r2".into()), true).unwrap();
         assert!(matches!(lazy.active(), Err(S3Error::KeyNeeded(id)) if id == "r2"));
         assert!(matches!(lazy.resolve(&a.record()), Err(S3Error::KeyNeeded(id)) if id == "r1"));

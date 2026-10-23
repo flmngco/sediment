@@ -8,6 +8,10 @@ defmodule Sediment do
   equivalent to `Exqlite.Sqlite3`.
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed, except: [transaction: 3]
+
   alias Sediment.Connection
   alias Sediment.Error
   alias Sediment.Query
@@ -170,7 +174,33 @@ defmodule Sediment do
           {:ok, result} | {:error, any}
         when result: var
   def transaction(conn, fun, opts \\ []) do
+    # Not sealed (see Sediment.S3.Keys.Sealed): `fun`'s exceptions are the
+    # caller's own. Its arguments are checked in the boundary first.
+    Sediment.S3.Keys.scrubbed(fn ->
+      Sediment.S3.Keys.options!(opts, "Sediment.transaction/3")
+      check_conn!(conn, "Sediment.transaction/3")
+
+      unless is_function(fun, 1),
+        do: raise(ArgumentError, "Sediment.transaction/3: expects a function of one argument")
+    end)
+
     DBConnection.transaction(conn, fun, opts)
+  end
+
+  # A pool, or the connection of a transaction or run, alive: DBConnection's
+  # exits for a name with no process carry the name.
+  defp check_conn!(%DBConnection{}, _call), do: :ok
+  defp check_conn!(pid, _call) when is_pid(pid), do: :ok
+
+  defp check_conn!(conn, call) do
+    case GenServer.whereis(conn) do
+      nil ->
+        raise ArgumentError,
+              "#{call}: no process #{Sediment.S3.Keys.shown_value(conn)}"
+
+      _found ->
+        :ok
+    end
   end
 
   @doc """

@@ -237,7 +237,7 @@ Cost: one PUT plus one HEAD per commit.
 turso's Database and its files are closed) leaves `.<name>.s3-warm` when
 everything committed is in S3 (upload queue empty, not poisoned, no recorded
 loss, no snapshot pending, the epoch is the manifest's, the lease never
-lapsed): `{version: 2, database_id, generation, epoch, log_len, log_end_crc,
+lapsed): `{version: 3, database_id, generation, epoch, log_len, log_end_crc,
 db_size, db_crc32c, db_sha256, log_sha256, key_fingerprint}` (version 3). A
 sidecar of another version (version 1 had no SHA-256, version 2 no key
 fingerprint) is never reused. It syncs the database file and the
@@ -251,8 +251,13 @@ may meet a sidecar written after its takeover: the sidecar is only a hint,
 and the checks below reject it (its generation is older than the manifest's,
 and the content checks fail too).
 
-An open takes the sidecar (reads and deletes it, syncs the directory) before
-anything touches the local files. After its takeover, it reuses the copy only
+An open reads the sidecar first, and deletes it (and syncs the directory)
+only once it goes ahead: under the lease, after resolving the key and
+deciding it has something to do (not a `KeyNeeded` round of a `key_for`
+ring, a rekey to the current key or a release with nothing to drop), and
+before its takeover PUT and anything that touches the local files. A run
+that stops earlier leaves the files untouched, so the sidecar still
+describes them. After its takeover, the open reuses the copy only
 if the manifest it took over has the sidecar's `database_id`, generation and
 epoch; the key the open resolved has the sidecar's fingerprint (and the
 manifest's); the database file's size and CRC32C are
@@ -369,7 +374,7 @@ takes the key with that id from its ring; the ring's key must have the
 recorded fingerprint. Otherwise it fails before writing anything but the
 lease, naming the id ("unknown key id r1 (ring: r2, r3)", "key r1 in the
 ring is not the key that encrypted this database (fingerprint X, recorded
-Y)"). A ring with `key_for` instead returns `KeyNeeded(id)` there; Elixir
+Y)", fingerprints by their first 16 hex digits). A ring with `key_for` instead returns `KeyNeeded(id)` there; Elixir
 asks `key_for` for the key, adds it and opens again (at most 3 times), so
 the decision is always taken under a lease, from a manifest read under it.
 The storage keeps the resolved key: the log's encryption context, the
@@ -444,7 +449,13 @@ the key that manifest records; it doesn't tell whether ours landed before
 it (with `retain_epochs` 0 an overtaking writer may already have trimmed
 our epoch from the history). So any result of a rekey or release but
 `{:ok, _}` is resolved only by running it again: its takeover ends any PUT
-still in flight, and it then returns `:current` or completes. A
+still in flight, and it then returns `:current` or completes. A re-run that
+finds nothing to do (`:current`, or a release with no epoch left under the
+key) returns before any takeover, and needs none: a manifest PUT that could
+still land is `If-Match` on the version that re-run just read, so only an
+operation that took that version over can have sent it, and when that
+version already names the target, that operation was an open, which keeps
+the key. A
 `key_census/1` in between observes, and resolves nothing; both keys stay in
 every ring until a re-run succeeds. The model's `OutcomeFinal`
 checks that no advance an open reported as failed ever becomes the

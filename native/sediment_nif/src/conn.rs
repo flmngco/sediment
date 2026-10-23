@@ -514,8 +514,9 @@ pub fn ok_tuple<'a, T: Encoder>(env: Env<'a>, value: T) -> Term<'a> {
     (atoms::ok(), value).encode(env)
 }
 
-pub fn error_tuple<'a, T: Encoder>(env: Env<'a>, reason: T) -> Term<'a> {
-    (atoms::error(), reason).encode(env)
+/// `{:error, reason}`, its text through the net ([`crate::redact`]).
+pub fn error_tuple<'a, T: crate::redact::Reason>(env: Env<'a>, reason: T) -> Term<'a> {
+    (atoms::error(), reason.encode_reason(env)).encode(env)
 }
 
 pub fn closed(env: Env<'_>) -> Term<'_> {

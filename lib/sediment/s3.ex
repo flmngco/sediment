@@ -88,7 +88,10 @@ defmodule Sediment.S3 do
   after taking the lease and before writing anything, and refuses
   `"unknown key id r1 (ring: r2, r3)"`, or `"key r1 in the ring is not the
   key that encrypted this database (fingerprint ..., recorded ...)"` when the
-  ring holds another key under the id. Errors never contain key material.
+  ring holds another key under the id (messages show fingerprints by their
+  first 16 hex digits). Errors never contain key material: besides naming
+  keys by id, every error Sediment returns or raises has each run of 32 or
+  more hex digits replaced by `<redacted>`.
   See "Rotating keys" in the S3 guide for `rekey/3`, `release_key/4` and
   `key_census/1`.
 
@@ -134,6 +137,10 @@ defmodule Sediment.S3 do
 
   See `docs/s3-durability.md` for the design.
   """
+
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed
 
   require Logger
 
@@ -742,7 +749,7 @@ defmodule Sediment.S3 do
       # Another node's process: DBConnection reaches it as usual.
       pid when is_pid(pid) -> :ok
       {_name, _node} -> :ok
-      nil -> raise ArgumentError, "#{call(op)}: no process #{inspect(conn)}"
+      nil -> raise ArgumentError, "#{call(op)}: no process #{Keys.shown_value(conn)}"
     end
   end
 
@@ -755,12 +762,12 @@ defmodule Sediment.S3 do
       {:supervisor, Ecto.Repo.Supervisor, _arity} ->
         raise ArgumentError,
               "#{call(op)} expects a db reference or a DBConnection pool, got the Ecto repo " <>
-                "#{inspect(conn)}: use the adapter's s3_* functions (Ecto.Adapters.Sediment), " <>
+                "#{Keys.shown_value(conn)}: use the adapter's s3_* functions (Ecto.Adapters.Sediment), " <>
                 "or pass Ecto.Adapter.lookup_meta(repo).pid"
 
       _ ->
         raise ArgumentError,
-              "#{call(op)} expects a db reference or a DBConnection pool, got #{inspect(conn)}"
+              "#{call(op)} expects a db reference or a DBConnection pool, got #{Keys.shown_value(conn)}"
     end
   end
 

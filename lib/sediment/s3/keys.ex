@@ -239,42 +239,118 @@ defmodule Sediment.S3.Keys do
   end
 
   @doc false
-  # Every public function taking keys (`:encryption`, `:source_encryption`,
-  # S3 options) runs all of its argument handling and its NIF call in here:
-  # no exception raised meanwhile can carry an argument. Each stack frame's
-  # arguments are replaced by their count (a function clause that doesn't
-  # match a map of options, or a NIF that can't decode an argument, puts
-  # them all, key rings and S3 credentials included, in the top frame,
-  # which consoles, crash reports and error trackers would show). Only
-  # Sediment's own exceptions keep their message (see `ours?/2`); any other
-  # (a FunctionClauseError, KeyError or MatchError holds the value it
-  # failed on) becomes an ArgumentError naming only its type.
+  # The boundary every public function of Sediment runs in (see
+  # Sediment.S3.Keys.Sealed), from its argument handling to its NIF calls:
+  #
+  #   * an exception raised meanwhile loses its stack frames' arguments (a
+  #     function clause that doesn't match a map of options, or a NIF that
+  #     can't decode an argument, puts them all, key rings and S3
+  #     credentials included, in the top frame, which consoles, crash
+  #     reports and error trackers would show);
+  #   * only Sediment's own exceptions (see `passes?/2`) keep their message;
+  #     any other (a FunctionClauseError, KeyError or MatchError holds the
+  #     value it failed on) becomes an ArgumentError naming only its type;
+  #   * the net: in what passes (an exception, an exit's reason, an
+  #     `{:error, reason}` result), every run of 32 or more hex digits is
+  #     replaced by "<redacted>". Keys are hex, so a key echoed anywhere,
+  #     now or by a future message, never leaves. Nothing Sediment shows
+  #     legitimately is such a run (fingerprints show 16 hex digits).
+  #
+  # Throws pass untouched (a transaction's rollback is one).
   @spec scrubbed((-> result)) :: result when result: term()
   def scrubbed(fun) do
-    fun.()
+    case fun.() do
+      {:error, reason} -> {:error, redact(reason)}
+      result -> result
+    end
   rescue
     exception ->
       stacktrace = __STACKTRACE__
-      safe = if ours?(exception, stacktrace), do: exception, else: withheld(exception)
+      safe = if passes?(exception, stacktrace), do: redact(exception), else: withheld(exception)
       reraise safe, Enum.map(stacktrace, &scrub_frame/1)
+  catch
+    :exit, reason -> exit(redact(reason))
   end
 
-  # Raised by Sediment's own code, whose messages never show a value: a
-  # key ring's errors (normalization, a failed key_for) and the
-  # ArgumentErrors, RuntimeErrors and Sediment.Errors raised in a module of
-  # Sediment's (a NIF's badarg is raised in Sediment.Native, with the plain
-  # message "argument error").
-  defp ours?(%type{message: "encryption: " <> _}, _stacktrace)
+  @doc false
+  # `term` with every run of 32 or more hex digits in its strings and atoms
+  # replaced by "<redacted>", its shape kept.
+  @spec redact(term()) :: term()
+  def redact(binary) when is_binary(binary),
+    do: Regex.replace(~r/[0-9a-fA-F]{32,}/, binary, "<redacted>")
+
+  def redact(atom) when is_atom(atom) and atom not in [nil, true, false] do
+    string = Atom.to_string(atom)
+
+    case redact(string) do
+      ^string -> atom
+      redacted -> String.to_atom(redacted)
+    end
+  end
+
+  def redact(list) when is_list(list), do: redact_list(list)
+
+  def redact(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> redact() |> List.to_tuple()
+
+  def redact(%module{} = struct) do
+    struct |> Map.from_struct() |> redact() |> Map.put(:__struct__, module)
+  end
+
+  def redact(map) when is_map(map), do: Map.new(map, fn {k, v} -> {redact(k), redact(v)} end)
+  def redact(other), do: other
+
+  defp redact_list([head | tail]) when is_list(tail), do: [redact(head) | redact_list(tail)]
+  defp redact_list([head | tail]), do: [redact(head) | redact(tail)]
+  defp redact_list([]), do: []
+
+  @doc false
+  # A value a caller gave, as a message names it (a mode, a parameter, a
+  # repo, a process name): an atom, a string or a number as inspect shows
+  # it, unless it could be a key (a run of 32 or more hex digits); anything
+  # else by its type only (a term can hold a key anywhere).
+  @spec shown_value(term()) :: String.t()
+  def shown_value(term)
+      when is_atom(term) or is_binary(term) or is_number(term) or is_pid(term) or
+             is_reference(term) or is_port(term) do
+    shown = inspect(term)
+    if shown =~ ~r/[0-9a-fA-F]{32,}/, do: "a value that looks like a key", else: shown
+  end
+
+  def shown_value(%module{}), do: "%#{module |> shown_value() |> String.trim_leading(":")}{...}"
+  def shown_value(term), do: "a value of type #{type(term)}"
+
+  defp type(term) when is_list(term), do: "list"
+  defp type(term) when is_map(term), do: "map"
+  defp type(term) when is_tuple(term), do: "tuple"
+  defp type(term) when is_function(term), do: "function"
+  defp type(_term), do: "term"
+
+  # Sediment's own exceptions, whose messages show no value a caller gave
+  # (and pass through the net anyway): a key ring's errors (normalization,
+  # a failed key_for), the ArgumentErrors and RuntimeErrors raised in a
+  # module of Sediment's (a NIF's badarg is raised in Sediment.Native, as
+  # "argument error"), Sediment.Error, and DBConnection's errors, which
+  # callers handle by their type.
+  @passing [
+    Sediment.Error,
+    DBConnection.ConnectionError,
+    DBConnection.TransactionError,
+    DBConnection.OwnershipError
+  ]
+
+  defp passes?(%type{message: "encryption: " <> _}, _stacktrace)
        when type in [ArgumentError, RuntimeError],
        do: true
 
-  defp ours?(%ErlangError{original: original}, _stacktrace) when is_atom(original), do: true
+  defp passes?(%ErlangError{original: original}, _stacktrace) when is_atom(original), do: true
+  defp passes?(%type{}, _stacktrace) when type in @passing, do: true
 
-  defp ours?(%type{}, [{module, _fun, _args, _location} | _])
-       when type in [ArgumentError, RuntimeError, Sediment.Error],
-       do: sediment_module?(module)
+  defp passes?(%type{} = exception, [{module, _fun, _args, _location} | _])
+       when type in [ArgumentError, RuntimeError],
+       do: withheld?(exception) or sediment_module?(module)
 
-  defp ours?(_exception, _stacktrace), do: false
+  defp passes?(_exception, _stacktrace), do: false
 
   defp sediment_module?(module) do
     case Atom.to_string(module) do
@@ -283,12 +359,14 @@ defmodule Sediment.S3.Keys do
     end
   end
 
-  defp withheld(exception) do
-    %ArgumentError{
-      message:
-        "#{inspect(exception.__struct__)} (details withheld: the arguments may hold keys or credentials)"
-    }
-  end
+  @withheld "(details withheld: the arguments may hold keys or credentials)"
+
+  defp withheld(exception),
+    do: %ArgumentError{message: "#{inspect(exception.__struct__)} #{@withheld}"}
+
+  # An exception an inner boundary withheld already.
+  defp withheld?(%ArgumentError{message: message}), do: String.ends_with?(message, @withheld)
+  defp withheld?(_exception), do: false
 
   @ring_options [:key, :keys, :key_for, :cipher, :active]
 
@@ -327,8 +405,13 @@ defmodule Sediment.S3.Keys do
   defp keyword?([{key, _value} | rest]) when is_atom(key), do: keyword?(rest)
   defp keyword?(_other), do: false
 
+  # A frame's module and function are atoms a caller can have given too
+  # (a key as a module, called).
   defp scrub_frame({module, fun, args, location}) when is_list(args),
-    do: {module, fun, length(args), location}
+    do: {redact(module), redact(fun), length(args), location}
+
+  defp scrub_frame({module, fun, arity, location}),
+    do: {redact(module), redact(fun), arity, location}
 
   defp scrub_frame(frame), do: frame
 end

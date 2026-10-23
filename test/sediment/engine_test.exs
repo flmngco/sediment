@@ -299,7 +299,7 @@ defmodule Sediment.EngineTest do
 
       {:ok, statement} = Engine.prepare(conn, "insert into test (stuff) values (?1)")
 
-      msg = "#DateTime<2021-08-25 13:23:25+00:00 UTC Europe/Berlin> is not in UTC"
+      msg = "a DateTime in \"Europe/Berlin\" is not in UTC"
 
       assert_raise ArgumentError, msg, fn ->
         {:ok, dt} = DateTime.from_naive(~N[2021-08-25 13:23:25], "Etc/UTC")
@@ -688,7 +688,7 @@ defmodule Sediment.EngineTest do
       {:ok, statement} = Engine.prepare(conn, "insert into test (stuff) values (?1)")
 
       assert_raise ArgumentError,
-                   "unsupported type: %ArgumentError{message: \"argument error\"}",
+                   "unsupported type: %ArgumentError{...}",
                    fn -> Engine.bind(statement, [%ArgumentError{}]) end
     end
 

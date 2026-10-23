@@ -13,6 +13,10 @@ defmodule Sediment.Connection do
       `Exqlite.Connection`, so that code written against exqlite works here.
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed, only: [connect: 1, handle_begin: 2, handle_close: 3]
+
   use DBConnection
   alias Sediment.Engine
   alias Sediment.Error
@@ -645,7 +649,8 @@ defmodule Sediment.Connection do
         handle_transaction(:begin, "SAVEPOINT sediment_savepoint", state)
       end
     else
-      raise ArgumentError, "unsupported transaction mode inside a transaction: #{inspect(mode)}"
+      raise ArgumentError,
+            "unsupported transaction mode inside a transaction: #{Sediment.S3.Keys.shown_value(mode)}"
     end
   end
 
@@ -751,8 +756,8 @@ defmodule Sediment.Connection do
   This callback is called in the client process.
   """
   @impl true
-  def handle_close(query, _opts, state) do
-    unless cached?(state, query.ref), do: Engine.release(state.db, query.ref)
+  def handle_close(%Query{ref: ref}, _opts, %__MODULE__{db: db} = state) do
+    unless cached?(state, ref), do: Engine.release(db, ref)
     {:ok, nil, state}
   end
 
@@ -1164,11 +1169,20 @@ defmodule Sediment.Connection do
     params = URI.decode_query(query || "")
 
     case {path, params["mode"]} do
-      {_, "memory"} -> {:ok, ":memory:", nil}
-      {path, _} when path in [nil, ""] -> {:error, "No path in #{inspect(uri)}"}
-      {path, "ro"} -> {:ok, path, :readonly}
-      {path, "rw"} -> {:ok, path, :readwrite}
-      {path, _} -> {:ok, path, nil}
+      {_, "memory"} ->
+        {:ok, ":memory:", nil}
+
+      {path, _} when path in [nil, ""] ->
+        {:error, "No path in #{Sediment.S3.Keys.shown_value(uri)}"}
+
+      {path, "ro"} ->
+        {:ok, path, :readonly}
+
+      {path, "rw"} ->
+        {:ok, path, :readwrite}
+
+      {path, _} ->
+        {:ok, path, nil}
     end
   end
 

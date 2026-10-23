@@ -23,6 +23,15 @@
   the first open after the upgrade restores in full.
 * `Sediment.Native` changed for key rings (`s3_refresh/2`, `s3_restore/4`,
   `s3_import/5`, `export_sqlite/5` take a ring).
+* The options of every function taking keys or S3 options
+  (`Sediment.Engine.open/2`, `Sediment.start_link/1`, `child_spec/1`,
+  `export_sqlite/3`, `transaction/3`, `Sediment.Connection.connect/1`,
+  `Sediment.S3`'s `refresh/2`, `restore/3`, `import/3`, `rekey/3`,
+  `release_key/4`, `destroy/2`) must be a keyword list, without a key
+  ring's options (`key:`, `keys:`, `key_for:`, `cipher:`, `active:`) at the
+  top level. A map, which some of them accepted, or a ring given as the
+  options, is refused with a fixed message; a bare ring given to
+  `Sediment.Engine.open/2` used to open an unencrypted database.
 
 ### S3 durability
 
@@ -71,22 +80,33 @@
   nor a value of the wrong type; an id that could be a key is shown as
   `<an id that looks like a key>`; a `key_for` that fails is reported by
   the id and the exception's type only, without stack frame arguments.
-* Options of the wrong shape never show a key either. Every public
-  function taking keys or S3 options (`Sediment.Engine.open/2`,
-  `Sediment.start_link/1`, `child_spec/1`, `export_sqlite/3`,
-  `Sediment.Connection.connect/1`, and `Sediment.S3`'s `refresh/2`,
-  `restore/3`, `import/3`, `rekey/3`, `release_key/4`, `destroy/2`,
-  `exists?/1`, `key_census/1`) handles its arguments inside one boundary:
-  any exception raised there loses its stack frames' arguments, and one
-  that isn't Sediment's own (a `FunctionClauseError` on a map of options,
-  a `KeyError`, a `MatchError`) is replaced by an `ArgumentError` naming
-  its type only. Their options must be a keyword list, without a ring's
-  options (`key:`, `keys:`, `cipher:` ...) at the top level: a map, or a
-  ring given as the options, is refused with a fixed message (a bare ring
-  given to `Sediment.Engine.open/2` used to open an unencrypted database).
-  An S3 option that doesn't parse is named, never shown (it was echoed:
-  `encryption: "<key>"` inside `:s3`), and so is an unknown option, mode
-  or journal mode that could be a key.
+* Arguments of any shape never show a key either. Every public function
+  of `Sediment`, `Sediment.Engine`, `Sediment.S3`, `Sediment.Basic`,
+  `Sediment.Pragma`, `Sediment.CDC` and `Sediment.Connection.connect/1`
+  runs inside one boundary, from its argument handling to its NIF calls:
+  * an exception raised there loses its stack frames' arguments, and one
+    that isn't Sediment's own (a `FunctionClauseError` on a map of options,
+    a `KeyError`, a `MatchError`) is replaced by an `ArgumentError` naming
+    its type only; Sediment's errors and DBConnection's keep their type;
+  * a net: every error Sediment returns or raises, and every exit reason
+    passing through, has each run of 32 or more hex digits replaced by
+    `<redacted>` (keys are hex), in Elixir and in the native code, so a key
+    echoed by any message never shows. Fingerprints in messages and in a
+    fenced result are shown by their first 16 hex digits;
+  * messages show a value a caller gave only as an atom, string or number
+    that couldn't be a key, otherwise by its type (`"unsupported type:
+    %ArgumentError{...}"`, `"argument error: a value of type map"`);
+  * an S3 option that doesn't parse is named, never shown (it was echoed:
+    `encryption: "<key>"` inside `:s3`), and so is an unknown option, mode
+    or journal mode that could be a key.
+  `Sediment.transaction/3` checks its arguments the same way (its function's
+  exceptions stay the caller's own).
+* With a `key_for` ring, every open and every rekey of a warm copy
+  (a clean close's) downloaded the whole database: the first round, which
+  asks `key_for` for the key, deleted the warm sidecar before it stopped.
+  The sidecar is now read first and deleted only once the open goes ahead,
+  so a `key_for` round, a rekey to the current key (`{:ok, :current}`) or
+  a release with nothing to drop keep the copy warm.
 * A pool (`Sediment.start_link/1`, `Sediment.child_spec/1`) and a
   connection's state keep the `:encryption` option (and a `:key`, which
   connections refuse) hidden: crash and

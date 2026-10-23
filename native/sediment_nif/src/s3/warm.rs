@@ -72,18 +72,27 @@ fn sync_dir(path: &Path) {
     }
 }
 
-/// Reads and deletes the sidecar of `db_path`. Whatever it held, it is gone
-/// once this returns (or the removal failed and nothing may be reused).
-pub fn take(db_path: &Path) -> Option<Sidecar> {
+/// Reads the sidecar of `db_path`, leaving it in place: an open that stops
+/// before it touches the local files (a key a `key_for` ring must add, a
+/// rekey with nothing to do, a refusal) keeps the copy warm. One that goes
+/// ahead [`discard`]s it first.
+pub fn read(db_path: &Path) -> Option<Sidecar> {
+    let bytes = std::fs::read(sidecar_path(db_path)).ok()?;
+    serde_json::from_slice::<Sidecar>(&bytes).ok()
+}
+
+/// Deletes the sidecar of `db_path`, before anything touches the local
+/// files: an open that fails or crashes from then on leaves none to trust.
+/// `false` when it couldn't be removed (nothing may be reused then).
+pub fn discard(db_path: &Path) -> bool {
     let path = sidecar_path(db_path);
-    let bytes = std::fs::read(&path).ok();
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(tmp_path(&path));
     if path.exists() {
-        return None;
+        return false;
     }
     sync_dir(&path);
-    bytes.and_then(|bytes| serde_json::from_slice::<Sidecar>(&bytes).ok())
+    true
 }
 
 fn tmp_path(sidecar: &Path) -> PathBuf {

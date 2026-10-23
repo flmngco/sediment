@@ -41,7 +41,7 @@ pub use config::S3Config;
 pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
-pub use keys::{shown, shown_value, Key, KeyRecord, KeyRing};
+pub use keys::{short_fingerprint, shown, shown_value, Key, KeyRecord, KeyRing};
 pub use rekey::{rekey, release_key, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;
@@ -391,9 +391,10 @@ pub(crate) enum Fresh {
 }
 
 fn prepare_fresh(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>, op: &Op) -> Result<Fresh> {
-    // Taken before anything touches the local files: an open that fails or
-    // crashes from here on leaves no sidecar to trust.
-    let sidecar = warm::take(local_path);
+    // Read only: it is discarded once the open goes ahead (see
+    // prepare_under_lease), so a run that stops before touching the local
+    // files (KeyNeeded, a no-op or refused rekey) keeps the copy warm.
+    let sidecar = warm::read(local_path);
     let remote = cfg.remote()?;
     let must_exist = cfg.must_exist || !matches!(op, Op::Open);
     // Before anything is written (the probe, the lease): a mistyped bucket
@@ -467,6 +468,10 @@ fn prepare_under_lease(
                     return Ok(Fresh::Unchanged);
                 }
             }
+            // The open goes ahead: the sidecar (and a temp file a cut-short
+            // write left) goes before anything touches the local files.
+            let discarded = warm::discard(local_path);
+            let sidecar = sidecar.filter(|_| discarded);
             let remote = remote.clone().for_key(key.as_ref())?;
             // Take the manifest over before reading the log: from here on no
             // stale writer can publish, or acknowledge a commit (see
@@ -568,6 +573,7 @@ fn prepare_under_lease(
         // A destroyed database: finish its purge (a destroy may have been
         // interrupted), then start a new one in its place.
         Some((ManifestState::Destroyed(tombstone), object_version)) => {
+            warm::discard(local_path);
             let key = new_database_key(cfg)?;
             purge(remote, &tombstone)?;
             check_no_old_objects(remote, Some(&tombstone))?;
@@ -580,6 +586,7 @@ fn prepare_under_lease(
             (manifest, version, published, key)
         }
         None => {
+            warm::discard(local_path);
             let key = new_database_key(cfg)?;
             check_no_old_objects(remote, None)?;
             refuse_to_replace_local_data(local_path, key.as_ref())?;
@@ -687,7 +694,7 @@ fn rekey_target(
                  as key {}; a rekey moves to a new key (allow_reuse: true to move back, once \
                  its retained epochs are released)",
                 shown(target.id()),
-                target.fingerprint(),
+                keys::short_fingerprint(target.fingerprint()),
                 first.retired_at_ms,
                 shown(&first.id)
             )));

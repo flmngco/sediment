@@ -7,6 +7,10 @@ defmodule Sediment.Engine do
   See the README section "Differences from exqlite".
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed
+
   alias Sediment.Native
 
   @type db() :: reference()
@@ -168,10 +172,8 @@ defmodule Sediment.Engine do
     modes
   end
 
-  # A mode is an atom; anything else is not shown (it could be a key given
-  # in the wrong place).
-  defp shown_mode(mode) when is_atom(mode), do: inspect(mode)
-  defp shown_mode(_mode), do: "a value that is not an atom"
+  # A mode as messages show it: never a key given in the wrong place.
+  defp shown_mode(mode), do: Sediment.S3.Keys.shown_value(mode)
 
   @doc """
   Closes the database and releases any underlying resources.
@@ -368,7 +370,7 @@ defmodule Sediment.Engine do
 
       if args_count != params_count do
         raise ArgumentError,
-              "expected #{params_count} named arguments, got #{args_count}: #{inspect(Map.keys(args))}"
+              "expected #{params_count} named arguments, got #{args_count}: #{Enum.map_join(Map.keys(args), ", ", &Sediment.S3.Keys.shown_value/1)}"
       end
 
       :ok = Native.bind_all(stmt, [])
@@ -409,7 +411,7 @@ defmodule Sediment.Engine do
     idx = Native.bind_parameter_index(stmt, to_string(name))
 
     if idx == 0 do
-      raise ArgumentError, "unknown named parameter: #{inspect(name)}"
+      raise ArgumentError, "unknown named parameter: #{Sediment.S3.Keys.shown_value(name)}"
     end
 
     stmt |> Native.bind_value_at(idx, normalize(param)) |> raise_on_bind_error()
@@ -465,7 +467,7 @@ defmodule Sediment.Engine do
       a when is_atom(a) -> Atom.to_string(a)
       {:blob, b} when is_binary(b) -> {:blob, b}
       {:blob, b} when is_list(b) -> {:blob, IO.iodata_to_binary(b)}
-      _other -> raise ArgumentError, "unsupported type: #{inspect(param)}"
+      _other -> raise ArgumentError, "unsupported type: #{Sediment.S3.Keys.shown_value(param)}"
     end
   end
 
@@ -664,7 +666,9 @@ defmodule Sediment.Engine do
   """
   @spec bind_text(statement, non_neg_integer, String.t()) :: :ok
   def bind_text(stmt, index, text) when is_binary(text), do: bind_at(stmt, index, text)
-  def bind_text(_stmt, _index, text), do: raise(ArgumentError, "argument error: #{inspect(text)}")
+
+  def bind_text(_stmt, _index, text),
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(text)}")
 
   @doc """
   Binds a blob value to a prepared statement.
@@ -677,7 +681,9 @@ defmodule Sediment.Engine do
   """
   @spec bind_blob(statement, non_neg_integer, binary) :: :ok
   def bind_blob(stmt, index, blob) when is_binary(blob), do: bind_at(stmt, index, {:blob, blob})
-  def bind_blob(_stmt, _index, blob), do: raise(ArgumentError, "argument error: #{inspect(blob)}")
+
+  def bind_blob(_stmt, _index, blob),
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(blob)}")
 
   @doc """
   Binds an integer value to a prepared statement.
@@ -693,7 +699,7 @@ defmodule Sediment.Engine do
     do: bind_at(stmt, index, integer)
 
   def bind_integer(_stmt, _index, integer),
-    do: raise(ArgumentError, "argument error: #{inspect(integer)}")
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(integer)}")
 
   @doc """
   Binds a float value to a prepared statement.
@@ -708,7 +714,7 @@ defmodule Sediment.Engine do
   def bind_float(stmt, index, float) when is_float(float), do: bind_at(stmt, index, float)
 
   def bind_float(_stmt, _index, float),
-    do: raise(ArgumentError, "argument error: #{inspect(float)}")
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(float)}")
 
   @doc """
   Binds a null value to a prepared statement.
@@ -730,7 +736,8 @@ defmodule Sediment.Engine do
     end
   end
 
-  defp bind_at(stmt, _index, _value), do: raise(ArgumentError, "argument error: #{inspect(stmt)}")
+  defp bind_at(stmt, _index, _value),
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(stmt)}")
 
   defp convert(%Date{} = val), do: Date.to_iso8601(val)
   defp convert(%Time{} = val), do: Time.to_iso8601(val)
@@ -738,7 +745,8 @@ defmodule Sediment.Engine do
   defp convert(%DateTime{time_zone: "Etc/UTC"} = val), do: NaiveDateTime.to_iso8601(val)
 
   defp convert(%DateTime{} = datetime) do
-    raise ArgumentError, "#{inspect(datetime)} is not in UTC"
+    raise ArgumentError,
+          "a DateTime in #{Sediment.S3.Keys.shown_value(datetime.time_zone)} is not in UTC"
   end
 
   defp convert(val) do
@@ -758,7 +766,8 @@ defmodule Sediment.Engine do
 
       {:error, reason} ->
         raise ArgumentError,
-              "Failed conversion by TypeExtension #{extension}: #{inspect(val)}. Reason: #{inspect(reason)}."
+              "Failed conversion by TypeExtension #{extension}: #{Sediment.S3.Keys.shown_value(val)}. " <>
+                "Reason: #{Sediment.S3.Keys.shown_value(reason)}."
     end
   end
 

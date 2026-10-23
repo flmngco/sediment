@@ -128,9 +128,14 @@ pub fn error_term<'a>(env: Env<'a>, err: &S3Error) -> Term<'a> {
                 ),
                 (
                     "fingerprint",
-                    key.as_ref().map(|k| k.fingerprint.clone()).encode(env),
+                    key.as_ref()
+                        .map(|k| s3::short_fingerprint(&k.fingerprint))
+                        .encode(env),
                 ),
-                ("message", err.to_string().encode(env)),
+                (
+                    "message",
+                    crate::redact::hex_runs(&err.to_string()).encode(env),
+                ),
             ]
             .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v));
             match Term::map_from_pairs(env, &pairs) {
@@ -149,7 +154,10 @@ pub fn error_term<'a>(env: Env<'a>, err: &S3Error) -> Term<'a> {
             .encode(env),
         S3Error::Indeterminate(_) => (
             crate::atoms::error(),
-            (crate::atoms::indeterminate(), err.to_string()),
+            (
+                crate::atoms::indeterminate(),
+                crate::redact::hex_runs(&err.to_string()).into_owned(),
+            ),
         )
             .encode(env),
         other => error_tuple(env, describe(other)),

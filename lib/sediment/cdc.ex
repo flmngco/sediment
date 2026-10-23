@@ -32,6 +32,10 @@ defmodule Sediment.CDC do
       columns
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed
+
   alias Sediment.Engine
 
   @default_table "turso_cdc"

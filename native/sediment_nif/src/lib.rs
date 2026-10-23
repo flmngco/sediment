@@ -6,6 +6,7 @@ mod export;
 mod log_guard;
 mod mvcc_guard;
 mod open;
+mod redact;
 mod replica;
 pub mod s3;
 mod s3_nif;

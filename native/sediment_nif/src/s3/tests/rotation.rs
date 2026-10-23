@@ -181,7 +181,13 @@ fn ring_errors_name_the_key_and_write_nothing() {
         message.contains("key r1 in the ring is not the key that encrypted this database"),
         "{message}"
     );
-    assert!(message.contains(&key_as("r1", "11").fingerprint().to_string()));
+    // Fingerprints show by their first 16 hex digits, never 32 (the net).
+    let fingerprint = key_as("r1", "11").fingerprint().to_string();
+    assert!(
+        message.contains(&format!("recorded {})", &fingerprint[..16])),
+        "{message}"
+    );
+    assert!(!message.contains(&fingerprint), "{message}");
     let message = err_text(rekey(&swapped, &dir.db("z.db"), Some("r2"), false, false));
     assert!(message.contains("not the key that encrypted"), "{message}");
     assert_eq!(remote.get(MANIFEST_KEY).unwrap().unwrap().bytes, before);
@@ -704,4 +710,73 @@ fn a_rekey_fenced_at_its_takeover_names_the_current_key() {
     }
     let message = err_text(Err::<(), _>(err));
     assert!(message.contains("switched nothing"), "{message}");
+}
+
+/// A key_for ring holding `keys` (`(id, key byte)`), `active` resolved on
+/// demand.
+fn lazy(store: &Arc<FaultyStore>, keys: &[(&str, &str)], active: &str) -> S3Config {
+    let mut cfg = config(store, "a");
+    cfg.unencrypted = false;
+    let keys = keys.iter().map(|(id, byte)| key_as(id, byte)).collect();
+    cfg.encryption = Some(crate::s3::KeyRing::new(keys, Some(active.into()), true).unwrap());
+    cfg
+}
+
+/// Runs `run` and asserts it downloaded no snapshot of the current epoch.
+fn downloads_no_snapshot<T>(store: &Arc<FaultyStore>, run: impl FnOnce() -> T) -> T {
+    let snapshot = manifest(store).snapshot;
+    let gets = store.get_log().len();
+    let result = run();
+    let downloaded = &store.get_log()[gets..];
+    assert!(
+        downloaded.iter().all(|key| !key.ends_with(&snapshot)),
+        "{downloaded:?}"
+    );
+    result
+}
+
+#[test]
+fn a_key_for_ring_and_a_no_op_rekey_keep_the_copy_warm() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let seed = seeded(&store, &dir, &["a"]);
+    let path = dir.db("seed.db");
+    let sidecar = crate::s3::warm::sidecar_path(&path);
+    assert!(sidecar.exists(), "the clean close left the copy warm");
+
+    // A key_for ring's first round needs the key and stops before it
+    // touches the local files: the copy stays warm for the second.
+    match open_encrypted(&lazy(&store, &[], "r1"), &path) {
+        Err(S3Error::KeyNeeded(id)) => assert_eq!(id, "r1"),
+        other => panic!("{:?}", other.map(drop)),
+    }
+    assert!(sidecar.exists());
+    let db = downloads_no_snapshot(&store, || {
+        open_encrypted(&lazy(&store, &[("r1", "11")], "r1"), &path).unwrap()
+    });
+    assert_eq!(rows(&db), ["a"]);
+    drop(db);
+    assert!(sidecar.exists());
+
+    // A rekey with nothing to do changes nothing local either.
+    assert_eq!(
+        rekey(&seed, &path, None, false, false).unwrap(),
+        Rekeyed::Current
+    );
+    assert!(sidecar.exists());
+
+    // A key_for rekey asks for the current key, then the target, and
+    // rekeys the warm copy without downloading it.
+    for (keys, needed) in [(&[][..], "r1"), (&[("r1", "11")][..], "r2")] {
+        match rekey(&lazy(&store, keys, "r2"), &path, None, false, false) {
+            Err(S3Error::KeyNeeded(id)) => assert_eq!(id, needed),
+            other => panic!("{other:?}"),
+        }
+        assert!(sidecar.exists());
+    }
+    let both = lazy(&store, &[("r1", "11"), ("r2", "22")], "r2");
+    let rekeyed = downloads_no_snapshot(&store, || rekey(&both, &path, None, false, false));
+    assert!(matches!(rekeyed, Ok(Rekeyed::Done { .. })), "{rekeyed:?}");
+    let db = downloads_no_snapshot(&store, || open_encrypted(&both, &path).unwrap());
+    assert_eq!(rows(&db), ["a"]);
 }

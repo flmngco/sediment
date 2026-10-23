@@ -277,11 +277,9 @@ fn an_encrypted_copy_is_reused_with_its_key_only() {
         "a wrong key still fails"
     );
 
-    // The failed open took the sidecar: a full restore, with the right key.
-    let (db, gets) = counting(&store, || open_encrypted(&cfg, &path).unwrap());
-    assert!(gets > 0);
-    assert_eq!(db.int("SELECT count(*) FROM t"), 1);
-    drop(db);
+    // The wrong key was refused before anything touched the local files:
+    // the copy stays warm for the right key.
+    assert!(sidecar(&path).exists());
     let (db, gets) = counting(&store, || open_encrypted(&cfg, &path).unwrap());
     assert_eq!(gets, 0, "warm");
     assert_eq!(db.int("SELECT count(*) FROM t"), 1);

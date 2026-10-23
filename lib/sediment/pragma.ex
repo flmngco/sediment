@@ -3,6 +3,10 @@ defmodule Sediment.Pragma do
   Handles parsing extra options for the turso connection
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed
+
   @doc "Returns `:busy_timeout` in milliseconds (default 2000) from the connection options."
   @spec busy_timeout(keyword() | nil) :: non_neg_integer()
   def busy_timeout(nil), do: busy_timeout([])

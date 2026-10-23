@@ -183,6 +183,40 @@ defmodule Sediment.S3RotationTest do
     assert refute_keys(message) =~ "unknown key id r2"
   end
 
+  test "a key_for ring reopens a clean close's warm copy, and a no-op rekey keeps it",
+       %{s3: s3, dir: dir} do
+    path = Path.join(dir, "warm.db")
+    sidecar = Path.join(dir, ".warm.db.s3-warm")
+
+    gets = fn ->
+      case S3.request_counts() do
+        %{"GetObject" => %{count: count}} -> count
+        _ -> 0
+      end
+    end
+
+    db = open!(path, s3, ["r1"])
+    :ok = Engine.execute(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")
+
+    # 50 sync commits: a full restore downloads the snapshot and 50 log
+    # objects.
+    for _ <- 1..50, do: :ok = Engine.execute(db, "INSERT INTO t (v) VALUES (randomblob(2000))")
+    :ok = Engine.close(db)
+    assert File.exists?(sidecar)
+
+    # The first round needs r1 (KeyNeeded) and keeps the copy warm for the
+    # second.
+    before = gets.()
+    {:ok, db} = Engine.open(path, s3: s3, encryption: [key_for: &key/1, active: "r1"])
+    reads = gets.() - before
+    :ok = Engine.close(db)
+    assert reads < 10, "a key_for open of a warm copy read #{reads} objects"
+    assert File.exists?(sidecar)
+
+    assert {:ok, :current} = S3.rekey(path, s3, encryption: ring(["r1"]))
+    assert File.exists?(sidecar)
+  end
+
   @doc false
   def only_r1("r1"), do: {:ok, @k1}
   def only_r1(_id), do: nil
@@ -293,7 +327,7 @@ defmodule Sediment.S3RotationTest do
     assert {:error, {:fenced, %{current_key: "r1", fingerprint: fingerprint, message: message}}} =
              Task.await(task, 30_000)
 
-    assert is_binary(fingerprint)
+    assert byte_size(fingerprint) == 16, "a fenced result shows 16 hex digits"
     assert refute_keys(message) =~ "s3 writer fenced"
     assert {:ok, :current} = S3.rekey(Path.join(dir, "r.db"), s3, encryption: ring(["r1", "r2"]))
     assert {:ok, %{current: "r1", retained: %{}}} = S3.key_census(s3)

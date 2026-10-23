@@ -4,6 +4,10 @@ defmodule Sediment.Basic do
   `Exqlite.Basic`).
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed
+
   alias Sediment.Connection
   alias Sediment.Engine
   alias Sediment.Error
@@ -62,9 +66,9 @@ defmodule Sediment.Basic do
 
   @doc "Not supported by turso. Always returns `{:error, :not_supported}`."
   @spec enable_load_extension(Connection.t()) :: {:error, :not_supported}
-  def enable_load_extension(conn), do: Engine.enable_load_extension(conn.db, true)
+  def enable_load_extension(%Connection{db: db}), do: Engine.enable_load_extension(db, true)
 
   @doc "Not supported by turso. Always returns `{:error, :not_supported}`."
   @spec disable_load_extension(Connection.t()) :: {:error, :not_supported}
-  def disable_load_extension(conn), do: Engine.enable_load_extension(conn.db, false)
+  def disable_load_extension(%Connection{db: db}), do: Engine.enable_load_extension(db, false)
 end
