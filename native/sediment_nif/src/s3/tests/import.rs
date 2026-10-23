@@ -212,7 +212,7 @@ fn an_encrypted_target_needs_its_key_and_the_source_may_be_encrypted_too() {
     let mut cfg = config(&store, "importer");
     cfg.encryption = Some(encryption("ab"));
     import(&cfg, &plain_source, &opts(Verify::Restore)).unwrap();
-    assert_eq!(manifest(&store).encrypted, Some(true));
+    assert_eq!(manifest(&store).key, Some(super::key("ab").record()));
     let db = open_encrypted(&cfg, &dir.db("restored.db")).unwrap();
     assert_eq!(db.int("SELECT count(*) FROM t"), 501);
     db.exec("INSERT INTO t (v) VALUES ('after')").unwrap();
@@ -229,7 +229,7 @@ fn an_encrypted_target_needs_its_key_and_the_source_may_be_encrypted_too() {
     // a plaintext database
     let encrypted_source = dir.db("enc.db");
     {
-        let key = encryption("cd");
+        let key = super::opts("cd");
         let (_db, conn) = crate::s3::open_local(&encrypted_source, Some(&key)).unwrap();
         conn.execute("CREATE TABLE e(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
@@ -246,13 +246,13 @@ fn an_encrypted_target_needs_its_key_and_the_source_may_be_encrypted_too() {
             "for an encrypted database give its key",
         );
         let mut bad = checksum();
-        bad.source_encryption = Some(encryption("ab"));
+        bad.source_encryption = Some(super::opts("ab"));
         assert_config_err(
             import(&cfg, &encrypted_source, &bad),
             "the given source key",
         );
         let mut good = checksum();
-        good.source_encryption = Some(encryption("cd"));
+        good.source_encryption = Some(super::opts("cd"));
         import(&cfg, &encrypted_source, &good).unwrap();
         let db = open_encrypted(&cfg, &dir.db("from-enc.db")).unwrap();
         db.exec("INSERT INTO e (v) VALUES ('c')").unwrap();

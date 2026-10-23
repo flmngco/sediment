@@ -52,6 +52,8 @@ pub fn still_usable(cfg: &S3Config, state: &ReplicaState) -> Result<bool> {
 pub struct Staged {
     db: PathBuf,
     pub state: ReplicaState,
+    /// The key it is under (from the open's ring, as the manifest records).
+    pub key: Option<super::keys::Key>,
 }
 
 impl Staged {
@@ -334,16 +336,18 @@ pub fn stage(cfg: &S3Config, db_path: &Path) -> Result<Staged> {
 }
 
 fn stage_at(cfg: &S3Config, db_path: &Path) -> Result<Staged> {
-    let remote = cfg.remote()?;
+    let unkeyed = cfg.remote()?;
     let staging = staging_path(db_path);
     let scope = format!("{}|{}", cfg.store_identity(), cfg.prefix);
     let mut last_error = None;
     for _ in 0..ATTEMPTS {
-        let manifest = restore::read_manifest(&remote)?.ok_or_else(|| {
+        let manifest = restore::read_manifest(&unkeyed)?.ok_or_else(|| {
             S3Error::Config(format!("no database at s3://{}/{}", cfg.bucket, cfg.prefix))
         })?;
         super::require_encryption_choice_for(cfg, Some(&manifest))?;
-        super::check_encryption(&manifest, cfg)?;
+        // The key of the current epoch: after a rekey, the new one.
+        let key = super::restore_key(cfg, manifest.key.as_ref())?;
+        let remote = unkeyed.clone().for_key(key.as_ref())?;
         let record = manifest.current();
         let chain = record.chain();
         let cacheable = !record.snapshot_base.is_empty() || record.snapshot_zstd;
@@ -361,6 +365,7 @@ fn stage_at(cfg: &S3Config, db_path: &Path) -> Result<Staged> {
                     let staged = Staged {
                         db: staging.clone(),
                         state: replica_state(&manifest, update.state),
+                        key,
                     };
                     if !restore::usable(&manifest, &update.state) {
                         return Err(restore::taking_over(&manifest));
@@ -399,11 +404,12 @@ fn stage_at(cfg: &S3Config, db_path: &Path) -> Result<Staged> {
             .or_else(|_| restore::restore(&remote, &manifest, &staging, cfg.download_concurrency)),
             None => restore::restore(&remote, &manifest, &staging, cfg.download_concurrency),
         };
-        match restored.map_err(|err| super::missing_key_hint(err, cfg)) {
+        match restored {
             Ok(log) => {
                 let staged = Staged {
                     db: staging.clone(),
                     state: replica_state(&manifest, log),
+                    key,
                 };
                 if !restore::usable(&manifest, &log) {
                     return Err(restore::taking_over(&manifest));

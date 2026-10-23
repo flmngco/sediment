@@ -182,6 +182,12 @@ impl Remote {
         self
     }
 
+    /// The remote for reading a log encrypted with `key` (or unencrypted).
+    pub fn for_key(self, key: Option<&super::keys::Key>) -> Result<Self> {
+        let overhead = key.map(super::keys::Key::log_encryption).transpose()?;
+        Ok(self.with_log_encryption(overhead))
+    }
+
     pub fn log_encryption(&self) -> Option<(usize, usize)> {
         self.log_encryption
     }
@@ -318,6 +324,26 @@ impl Remote {
                 Err(err) => Err(S3Error::Store(err)),
             }
         })
+    }
+
+    /// The store's Last-Modified time of `key` (unix ms), if it exists.
+    pub fn last_modified(&self, key: &str) -> Result<Option<u64>> {
+        let store = self.store.clone();
+        let path = self.path(key);
+        self.run(async move {
+            match store.head(&path).await {
+                Ok(meta) => Ok(Some(meta.last_modified.timestamp_millis().max(0) as u64)),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(err) => Err(S3Error::Store(err)),
+            }
+        })
+    }
+
+    /// The store's time of `key`, an object this writer just wrote (a seal,
+    /// a snapshot): where an epoch starts.
+    pub fn boundary(&self, key: &str) -> Result<u64> {
+        self.last_modified(key)?
+            .ok_or_else(|| S3Error::Corrupt(format!("{key} is gone right after it was written")))
     }
 
     /// Uploads a database file as a zstd-compressed snapshot, streaming it

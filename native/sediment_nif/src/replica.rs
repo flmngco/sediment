@@ -16,7 +16,7 @@ use rustler::{Encoder, Env, ResourceArc, Term};
 use turso_core::{Database, DatabaseOpts, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
 use crate::conn::{closed, error_tuple, lock, ok_tuple, ConnRes, Handle};
-use crate::open::Opened;
+use crate::open::{OpenError, Opened};
 use crate::s3::replica::{stage, still_usable, unique_path, ReplicaState};
 use crate::s3::restore;
 use crate::s3::S3Config;
@@ -27,9 +27,9 @@ pub struct Generation {
     io: Arc<dyn IO>,
     db: Arc<Database>,
     pub state: ReplicaState,
-    /// The key it was opened with: a connection reusing it must give the
-    /// same (it reads the decrypted state).
-    encryption: Option<turso_core::EncryptionOpts>,
+    /// The key it is under: a connection reusing it must hold the same
+    /// (it reads the decrypted state).
+    encryption: Option<crate::s3::Key>,
 }
 
 impl Drop for Generation {
@@ -86,14 +86,13 @@ impl Replica {
 
 /// Opens a replica connection on the current generation of `path`, restoring
 /// one from S3 first if no connection of this process reads it yet.
-pub fn open(cfg: S3Config, path: &str, db_opts: DatabaseOpts) -> Result<Opened, String> {
+pub fn open(cfg: S3Config, path: &str, db_opts: DatabaseOpts) -> Result<Opened, OpenError> {
     let path = PathBuf::from(path);
     let slot = slot(&Replica::key(&cfg, &path));
     let mut slot = lock(&slot);
     let generation = match usable(&mut slot, &cfg)? {
         Some(generation) => {
-            crate::s3::check_same_encryption(generation.encryption.as_ref(), &cfg)
-                .map_err(|e| e.to_string())?;
+            crate::s3::check_same_encryption(generation.encryption.as_ref(), &cfg)?;
             generation
         }
         None => {
@@ -103,12 +102,12 @@ pub fn open(cfg: S3Config, path: &str, db_opts: DatabaseOpts) -> Result<Opened, 
         }
     };
     drop(slot);
-    connect(Replica {
+    Ok(connect(Replica {
         cfg,
         path,
         db_opts,
         generation,
-    })
+    })?)
 }
 
 /// The slot's current generation, if S3 still has it: a destroy (and maybe a
@@ -131,18 +130,19 @@ fn new_generation(
     cfg: &S3Config,
     path: &std::path::Path,
     db_opts: DatabaseOpts,
-) -> Result<Arc<Generation>, String> {
-    let staged = stage(cfg, path).map_err(|e| e.to_string())?;
+) -> Result<Arc<Generation>, OpenError> {
+    let staged = stage(cfg, path)?;
     let working = unique_path(path, "replica");
-    let state = staged.install(&working).map_err(|e| e.to_string())?;
-    open_generation(cfg, working, db_opts, state)
+    let key = staged.key.clone();
+    let state = staged.install(&working)?;
+    Ok(open_generation(working, db_opts, state, key)?)
 }
 
 fn open_generation(
-    cfg: &S3Config,
     working: PathBuf,
     db_opts: DatabaseOpts,
     state: ReplicaState,
+    key: Option<crate::s3::Key>,
 ) -> Result<Arc<Generation>, String> {
     let removal = Removal(working.clone());
     let path = working
@@ -152,8 +152,8 @@ fn open_generation(
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| e.to_string())?);
     let options = OpenOptions::new(Arc::new(SqliteDialect))
         .flags(OpenFlags::Create)
-        .db_opts(db_opts)
-        .encryption(cfg.encryption.clone());
+        .db_opts(db_opts.with_encryption(key.is_some()))
+        .encryption(key.as_ref().map(crate::s3::Key::opts));
     let db = Database::open(io.clone(), &path, options).map_err(|e| e.to_string())?;
     std::mem::forget(removal);
     Ok(Arc::new(Generation {
@@ -161,7 +161,7 @@ fn open_generation(
         io,
         db,
         state,
-        encryption: cfg.encryption.clone(),
+        encryption: key,
     }))
 }
 
@@ -178,13 +178,12 @@ impl Drop for Removal {
 
 fn connect(replica: Replica) -> Result<Opened, String> {
     let generation = replica.generation.clone();
-    let key = replica
-        .cfg
+    let key = generation
         .encryption
         .as_ref()
-        .map(|opts| turso_core::EncryptionKey::from_hex_string(&opts.hexkey))
+        .map(|key| turso_core::EncryptionKey::from_hex_string(&key.opts().hexkey))
         .transpose()
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| "the replica's key is not a valid key".to_string())?;
     let conn = generation
         .db
         .connect_with_encryption(key)
@@ -235,15 +234,26 @@ fn s3_replica_info(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
 /// generation if another connection already published a newer one (no S3
 /// request), otherwise to a new generation staged from S3 if S3 changed.
 /// Statements prepared before a switch are finalized.
+///
+/// `encryption`, when not nil, replaces the replica's key ring (a ring that
+/// learned keys through `key_for`, say), for this refresh and later ones.
 #[rustler::nif(schedule = "DirtyIo")]
-fn s3_refresh(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
+fn s3_refresh<'a>(env: Env<'a>, res: ResourceArc<ConnRes>, encryption: Term<'a>) -> Term<'a> {
+    let ring = match crate::s3_nif::decode_ring(encryption) {
+        Ok(ring) => ring,
+        Err(reason) => return error_tuple(env, reason),
+    };
     let mut guard = res.handle();
-    let Some(handle) = guard.as_ref() else {
+    let Some(handle) = guard.as_mut() else {
         return closed(env);
     };
-    let Some(replica) = handle.replica.as_ref() else {
+    let Some(replica) = handle.replica.as_mut() else {
         return error_tuple(env, "not an s3 replica");
     };
+    if ring.is_some() {
+        replica.cfg.encryption = ring;
+    }
+    let replica = &*replica;
 
     let slot = slot(&Replica::key(&replica.cfg, &replica.path));
     let mut slot = lock(&slot);
@@ -256,24 +266,25 @@ fn s3_refresh(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
             if let Err(err) =
                 crate::s3::check_same_encryption(current.encryption.as_ref(), &replica.cfg)
             {
-                return error_tuple(env, err.to_string());
+                return crate::s3_nif::error_term(env, &err);
             }
             current
         }
         _ => {
             let staged = match stage(&replica.cfg, &replica.path) {
                 Ok(staged) => staged,
-                Err(err) => return error_tuple(env, err.to_string()),
+                Err(err) => return crate::s3_nif::error_term(env, &err),
             };
             let state = &replica.generation.state;
             if staged.state.epoch == state.epoch && staged.state.log_bytes == state.log_bytes {
                 return state_map(env, state);
             }
             let working = unique_path(&replica.path, "replica");
+            let key = staged.key.clone();
             let generation = staged
                 .install(&working)
                 .map_err(|e| e.to_string())
-                .and_then(|state| open_generation(&replica.cfg, working, replica.db_opts, state));
+                .and_then(|state| open_generation(working, replica.db_opts, state, key));
             match generation {
                 Ok(generation) => {
                     slot.current = Arc::downgrade(&generation);

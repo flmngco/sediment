@@ -184,23 +184,43 @@ defmodule Sediment.Native do
   @spec s3_replica_info(db()) :: {:ok, map()} | {:error, reason()}
   def s3_replica_info(_conn), do: :erlang.nif_error(:not_loaded)
 
-  @spec s3_refresh(db()) :: {:ok, map()} | {:error, reason()}
-  def s3_refresh(_conn), do: :erlang.nif_error(:not_loaded)
+  # A key ring as Sediment.S3.Keys.native/1 builds it.
+  @typep ring :: map() | nil
+
+  @spec s3_refresh(db(), ring()) :: {:ok, map()} | {:error, reason()}
+  def s3_refresh(_conn, _encryption), do: :erlang.nif_error(:not_loaded)
 
   @spec s3_restore(
           String.t(),
           keyword() | map(),
           :latest | {:epoch | :time, non_neg_integer()},
-          {String.t(), String.t()} | nil
+          ring()
         ) :: {:ok, map()} | {:error, reason()}
   def s3_restore(_path, _opts, _target, _encryption), do: :erlang.nif_error(:not_loaded)
+
+  @spec s3_rekey(String.t(), keyword() | map(), ring(), String.t() | nil, boolean(), boolean()) ::
+          {:ok, map() | :current} | {:error, reason()}
+  def s3_rekey(_path, _opts, _encryption, _to, _force, _allow_reuse),
+    do: :erlang.nif_error(:not_loaded)
+
+  @spec s3_release_key(String.t(), keyword() | map(), ring(), String.t(), boolean()) ::
+          {:ok, map()} | {:error, reason()}
+  def s3_release_key(_path, _opts, _encryption, _key, _force), do: :erlang.nif_error(:not_loaded)
+
+  @spec s3_key_census(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
+  def s3_key_census(_opts), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  # Test hook at a point of a rekey or key release (see the native s3::hook).
+  @spec s3_test_hook(keyword() | map(), String.t(), atom()) :: atom() | {:error, reason()}
+  def s3_test_hook(_opts, _stage, _action), do: :erlang.nif_error(:not_loaded)
 
   @spec s3_import(
           String.t(),
           keyword() | map(),
           :checksum | :restore,
-          {String.t(), String.t()} | nil,
-          {String.t(), String.t()} | nil
+          ring(),
+          ring()
         ) :: {:ok, map()} | {:error, reason()}
   def s3_import(_path, _opts, _verify, _encryption, _source_encryption),
     do: :erlang.nif_error(:not_loaded)
@@ -215,7 +235,7 @@ defmodule Sediment.Native do
           String.t() | nil,
           String.t(),
           keyword() | map() | nil,
-          {String.t(), String.t()} | nil,
+          ring(),
           boolean()
         ) :: {:ok, map()} | {:error, reason()}
   def export_sqlite(_source, _dest, _from_s3, _encryption, _drop_fts),

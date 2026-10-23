@@ -1,0 +1,97 @@
+//! Test hooks at fixed points of a rekey or key release
+//! (`Sediment.Native.s3_test_hook/3`): hold the operation there until
+//! released, fail it, or crash it (the lease stays taken, as after a kill).
+//! Armed for one database (its store and prefix) and one use.
+
+use std::sync::{Condvar, Mutex};
+
+use super::error::{Result, S3Error};
+use super::lease::Lease;
+
+/// Right before the manifest PUT that publishes a rekey or a release: the
+/// copy is done and the new snapshot uploaded.
+pub const PUBLISH: &str = "publish";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Pause,
+    Fail,
+    Crash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Armed,
+    /// Paused at the point, until [`release`].
+    Paused,
+    /// Released, or it failed or crashed there.
+    Done,
+}
+
+struct Armed {
+    place: String,
+    stage: String,
+    action: Action,
+    state: State,
+}
+
+static HOOK: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+static CHANGED: Condvar = Condvar::new();
+
+/// Arms the hook at `stage` for the database at `place` (`S3Config::place`).
+pub fn arm(place: &str, stage: &str, action: Action) {
+    let mut hooks = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    hooks.retain(|armed| armed.place != place);
+    hooks.push(Armed {
+        place: place.to_string(),
+        stage: stage.to_string(),
+        action,
+        state: State::Armed,
+    });
+}
+
+/// Where the hook for `place` is (`None`: none armed).
+pub fn state(place: &str) -> Option<State> {
+    let hooks = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    hooks
+        .iter()
+        .find(|armed| armed.place == place)
+        .map(|armed| armed.state)
+}
+
+/// Lets a paused operation go on, and disarms the hook.
+pub fn release(place: &str) {
+    let mut hooks = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    hooks.retain(|armed| armed.place != place);
+    CHANGED.notify_all();
+}
+
+/// Called by the operation at `stage`.
+pub(crate) fn at(stage: &str, place: &str, lease: &Lease) -> Result<()> {
+    let mut hooks = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(armed) = hooks
+        .iter_mut()
+        .find(|armed| armed.place == place && armed.stage == stage && armed.state == State::Armed)
+    else {
+        return Ok(());
+    };
+    match armed.action {
+        Action::Pause => {
+            armed.state = State::Paused;
+            CHANGED.notify_all();
+            while hooks.iter().any(|armed| armed.place == place) {
+                hooks = CHANGED.wait(hooks).unwrap_or_else(|e| e.into_inner());
+            }
+            Ok(())
+        }
+        Action::Fail => {
+            armed.state = State::Done;
+            Err(S3Error::Config(format!("test hook: failed at {stage}")))
+        }
+        Action::Crash => {
+            armed.state = State::Done;
+            lease.abandon();
+            Err(S3Error::Fenced(format!("test hook: crashed at {stage}")))
+        }
+    }
+}

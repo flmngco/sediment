@@ -108,7 +108,7 @@ fn save_copy(store: &Arc<FaultyStore>, db: &Db, path: &Path) -> Vec<(PathBuf, Ve
         manifest: &manifest,
         generation: db.storage.info().generation,
         log_offset: db.storage.info().log_offset,
-        encryption: db.storage.encryption(),
+        key: db.storage.encryption(),
         log_encryption: None,
     };
     assert!(warm::write(&closing).unwrap());
@@ -362,7 +362,7 @@ fn every_check_refuses_on_its_own() {
         serde_json::from_slice(&std::fs::read(sidecar(&path)).unwrap()).unwrap();
     let remote = Remote::new(store.clone(), PREFIX);
     let manifest = super::manifest(&store);
-    assert!(warm::check(&side, &manifest, &cfg, &remote, &path).is_ok());
+    assert!(warm::check(&side, &manifest, None, &remote, &path).is_ok());
 
     type Change = Box<dyn Fn(&mut warm::Sidecar)>;
     let variants: Vec<(&str, Change)> = vec![
@@ -376,7 +376,10 @@ fn every_check_refuses_on_its_own() {
             "epoch",
             Box::new(|s| s.epoch = "00000000000000000009-0000000001".into()),
         ),
-        ("encryption", Box::new(|s| s.encrypted = true)),
+        (
+            "key_fingerprint",
+            Box::new(|s| s.key_fingerprint = Some(super::key("ab").fingerprint().into())),
+        ),
         ("db_size", Box::new(|s| s.db_size += 1)),
         ("db_crc32c", Box::new(|s| s.db_crc32c ^= 1)),
         (
@@ -397,7 +400,7 @@ fn every_check_refuses_on_its_own() {
         let mut changed = side.clone();
         change(&mut changed);
         assert!(
-            warm::check(&changed, &manifest, &cfg, &remote, &path).is_err(),
+            warm::check(&changed, &manifest, None, &remote, &path).is_err(),
             "{field}"
         );
     }
@@ -554,10 +557,10 @@ fn a_missing_earlier_log_object_is_never_skipped() {
         .collect();
     log.sort();
     assert!(log.len() >= 3, "{log:?}");
-    assert!(warm::check(&side, &manifest, &cfg, &remote, &path).is_ok());
+    assert!(warm::check(&side, &manifest, None, &remote, &path).is_ok());
     remote.delete(&log[0]).unwrap();
 
-    let why = warm::check(&side, &manifest, &cfg, &remote, &path).unwrap_err();
+    let why = warm::check(&side, &manifest, None, &remote, &path).unwrap_err();
     assert!(why.contains("gap"), "{why}");
     // Before: the warm open succeeded where the full restore fails.
     match open_db(&cfg, &path) {

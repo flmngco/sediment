@@ -388,7 +388,7 @@ defmodule Sediment.S3Test do
     refused = fn ->
       for opts <- [[], [encryption: false], [encryption: wrong]] do
         assert {:error, message} = Engine.open(path.("r.db"), [s3: replica] ++ opts)
-        assert message =~ "is encrypted" or message =~ "another :encryption key", message
+        assert message =~ "is encrypted" or message =~ "not the key that encrypted", message
       end
     end
 
@@ -1997,7 +1997,8 @@ defmodule Sediment.S3Test do
       :ok = Engine.close(db)
 
       assert {:error, msg} = Engine.open(Path.join(dir, "b.db"), s3: s3, encryption: @wrong)
-      assert msg =~ "wrong key"
+      assert msg =~ "key default in the ring is not the key that encrypted this database"
+      refute msg =~ String.slice(@wrong[:key], 0, 16)
       assert {:error, _} = Engine.open(Path.join(dir, "c.db"), s3: s3)
 
       {:ok, restored} = Engine.open(Path.join(dir, "d.db"), s3: s3, encryption: @enc)

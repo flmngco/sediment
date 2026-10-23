@@ -40,7 +40,7 @@ pub fn destroy(cfg: &S3Config, force: bool) -> Result<Destroyed> {
         probe::verify(&remote, &cfg.store_identity())?;
     }
     let owner = cfg.owner.clone().unwrap_or_else(default_owner);
-    let lease = Lease::acquire_to_destroy(remote.clone(), owner.clone(), cfg.lease_ttl, force)?;
+    let lease = Lease::acquire_exclusive(remote.clone(), owner.clone(), cfg.lease_ttl, force)?;
     let ended = end(&remote, &lease, &owner);
     // Not left to Drop: the renewal thread may hold the lease a while longer.
     lease.release();
@@ -52,7 +52,7 @@ pub fn destroy(cfg: &S3Config, force: bool) -> Result<Destroyed> {
 /// thread of its own, uploading pending commits first) is waited for, as
 /// long as an open would wait for it. An owner's death reaches the NIF
 /// asynchronously, so connections still open get a moment to start closing.
-fn wait_until_closed(cfg: &S3Config) -> Result<()> {
+pub(crate) fn wait_until_closed(cfg: &S3Config) -> Result<()> {
     const GRACE: Duration = Duration::from_millis(250);
     let place = cfg.place();
     let start = Instant::now();

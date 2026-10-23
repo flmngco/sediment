@@ -25,6 +25,13 @@ pub enum S3Error {
     /// Commits acknowledged earlier (async) never reached S3; reported until
     /// acknowledged (`S3DurableStorage::acknowledge_loss`).
     Lost(String),
+    /// The open needs this key, which its ring (resolved on demand through
+    /// `key_for`) doesn't hold yet: the caller adds it and opens again.
+    /// Returned before anything was written to S3 but the lease.
+    KeyNeeded(String),
+    /// A manifest PUT whose outcome is unknown: it failed, and the manifest
+    /// couldn't be read back to tell whether it landed.
+    Indeterminate(String),
 }
 
 pub type Result<T> = std::result::Result<T, S3Error>;
@@ -63,6 +70,10 @@ impl fmt::Display for S3Error {
             S3Error::Turso(msg) => write!(f, "s3 bootstrap: {msg}"),
             S3Error::Timeout(msg) => write!(f, "{msg}"),
             S3Error::Lost(msg) => write!(f, "{msg}"),
+            S3Error::Indeterminate(msg) => write!(f, "s3 indeterminate: {msg}"),
+            S3Error::KeyNeeded(id) => {
+                write!(f, "s3 config: needs key {id}, which is not in the ring")
+            }
         }
     }
 }

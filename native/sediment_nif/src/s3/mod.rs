@@ -5,15 +5,19 @@
 //! the writer lease, and returns the storage to attach with
 //! `OpenOptions::durable_storage`.
 
+mod census;
 mod config;
 mod destroy;
 mod error;
+pub mod hook;
 pub(crate) mod import;
+pub mod keys;
 mod layout;
 mod lease;
 mod logfmt;
 pub mod meter;
 mod probe;
+mod rekey;
 pub mod remote;
 pub mod replica;
 pub mod restore;
@@ -32,10 +36,13 @@ use std::sync::{Arc, Mutex, Weak};
 use turso_core::mvcc::persistent_storage::Storage;
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
+pub use census::{key_census, Census};
 pub use config::S3Config;
 pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
+pub use keys::{Key, KeyRecord, KeyRing};
+pub use rekey::{rekey, release_key, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;
 pub use storage::Loss;
@@ -109,7 +116,9 @@ fn prepare_at(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>) -> Result<Atta
     // opens of other files look there too. The caller serializes opens of
     // one file (the NIF's per-file open lock), so no other restore of it
     // runs now.
-    let storage = prepare_fresh(cfg, local_path, io)?;
+    let Fresh::Opened { storage, .. } = prepare_fresh(cfg, local_path, io, &Op::Open)? else {
+        unreachable!("an open always opens")
+    };
     let attached = Attached::try_new(&storage).expect("a new storage isn't closing");
     // The restore put a new file in place: register its identity.
     LIVE.lock()
@@ -326,18 +335,59 @@ fn open_at(place: &str) -> Option<(bool, std::time::Duration)> {
     found
 }
 
-fn prepare_fresh(
-    cfg: &S3Config,
-    local_path: &Path,
-    io: Arc<dyn IO>,
-) -> Result<Arc<S3DurableStorage>> {
+/// What a writer open does besides opening the database.
+#[derive(Clone, Debug)]
+pub(crate) enum Op {
+    Open,
+    /// `Sediment.S3.rekey/3`: re-encrypt under the key `to` (the ring's
+    /// active one without it). A retired key only with `allow_reuse`.
+    Rekey {
+        to: Option<String>,
+        force: bool,
+        allow_reuse: bool,
+    },
+    /// `Sediment.S3.release_key/4`: drop the retained epochs under `key`.
+    Release {
+        key: String,
+        force: bool,
+    },
+}
+
+impl Op {
+    /// Like a destroy, a maintenance operation refuses any unexpired lease,
+    /// this owner's too, unless forced: it may be a writer still running.
+    fn exclusive(&self) -> Option<bool> {
+        match self {
+            Op::Open => None,
+            Op::Rekey { force, .. } | Op::Release { force, .. } => Some(*force),
+        }
+    }
+}
+
+/// A writer open's result.
+pub(crate) enum Fresh {
+    Opened {
+        storage: Arc<S3DurableStorage>,
+        /// The key ids it moved the database from and to, if it rekeyed.
+        rekeyed: Option<(String, String)>,
+        /// The epochs it dropped from the history (`Op::Release`).
+        released: Vec<Epoch>,
+    },
+    /// Nothing to do: the database is under the rekey's key already, or no
+    /// retained epoch is under the released key. Nothing was written but
+    /// the lease, which is released.
+    Unchanged,
+}
+
+fn prepare_fresh(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>, op: &Op) -> Result<Fresh> {
     // Taken before anything touches the local files: an open that fails or
     // crashes from here on leaves no sidecar to trust.
     let sidecar = warm::take(local_path);
     let remote = cfg.remote()?;
+    let must_exist = cfg.must_exist || !matches!(op, Op::Open);
     // Before anything is written (the probe, the lease): a mistyped bucket
     // or prefix gets nothing. Checked again under the lease below.
-    if cfg.must_exist && restore::read_manifest(&remote)?.is_none() {
+    if must_exist && restore::read_manifest(&remote)?.is_none() {
         return Err(no_database(cfg));
     }
     require_encryption_choice(cfg, &remote)?;
@@ -346,7 +396,35 @@ fn prepare_fresh(
         probe::verify(&remote, &cfg.store_identity())?;
     }
     let owner = cfg.owner.clone().unwrap_or_else(default_owner);
-    let lease = Lease::acquire(remote.clone(), owner.clone(), cfg.lease_ttl)?;
+    let lease = match op.exclusive() {
+        None => Lease::acquire(remote.clone(), owner.clone(), cfg.lease_ttl)?,
+        Some(force) => {
+            Lease::acquire_exclusive(remote.clone(), owner.clone(), cfg.lease_ttl, force)?
+        }
+    };
+    // The renewal thread holds the lease now and then, so dropping it may
+    // release it only later: give it up at once when this open ends
+    // without a storage (a maintenance operation's re-run, or another
+    // owner's open, need it now). A crash (test hook) gave it up already.
+    let fresh = prepare_under_lease(cfg, local_path, io, op, &remote, sidecar, owner, &lease);
+    if !matches!(fresh, Ok(Fresh::Opened { .. })) {
+        lease.release();
+    }
+    fresh
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_under_lease(
+    cfg: &S3Config,
+    local_path: &Path,
+    io: Arc<dyn IO>,
+    op: &Op,
+    remote: &remote::Remote,
+    sidecar: Option<warm::Sidecar>,
+    owner: String,
+    lease: &Arc<Lease>,
+) -> Result<Fresh> {
+    let must_exist = cfg.must_exist || !matches!(op, Op::Open);
     let generation = lease.generation();
 
     let current = match remote.get(MANIFEST_KEY)? {
@@ -356,18 +434,35 @@ fn prepare_fresh(
     if let Some((state, _)) = &current {
         refuse_newer(state.generation(), generation)?;
     }
-    if cfg.must_exist && !matches!(current, Some((ManifestState::Database(_), _))) {
+    if must_exist && !matches!(current, Some((ManifestState::Database(_), _))) {
         return Err(no_database(cfg));
     }
-    let (manifest, version, published) = match current {
+    let mut rekeyed = None;
+    let mut released = Vec::new();
+    let (manifest, version, published, key) = match current {
         Some((ManifestState::Database(decoded), object_version)) => {
+            // The key comes from the manifest just read under the lease,
+            // before anything is written: an unknown id, or another key under
+            // the id, is refused by name, and a key_for ring asks for the key
+            // it lacks (`S3Error::KeyNeeded`).
+            let key = resolve_key(cfg, decoded.key.as_ref())?;
+            let target = rekey_target(cfg, op, &decoded, key.as_ref())?;
+            if matches!(op, Op::Rekey { .. }) && target.is_none() {
+                return Ok(Fresh::Unchanged);
+            }
+            if let Op::Release { key: id, .. } = op {
+                released = released_epochs(&decoded, id)?;
+                if released.is_empty() {
+                    return Ok(Fresh::Unchanged);
+                }
+            }
+            let remote = remote.clone().for_key(key.as_ref())?;
             // Take the manifest over before reading the log: from here on no
             // stale writer can publish, or acknowledge a commit (see
             // `S3DurableStorage::confirm_ownership`).
-            check_encryption(&decoded, cfg)?;
             // Checked against the manifest as the previous writer left it.
             let warm = sidecar.as_ref().and_then(|sidecar| {
-                warm::check(sidecar, &decoded, cfg, &remote, local_path)
+                warm::check(sidecar, &decoded, key.as_ref(), &remote, local_path)
                     .map_err(|why| {
                         tracing::info!("s3: full restore of {}: {why}", local_path.display())
                     })
@@ -377,9 +472,6 @@ fn prepare_fresh(
                 generation,
                 writer: owner,
                 updated_at_ms: now_ms(),
-                // Unchanged until the restore below shows what the key (or
-                // its absence) reads: a wrong guess here would lock the
-                // database out of every later open.
                 ..decoded
             };
             let version = remote
@@ -397,26 +489,35 @@ fn prepare_fresh(
                 .map_err(|err| tracing::warn!("s3: reusing {} failed: {err}", local_path.display()))
                 .ok()
             });
-            if reused.is_none() {
-                restore::restore_and_seal(
+            let log = match reused {
+                Some(log) => log,
+                None => restore::restore_and_seal(
                     &remote,
                     &manifest,
                     local_path,
                     cfg.download_concurrency,
                     generation,
                     None,
-                )
-                .map_err(|err| missing_key_hint(err, cfg))?;
-            }
+                )?,
+            };
+            // The new epoch starts at the store's time of the seal that
+            // closed the old one: every frame of the old epoch landed
+            // before it, every frame of the new one lands after the
+            // manifest below.
+            let boundary = remote.boundary(&manifest.epoch.segment_key(log.len))?;
             // The restored snapshot, before the log is replayed into it: the
-            // new epoch's snapshot can be a delta on top of it.
-            let restored = cfg
-                .incremental_snapshots
+            // new epoch's snapshot can be a delta on top of it. Never across
+            // a rekey: a chain is under one key.
+            let restored = (cfg.incremental_snapshots && target.is_none())
                 .then(|| Digests::of_file(local_path))
                 .transpose()?;
             // Every open moves to an epoch of its own: an earlier incarnation's
             // or a stale writer's late PUTs can only target the old one.
-            checkpoint_local(local_path, cfg.encryption.as_ref())?;
+            checkpoint_local(local_path, key.as_ref())?;
+            if let (Some(from), Some(to)) = (&key, &target) {
+                rekey::reencrypt(local_path, from, to)?;
+                rekeyed = Some((from.id().to_string(), to.id().to_string()));
+            }
             let epoch = manifest.epoch.next(generation);
             let record = manifest.current();
             let published = snapshot::publish(
@@ -425,39 +526,51 @@ fn prepare_fresh(
                 local_path,
                 restored.as_ref().map(|d| (&record, d)),
             )?;
+            let key = target.or(key);
             let mut fresh = manifest.advance(
                 epoch,
                 &published,
                 generation,
                 &manifest.writer,
                 cfg.retain_epochs,
+                key.as_ref().map(Key::record),
+                boundary,
             );
-            // The restore and checkpoint read the database with this key, or
-            // without one: that is what it is (also for manifests that
-            // didn't record it).
-            fresh.encrypted = Some(cfg.encryption.is_some());
-            let version = remote
-                .put(MANIFEST_KEY, fresh.encode(), Put::Update(version))
-                .map_err(fenced_on_conflict)?;
-            (fresh, version, published)
+            fresh
+                .history
+                .retain(|record| !released.contains(&record.epoch));
+            if !matches!(op, Op::Open) {
+                hook::at(hook::PUBLISH, &cfg.place(), lease)?;
+            }
+            // A rekey's switch: If-Match on the takeover, so a writer that
+            // took over since (during the copy, say) gets this one fenced
+            // with nothing switched.
+            let version = publish_manifest(&remote, &fresh, version)?;
+            (fresh, version, published, key)
         }
         // A destroyed database: finish its purge (a destroy may have been
         // interrupted), then start a new one in its place.
         Some((ManifestState::Destroyed(tombstone), object_version)) => {
-            purge(&remote, &tombstone)?;
-            check_no_old_objects(&remote, Some(&tombstone))?;
-            refuse_to_replace_local_data(local_path, cfg)?;
-            bootstrap_local(local_path, cfg.encryption.as_ref())?;
+            let key = new_database_key(cfg)?;
+            purge(remote, &tombstone)?;
+            check_no_old_objects(remote, Some(&tombstone))?;
+            refuse_to_replace_local_data(local_path, key.as_ref())?;
+            bootstrap_local(local_path, key.as_ref())?;
             let over = Some((&tombstone, object_version));
-            create_database(&remote, cfg, generation, owner, local_path, over)
-                .map_err(fenced_on_conflict)?
+            let (manifest, version, published) =
+                create_database(remote, key.as_ref(), generation, owner, local_path, over)
+                    .map_err(fenced_on_conflict)?;
+            (manifest, version, published, key)
         }
         None => {
-            check_no_old_objects(&remote, None)?;
-            refuse_to_replace_local_data(local_path, cfg)?;
-            bootstrap_local(local_path, cfg.encryption.as_ref())?;
-            create_database(&remote, cfg, generation, owner, local_path, None)
-                .map_err(fenced_on_conflict)?
+            let key = new_database_key(cfg)?;
+            check_no_old_objects(remote, None)?;
+            refuse_to_replace_local_data(local_path, key.as_ref())?;
+            bootstrap_local(local_path, key.as_ref())?;
+            let (manifest, version, published) =
+                create_database(remote, key.as_ref(), generation, owner, local_path, None)
+                    .map_err(fenced_on_conflict)?;
+            (manifest, version, published, key)
         }
     };
 
@@ -466,7 +579,7 @@ fn prepare_fresh(
         .to_str()
         .ok_or_else(|| S3Error::Config("database path must be valid UTF-8".into()))?;
     let file = io.open_file(log_path, OpenFlags::default(), false)?;
-    let inner = Storage::new(file, io, cfg.encryption_ctx()?);
+    let inner = Storage::new(file, io, key.as_ref().map(Key::context).transpose()?);
     if let Some(threshold) = cfg.checkpoint_threshold {
         turso_core::mvcc::persistent_storage::DurableStorage::set_checkpoint_threshold(
             &inner, threshold,
@@ -474,17 +587,172 @@ fn prepare_fresh(
     }
     let storage = Arc::new(S3DurableStorage::new(
         inner,
-        remote,
-        lease,
+        remote.clone().for_key(key.as_ref())?,
+        lease.clone(),
         cfg,
         local_path.to_path_buf(),
         (manifest, version),
         cfg.incremental_snapshots
             .then_some((published.key, published.digests)),
+        key,
     ));
     storage.collect_garbage_now();
     storage.start_uploader();
-    Ok(storage)
+    Ok(Fresh::Opened {
+        storage,
+        rekeyed,
+        released,
+    })
+}
+
+/// The key `Op::Rekey` moves the database to (the ring's active one unless
+/// it names one), or `None` when the database is under it already. A key
+/// the database was rotated away from is refused unless reuse is allowed.
+fn rekey_target(
+    cfg: &S3Config,
+    op: &Op,
+    manifest: &Manifest,
+    current: Option<&Key>,
+) -> Result<Option<Key>> {
+    let Op::Rekey {
+        to, allow_reuse, ..
+    } = op
+    else {
+        return Ok(None);
+    };
+    let Some(ring) = &cfg.encryption else {
+        return Err(S3Error::Config(
+            "a rekey needs the :encryption key ring with the key to move to".into(),
+        ));
+    };
+    let target = match to {
+        Some(id) => ring.need(id, |ring| {
+            format!("rekey: key {id} is not in the ring (ring: {ring})")
+        })?,
+        None => ring.active()?,
+    };
+    let current = current.ok_or_else(|| S3Error::Config(UNENCRYPTED_WITH_KEY.into()))?;
+    if current.id() == target.id() {
+        // The fingerprint was checked: the ring's key under that id is the
+        // database's.
+        return Ok(None);
+    }
+    if target.cipher() != current.cipher() {
+        return Err(S3Error::Config(format!(
+            "rekey: key {} is for {}, the database's key {} for {}: a rekey keeps the cipher",
+            target.id(),
+            target.cipher(),
+            current.id(),
+            current.cipher()
+        )));
+    }
+    if let Some(retired) = manifest
+        .retired_keys
+        .iter()
+        .find(|r| r.id == target.id() || r.fingerprint == target.fingerprint())
+    {
+        if !allow_reuse {
+            return Err(S3Error::Config(format!(
+                "rekey: key {} (fingerprint {}) was retired from this database at {} (unix ms) \
+                 as key {}; a rekey moves to a new key (allow_reuse: true to move back, once \
+                 its retained epochs are released)",
+                target.id(),
+                target.fingerprint(),
+                retired.retired_at_ms,
+                retired.id
+            )));
+        }
+        // Each key has at most one pinned run: its old one must be gone.
+        if manifest.history.iter().any(|record| {
+            record
+                .key
+                .as_ref()
+                .is_some_and(|key| key.id == retired.id || key.fingerprint == retired.fingerprint)
+        }) {
+            return Err(S3Error::Config(format!(
+                "rekey: key {} still has retained epochs from when it was current; release them \
+                 first (Sediment.S3.release_key/4), then reuse it",
+                retired.id
+            )));
+        }
+    }
+    Ok(Some(target.clone()))
+}
+
+/// The epoch-advance manifest PUT (`If-Match` on the takeover). A failure is
+/// never reported while this PUT can still land: after any error the
+/// manifest is read back. Ours: adopted. Still the version we hold: the PUT
+/// may be in flight, so the same body is sent again on that version.
+/// Foreign: another writer moved the manifest, so ours can't land anymore
+/// (fenced). Still ours-held or unreadable after the retries: the outcome
+/// is unknown.
+fn publish_manifest(
+    remote: &remote::Remote,
+    manifest: &Manifest,
+    held: object_store::UpdateVersion,
+) -> Result<object_store::UpdateVersion> {
+    const ATTEMPTS: usize = 4;
+    let body = manifest.encode();
+    let mut last = String::new();
+    for _ in 0..ATTEMPTS {
+        let err = match remote.put(MANIFEST_KEY, body.clone(), Put::Update(held.clone())) {
+            Ok(version) => return Ok(version),
+            Err(err) => err,
+        };
+        match remote.get(MANIFEST_KEY) {
+            Ok(Some(object)) if object.bytes == body => return Ok(object.version),
+            Ok(Some(object))
+                if object.version.e_tag.is_some() && object.version.e_tag == held.e_tag =>
+            {
+                last = format!("{err}, and the manifest is still the one this open holds");
+            }
+            // Another writer's manifest that still names our epoch: ours
+            // landed, and that writer took over after it.
+            Ok(Some(object))
+                if Manifest::decode(&object.bytes).is_ok_and(|current| {
+                    current
+                        .retained()
+                        .any(|record| record.epoch == manifest.epoch)
+                }) =>
+            {
+                return Err(S3Error::Fenced(format!(
+                    "this open's manifest (epoch {}, key {}) landed, then another writer took \
+                     the database over",
+                    manifest.epoch,
+                    manifest.key.as_ref().map_or("none", |key| key.id.as_str())
+                )))
+            }
+            Ok(_) => {
+                return Err(fenced_on_conflict(match err {
+                    S3Error::Conflict(msg) => S3Error::Conflict(msg),
+                    other => {
+                        S3Error::Conflict(format!("{other}, and the manifest is another writer's"))
+                    }
+                }))
+            }
+            Err(read) => last = format!("{err}, and reading it back failed too ({read})"),
+        }
+    }
+    Err(S3Error::Indeterminate(format!(
+        "the manifest PUT of epoch {} failed ({last}): whether it landed is unknown",
+        manifest.epoch
+    )))
+}
+
+/// The retained epochs `release_key` drops: those under `id`. The current
+/// key is refused: its epoch is the database.
+fn released_epochs(manifest: &Manifest, id: &str) -> Result<Vec<Epoch>> {
+    if manifest.key.as_ref().is_some_and(|key| key.id == id) {
+        return Err(S3Error::Config(format!(
+            "key {id} is the current key of this database: rekey it to another key first"
+        )));
+    }
+    Ok(manifest
+        .history
+        .iter()
+        .filter(|record| record.key.as_ref().is_some_and(|key| key.id == id))
+        .map(|record| record.epoch)
+        .collect())
 }
 
 /// Checkpoint images a previous writer of this file left behind (a crash
@@ -509,11 +777,14 @@ fn remove_snapshot_images(local_path: &Path) {
 }
 
 /// Result of [`restore_to`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Restored {
     pub epoch: String,
     pub epoch_started_at_ms: u64,
     pub frames: usize,
+    /// The key of the restored epoch, which the restored file is encrypted
+    /// with.
+    pub key: Option<Key>,
 }
 
 /// A restore renames a new file over the local path. Over a symlink, that
@@ -551,21 +822,22 @@ fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Res
     // Like a replica's refresh (see replica::stage): only a log the writer
     // still owned after it was listed.
     let mut attempts = 0;
-    let (point, log) = loop {
+    let (point, log, key) = loop {
         let manifest = restore::read_manifest(&remote)?
             .ok_or_else(|| S3Error::Config("no database at this S3 prefix".into()))?;
         require_encryption_choice_for(cfg, Some(&manifest))?;
-        check_encryption(&manifest, cfg)?;
         let point = restore::choose(&manifest, target)?;
-        let log = restore::restore_point(&remote, &point, local_path, cfg.download_concurrency)
-            .map_err(|err| missing_key_hint(err, cfg))?;
+        // The key recorded for that epoch, whatever the current one is.
+        let key = restore_key(cfg, point.record.key.as_ref())?;
+        let remote = remote.clone().for_key(key.as_ref())?;
+        let log = restore::restore_point(&remote, &point, local_path, cfg.download_concurrency)?;
         // An epoch before the current one was sealed by whoever replaced it.
         if point.record.epoch == manifest.epoch && !restore::usable(&manifest, &log) {
             return Err(restore::taking_over(&manifest));
         }
         attempts += 1;
         if restore::still_retained(&remote, point.record.epoch)? {
-            break (point, log);
+            break (point, log, key);
         }
         if attempts == 3 {
             return Err(S3Error::Timeout(
@@ -575,11 +847,12 @@ fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Res
             ));
         }
     };
-    checkpoint_local(local_path, cfg.encryption.as_ref())?;
+    checkpoint_local(local_path, key.as_ref())?;
     Ok(Restored {
         epoch: point.record.epoch.to_string(),
         epoch_started_at_ms: point.record.started_at_ms,
         frames: log.frames,
+        key,
     })
 }
 
@@ -609,12 +882,7 @@ pub(crate) fn require_encryption_choice_for(
         return Ok(());
     }
     Err(S3Error::Config(match existing {
-        Some(manifest) if manifest.encrypted == Some(true) => ENCRYPTED_NEEDS_KEY.into(),
-        Some(manifest) if manifest.encrypted.is_none() => {
-            "this S3 prefix holds a database: open it with the :encryption option it was \
-             created with, or with encryption: false if it is unencrypted"
-                .into()
-        }
+        Some(manifest) if manifest.key.is_some() => ENCRYPTED_NEEDS_KEY.into(),
         Some(_) => UNENCRYPTED_NEEDS_OPT_OUT.into(),
         None => "S3 databases are encrypted by default: set encryption: [cipher: \"aegis256\", \
                  key: \"<64 hex chars>\"] (generate a key with Sediment.S3.generate_key() or \
@@ -632,59 +900,68 @@ const UNENCRYPTED_WITH_KEY: &str = "the database at this S3 prefix is unencrypte
      with encryption: false (it was created without a key; to encrypt it, import its data \
      into a new prefix with Sediment.S3.import/3 and a key)";
 
+const ENCRYPTED_NEEDS_KEY: &str = "the database at this S3 prefix is encrypted: open or \
+                                   restore it with an :encryption key ring holding its key";
+
+/// The key `recorded` (a manifest's current key) names, from the open's
+/// ring; `None` for an unencrypted database. Refuses a ring on an
+/// unencrypted database and no ring on an encrypted one, an id the ring
+/// lacks, and a ring key under the id that isn't the recorded key.
+pub(crate) fn resolve_key(cfg: &S3Config, recorded: Option<&KeyRecord>) -> Result<Option<Key>> {
+    resolve_with(cfg, recorded, KeyRing::resolve)
+}
+
+/// [`resolve_key`] for a restore of an epoch whose key is `recorded`.
+pub(crate) fn restore_key(cfg: &S3Config, recorded: Option<&KeyRecord>) -> Result<Option<Key>> {
+    resolve_with(cfg, recorded, KeyRing::resolve_for_restore)
+}
+
+fn resolve_with(
+    cfg: &S3Config,
+    recorded: Option<&KeyRecord>,
+    resolve: impl for<'a> Fn(&'a KeyRing, &KeyRecord) -> Result<&'a Key>,
+) -> Result<Option<Key>> {
+    match (recorded, &cfg.encryption) {
+        (Some(record), Some(ring)) => resolve(ring, record).cloned().map(Some),
+        (Some(_), None) => Err(S3Error::Config(ENCRYPTED_NEEDS_KEY.into())),
+        // Refused before anything is written: a key can't read a plaintext
+        // database.
+        (None, Some(_)) => Err(S3Error::Config(UNENCRYPTED_WITH_KEY.into())),
+        (None, None) if cfg.unencrypted => Ok(None),
+        (None, None) => Err(S3Error::Config(UNENCRYPTED_NEEDS_OPT_OUT.into())),
+    }
+}
+
+/// The key a new database is created under: the ring's active one.
+pub(crate) fn new_database_key(cfg: &S3Config) -> Result<Option<Key>> {
+    match &cfg.encryption {
+        Some(ring) => ring.active().cloned().map(Some),
+        None if cfg.unencrypted => Ok(None),
+        None => require_encryption_choice_for(cfg, None).map(|()| None),
+    }
+}
+
 /// A database already open in this VM (a writer's storage, a replica's
 /// generation) was opened with `existing`. Another open shares its decrypted
-/// state, so it must make the same choice: the same key, or none with
-/// `encryption: false`.
-pub fn check_same_encryption(
-    existing: Option<&turso_core::EncryptionOpts>,
-    cfg: &S3Config,
-) -> Result<()> {
+/// state, so its ring must hold that same key (or it must make the same
+/// choice of no key, with `encryption: false`).
+pub fn check_same_encryption(existing: Option<&Key>, cfg: &S3Config) -> Result<()> {
     let refuse = |message: &str| Err(S3Error::Config(message.into()));
     match (existing, &cfg.encryption) {
-        (Some(open), Some(given))
-            if open.cipher == given.cipher && open.hexkey.eq_ignore_ascii_case(&given.hexkey) =>
-        {
-            Ok(())
+        (Some(open), Some(ring)) => {
+            let key = ring.need(open.id(), |ring| {
+                format!(
+                    "the database at this S3 prefix is open in this VM under key {}, which is \
+                     not in the ring (ring: {ring}); every open needs the key it is under",
+                    open.id()
+                )
+            })?;
+            keys::check_matches(key, &open.record())
         }
-        (Some(_), Some(_)) => refuse(
-            "the database at this S3 prefix is open in this VM with another :encryption key; \
-             every open needs the key it was created with",
-        ),
         (Some(_), None) => refuse(ENCRYPTED_NEEDS_KEY),
         (None, Some(_)) => refuse(UNENCRYPTED_WITH_KEY),
         (None, None) if cfg.unencrypted => Ok(()),
         (None, None) => refuse(UNENCRYPTED_NEEDS_OPT_OUT),
-    }
-}
-
-const ENCRYPTED_NEEDS_KEY: &str = "the database at this S3 prefix is encrypted: open or \
-                                   restore it with the :encryption option it was created with";
-
-pub(crate) fn check_encryption(manifest: &Manifest, cfg: &S3Config) -> Result<()> {
-    match (manifest.encrypted, &cfg.encryption) {
-        (Some(true), None) => Err(S3Error::Config(ENCRYPTED_NEEDS_KEY.into())),
-        // Refused before anything is written: a key can't read a plaintext
-        // database, and the attempt must not mark it encrypted.
-        (Some(false), Some(_)) => Err(S3Error::Config(UNENCRYPTED_WITH_KEY.into())),
-        _ => Ok(()),
-    }?;
-    Ok(())
-}
-
-/// Manifests from before the `encrypted` flag: a broken CRC chain without a
-/// key may just be an encrypted database opened without `:encryption`.
-pub(crate) fn missing_key_hint(err: S3Error, cfg: &S3Config) -> S3Error {
-    match err {
-        S3Error::Corrupt(message)
-            if cfg.encryption.is_none() && message.contains("crc chain broken") =>
-        {
-            S3Error::Corrupt(format!(
-                "{message} (if this database is encrypted, pass the :encryption option it was \
-                 created with)"
-            ))
-        }
-        other => other,
     }
 }
 
@@ -791,7 +1068,7 @@ pub(crate) fn purge(remote: &remote::Remote, tombstone: &Tombstone) -> Result<us
 /// another writer got there first).
 fn create_database(
     remote: &remote::Remote,
-    cfg: &S3Config,
+    key: Option<&Key>,
     generation: u64,
     owner: String,
     local_path: &Path,
@@ -803,6 +1080,8 @@ fn create_database(
     };
     let epoch = Epoch { seq, generation };
     let published = snapshot::publish(remote, epoch, local_path, None)?;
+    // The first epoch starts at the store's time of its snapshot.
+    let started_at_ms = remote.boundary(&published.key)?;
     let snapshot = &published.snapshot;
     let manifest = Manifest {
         version: MANIFEST_VERSION,
@@ -816,9 +1095,10 @@ fn create_database(
         snapshot_base: Vec::new(),
         writer: owner,
         updated_at_ms: now_ms(),
-        started_at_ms: now_ms(),
+        started_at_ms,
         history: Vec::new(),
-        encrypted: Some(cfg.encryption.is_some()),
+        key: key.map(Key::record),
+        retired_keys: Vec::new(),
         database_id: Some(format!("{:016x}{:016x}", rand_u64(), rand_u64())),
     };
     let version = remote.put(MANIFEST_KEY, manifest.encode(), mode)?;
@@ -830,7 +1110,7 @@ fn create_database(
 /// keep, or the local copy of a prefix someone emptied). A database with
 /// nothing but turso's internal tables (e.g. what an earlier bootstrap that
 /// failed before its manifest left) is replaced. A file that can't be read isn't assumed empty.
-fn refuse_to_replace_local_data(path: &Path, cfg: &S3Config) -> Result<()> {
+fn refuse_to_replace_local_data(path: &Path, key: Option<&Key>) -> Result<()> {
     let has_bytes = |p: &Path| std::fs::metadata(p).is_ok_and(|meta| meta.len() > 0);
     if ![
         path.to_path_buf(),
@@ -843,7 +1123,7 @@ fn refuse_to_replace_local_data(path: &Path, cfg: &S3Config) -> Result<()> {
         return Ok(());
     }
     let mut entries = 0;
-    let read = with_local_connection(path, cfg.encryption.as_ref(), |conn| {
+    let read = with_local_connection(path, key.map(Key::opts).as_ref(), |conn| {
         let rows = conn
             .query(
                 "SELECT count(*) FROM sqlite_schema \
@@ -863,17 +1143,16 @@ fn refuse_to_replace_local_data(path: &Path, cfg: &S3Config) -> Result<()> {
         Err(err) => format!("a file that can't be read as a database ({err})"),
     };
     Err(S3Error::Config(format!(
-        "{} holds {what}, but the S3 prefix {:?} has no database; refusing to replace \
+        "{} holds {what}, but the S3 prefix has no database; refusing to replace \
          the local file with a new, empty database. To start empty, move or delete it \
          (and its -wal and .db-log files). To upload it as this prefix's database, \
          import it (Sediment.S3.import/3). If the prefix should hold this database's \
          S3 copy, check the bucket and prefix",
         path.display(),
-        cfg.prefix
     )))
 }
 
-fn bootstrap_local(path: &Path, encryption: Option<&turso_core::EncryptionOpts>) -> Result<()> {
+fn bootstrap_local(path: &Path, key: Option<&Key>) -> Result<()> {
     for stale in [
         path.to_path_buf(),
         restore::wal_path(path),
@@ -881,7 +1160,7 @@ fn bootstrap_local(path: &Path, encryption: Option<&turso_core::EncryptionOpts>)
     ] {
         restore::remove_if_exists(&stale)?;
     }
-    with_local_connection(path, encryption, |conn| {
+    with_local_connection(path, key.map(Key::opts).as_ref(), |conn| {
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     })
@@ -889,8 +1168,8 @@ fn bootstrap_local(path: &Path, encryption: Option<&turso_core::EncryptionOpts>)
 
 /// Replays the local log into the DB file and empties the log, using turso's
 /// own local storage.
-fn checkpoint_local(path: &Path, encryption: Option<&turso_core::EncryptionOpts>) -> Result<()> {
-    with_local_connection(path, encryption, |conn| {
+fn checkpoint_local(path: &Path, key: Option<&Key>) -> Result<()> {
+    with_local_connection(path, key.map(Key::opts).as_ref(), |conn| {
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     })
 }

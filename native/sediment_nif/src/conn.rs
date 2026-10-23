@@ -621,7 +621,7 @@ type OpenLocks = HashMap<PathBuf, Weak<Mutex<()>>>;
 static OPEN_LOCKS: OnceLock<Mutex<OpenLocks>> = OnceLock::new();
 
 /// The per-file lock serializing opens, or `None` for in-memory databases.
-fn path_lock(path: &str) -> Option<Arc<Mutex<()>>> {
+pub(crate) fn path_lock(path: &str) -> Option<Arc<Mutex<()>>> {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed.starts_with(":memory:") || trimmed.starts_with("file::memory:")
     {
@@ -726,7 +726,10 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
     });
     let opened = match opened {
         Ok(Ok(opened)) => opened,
-        Ok(Err(reason)) => return Ok(error_tuple(env, reason)),
+        Ok(Err(crate::open::OpenError::Message(reason))) => return Ok(error_tuple(env, reason)),
+        Ok(Err(crate::open::OpenError::KeyNeeded(id))) => {
+            return Ok((atoms::error(), (atoms::key_needed(), id)).encode(env))
+        }
         Err(panic) => {
             let reason = stmt::panic_reason(&*panic);
             return Ok(error_tuple(env, format!("internal turso error: {reason}")));

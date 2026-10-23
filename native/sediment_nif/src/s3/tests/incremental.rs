@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::faulty::FaultyStore;
 use super::{config, keys, manifest, open_db, Db, TempDir, PREFIX};
-use crate::s3::layout::{Manifest, MANIFEST_VERSION, MANIFEST_VERSION_CHAIN};
+use crate::s3::layout::{Manifest, MANIFEST_VERSION};
 use crate::s3::remote::{Put, Remote};
 use crate::s3::restore::restore_point;
 use crate::s3::snapshot::MAX_CHAIN;
@@ -52,7 +52,7 @@ fn small_changes_upload_deltas_until_the_chain_is_long() {
         assert!(m.snapshot.ends_with(".delta"), "{}", m.snapshot);
         assert_eq!(m.snapshot_base.len(), start + i);
         assert_eq!(m.snapshot_base[0], full);
-        assert_eq!(m.version, MANIFEST_VERSION_CHAIN);
+        assert_eq!(m.version, MANIFEST_VERSION);
         assert!(
             m.snapshot_stored_size * 10 < full.stored_size,
             "delta {} vs full {}",
@@ -305,13 +305,10 @@ fn manifests_stay_version_2_while_any_retained_epoch_is_a_chain() {
             let m = manifest(&store);
             let chains = m.retained().any(|r| !r.snapshot_base.is_empty());
             saw_full_with_chain_history |= m.snapshot_base.is_empty() && chains;
-            let expected = if chains {
-                MANIFEST_VERSION_CHAIN
-            } else {
-                MANIFEST_VERSION
-            };
+            // One version whatever the history holds (version 2 marked chains
+            // for older drivers, which refuse version 4 anyway).
             assert_eq!(
-                m.version, expected,
+                m.version, MANIFEST_VERSION,
                 "turn_off={turn_off} step {step}: {m:?}"
             );
         }

@@ -19,7 +19,9 @@ pub struct OpenConfig<'a> {
     pub readonly: bool,
     pub create: bool,
     pub journal_mode: Option<String>,
-    pub encryption: Option<EncryptionOpts>,
+    /// The `:encryption` key ring: an S3 open resolves the database's key
+    /// from it, a plain open uses its active key.
+    pub encryption: Option<crate::s3::KeyRing>,
     pub experimental: Vec<String>,
     /// Raw `s3:` option term, handed to the s3 module untouched.
     pub s3: Option<Term<'a>>,
@@ -35,6 +37,35 @@ const JOURNAL_MODES: [&str; 8] = [
     "mvcc",
     "experimental_mvcc",
 ];
+
+/// Why an open failed: a message, or the key a `key_for` ring must add
+/// before the open is tried again (`{:error, {:key_needed, id}}`).
+#[derive(Debug)]
+pub enum OpenError {
+    Message(String),
+    KeyNeeded(String),
+}
+
+impl From<String> for OpenError {
+    fn from(message: String) -> Self {
+        OpenError::Message(message)
+    }
+}
+
+impl From<&str> for OpenError {
+    fn from(message: &str) -> Self {
+        OpenError::Message(message.to_string())
+    }
+}
+
+impl From<crate::s3::S3Error> for OpenError {
+    fn from(err: crate::s3::S3Error) -> Self {
+        match err {
+            crate::s3::S3Error::KeyNeeded(id) => OpenError::KeyNeeded(id),
+            other => OpenError::Message(other.to_string()),
+        }
+    }
+}
 
 pub struct Opened {
     pub io: Arc<dyn IO>,
@@ -78,16 +109,7 @@ impl<'a> OpenConfig<'a> {
         };
 
         let encryption = match get(opts, atoms::encryption()) {
-            Some(t) => {
-                let cipher = get(t, atoms::cipher())
-                    .and_then(|c| c.decode::<String>().ok())
-                    .ok_or("encryption requires a :cipher")?;
-                let hexkey = get(t, atoms::key())
-                    .and_then(|k| k.decode::<String>().ok())
-                    .ok_or("encryption requires a hex :key")?;
-                check_hex_key(&hexkey)?;
-                Some(EncryptionOpts { cipher, hexkey })
-            }
+            Some(t) => crate::s3_nif::decode_ring(t)?,
             None => None,
         };
 
@@ -124,8 +146,8 @@ impl<'a> OpenConfig<'a> {
         flags
     }
 
-    fn db_opts(&self) -> Result<DatabaseOpts, String> {
-        let mut opts = DatabaseOpts::new().with_encryption(self.encryption.is_some());
+    fn db_opts(&self, encrypted: bool) -> Result<DatabaseOpts, String> {
+        let mut opts = DatabaseOpts::new().with_encryption(encrypted);
         for feature in &self.experimental {
             opts = match feature.as_str() {
                 "views" => opts.with_views(true),
@@ -144,7 +166,7 @@ impl<'a> OpenConfig<'a> {
         Ok(opts)
     }
 
-    pub fn open(&self) -> Result<Opened, String> {
+    pub fn open(&self) -> Result<Opened, OpenError> {
         // See log_guard: a database that can ATTACH is never MVCC, and S3
         // databases (replicas too) always are.
         let attach = self.experimental.iter().any(|feature| feature == "attach");
@@ -165,7 +187,8 @@ impl<'a> OpenConfig<'a> {
             if cfg.replica {
                 self.check_s3()?;
                 cfg.encryption = self.encryption.clone();
-                return crate::replica::open(cfg, &self.path, self.db_opts()?);
+                // The encryption flag follows the replica's resolved key.
+                return crate::replica::open(cfg, &self.path, self.db_opts(false)?);
             }
         }
 
@@ -185,10 +208,6 @@ impl<'a> OpenConfig<'a> {
         } else {
             self.flags()
         };
-        let mut options = OpenOptions::new(Arc::new(SqliteDialect))
-            .flags(flags)
-            .db_opts(self.db_opts()?)
-            .encryption(self.encryption.clone());
 
         // Before an S3 restore writes the MVCC log or turso replays it.
         let path = Path::new(&self.path);
@@ -219,36 +238,61 @@ impl<'a> OpenConfig<'a> {
                 return Err(format!(
                     "{} is open with S3 durability here; journal_mode must stay mvcc, got {mode}",
                     self.path
-                ));
+                )
+                .into());
             }
         }
         if let (None, Some(storage)) = (self.s3, &s3) {
-            // A plain open shares the S3 database's decrypted state: it needs
-            // the same key (or none for an unencrypted one).
-            if !same_encryption(storage.encryption(), self.encryption.as_ref()) {
+            // A plain open shares the S3 database's decrypted state: its ring
+            // needs the key the database is under (or none for an
+            // unencrypted one).
+            let holds = match (storage.encryption(), &self.encryption) {
+                (Some(open), Some(ring)) => ring.get(open.id()).is_some_and(|key| key.same(open)),
+                (None, None) => true,
+                _ => false,
+            };
+            if !holds {
                 return Err(format!(
                     "{} is open with S3 durability here with another :encryption choice; \
-                     open it with the same :encryption",
-                    self.path
-                ));
+                     open it with a ring holding its key{}",
+                    self.path,
+                    storage
+                        .encryption()
+                        .map_or(String::new(), |key| format!(" ({})", key.id()))
+                )
+                .into());
             }
         }
+        // The key turso opens the file with: the one the S3 database is
+        // under, or the ring's active key for a plain open.
+        let encryption: Option<EncryptionOpts> = match &s3 {
+            Some(storage) => storage.encryption().map(crate::s3::Key::opts),
+            None => match &self.encryption {
+                Some(ring) => Some(ring.active()?.opts()),
+                None => None,
+            },
+        };
         if s3.is_none() && !self.is_memory() {
             // turso hands this open the Database already open for the path,
             // with its decrypted pages: only an open with the same key may
             // share it (or none, for an unencrypted file).
             if let Some(open) = plain_encryption(&self.path) {
-                if !same_encryption(open.as_ref(), self.encryption.as_ref()) {
+                if !same_encryption(open.as_ref(), encryption.as_ref()) {
                     return Err(format!(
                         "{} is already open in this VM with another :encryption choice; \
                          every open of a file needs the same :encryption (the key it was \
                          created with, or none for an unencrypted file)",
                         self.path
-                    ));
+                    )
+                    .into());
                 }
             }
         }
-        options = options.durable_storage(s3.clone().map(|s| s as Arc<dyn DurableStorage>));
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
+            .flags(flags)
+            .db_opts(self.db_opts(encryption.is_some())?)
+            .encryption(encryption.clone())
+            .durable_storage(s3.clone().map(|s| s as Arc<dyn DurableStorage>));
 
         let db = Database::open(io.clone(), &self.path, options).map_err(|e| {
             if s3.is_some() && !Path::new(&self.path).exists() {
@@ -260,16 +304,16 @@ impl<'a> OpenConfig<'a> {
         // What the S3 prepare restored (or created) is an MVCC database; any
         // other file here was put in its place since.
         if s3.is_some() && !db.mvcc_enabled() {
-            return Err(removed_while_opening(&self.path));
+            return Err(removed_while_opening(&self.path).into());
         }
         if let Some(claim) = log_claim {
             claim.keep_while(&db);
         }
         if s3.is_none() && !self.is_memory() {
-            register_plain(&self.path, &db, self.encryption.clone());
+            register_plain(&self.path, &db, encryption.clone());
         }
 
-        let key = match &self.encryption {
+        let key = match &encryption {
             Some(enc) => {
                 Some(EncryptionKey::from_hex_string(&enc.hexkey).map_err(|e| e.to_string())?)
             }
@@ -294,11 +338,15 @@ impl<'a> OpenConfig<'a> {
         })
     }
 
-    fn prepare_s3(&self, term: Term<'a>, io: Arc<dyn IO>) -> Result<crate::s3::Attached, String> {
+    fn prepare_s3(
+        &self,
+        term: Term<'a>,
+        io: Arc<dyn IO>,
+    ) -> Result<crate::s3::Attached, OpenError> {
         if self.readonly {
-            return Err(
-                "s3 durability does not support read-only opens; use s3: [mode: :replica]".into(),
-            );
+            return Err(OpenError::from(
+                "s3 durability does not support read-only opens; use s3: [mode: :replica]",
+            ));
         }
         self.check_s3()?;
         // Restoring would replace the file under those connections.
@@ -306,7 +354,8 @@ impl<'a> OpenConfig<'a> {
             return Err(format!(
                 "{} is open without :s3 in this VM; close those connections before opening it with :s3",
                 self.path
-            ));
+            )
+            .into());
         }
         crate::s3_nif::prepare(term, &self.path, self.encryption.clone(), io)
     }
@@ -390,14 +439,4 @@ fn removed_while_opening(path: &str) -> String {
         "s3: {path} was removed or replaced while it was being opened; open it again \
          (the next open restores it from S3)"
     )
-}
-
-/// turso's own error quotes the offending character of the key; this one
-/// doesn't. The key's length is checked by turso against the cipher.
-pub fn check_hex_key(hexkey: &str) -> Result<(), String> {
-    if hexkey.len().is_multiple_of(2) && hexkey.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err("encryption :key must be hex encoded (an even number of 0-9a-f digits)".into())
-    }
 }

@@ -59,6 +59,36 @@ defmodule Sediment.S3 do
   logical log. Restoring (a writer's open, a replica, `restore/3`) needs the
   same key; a wrong or missing key fails the open.
 
+  `:encryption` is a key ring. `[cipher: c, key: hex]` is a ring of one key
+  whose id is `"default"`. A ring of several keys names each:
+
+      encryption: [keys: [{"r2", key2}, {"r1", key1}], cipher: "aegis256"]
+
+  The first key is the active one: new databases are created under it, and
+  `rekey/3` moves databases to it. An entry may give its own cipher,
+  `{"r1", key1, cipher: "aegis256"}` (`"aegis256"` by default). Ids match
+  `[a-z0-9][a-z0-9_-]{0,31}`; ids and keys must be unique in a ring.
+
+  Keys can also come from a function, called only with an id the database
+  needs:
+
+      encryption: [key_for: &MyApp.Keys.database_key/1, active: "r2"]
+
+  `key_for` (a 1-arity function or `{module, function, args}`, called with
+  the id first) returns the hex key, `{:ok, hex}`, or `nil` for an id it
+  doesn't know. It may be combined with `keys:`.
+
+  The manifest records, for the current epoch and every retained one, the
+  id of its key, its cipher and its fingerprint (the first 16 bytes of
+  HMAC-SHA256(key, "sediment/key-fingerprint/v1"), which tells keys apart
+  without revealing them). An open takes the key from its ring by that id,
+  after taking the lease and before writing anything, and refuses
+  `"unknown key id r1 (ring: r2, r3)"`, or `"key r1 in the ring is not the
+  key that encrypted this database (fingerprint ..., recorded ...)"` when the
+  ring holds another key under the id. Errors never contain key material.
+  See "Rotating keys" in the S3 guide for `rekey/3`, `release_key/4` and
+  `key_census/1`.
+
   ## Read-only replicas
 
   `mode: :replica` opens a read-only copy of the database instead: it is
@@ -105,6 +135,7 @@ defmodule Sediment.S3 do
   require Logger
 
   alias Sediment.Native
+  alias Sediment.S3.Keys
   alias Sediment.Telemetry
 
   @type info :: %{
@@ -136,6 +167,24 @@ defmodule Sediment.S3 do
           committed_epoch: String.t(),
           committed_offset: non_neg_integer()
         }
+
+  @typedoc """
+  The `:encryption` option: a key ring (see "Encryption"), or `false` for
+  an unencrypted database.
+  """
+  @type encryption ::
+          [cipher: String.t(), key: String.t()]
+          | [
+              keys: [{String.t(), String.t()} | {String.t(), String.t(), [cipher: String.t()]}],
+              cipher: String.t()
+            ]
+          | [
+              key_for: (String.t() -> String.t() | {:ok, String.t()} | nil) | mfa(),
+              active: String.t(),
+              keys: list(),
+              cipher: String.t()
+            ]
+          | false
 
   @type replica_info :: %{
           mode: :replica,
@@ -178,16 +227,37 @@ defmodule Sediment.S3 do
 
   Returns `{:error, "not an s3 replica"}` for other databases.
 
+  After a rekey the replica switches to the new key at its next refresh:
+  its ring must hold it. A ring with `key_for` resolves it when the
+  `:encryption` option is given here again (a pool passes its own).
+
   With a `DBConnection` pool (for example a replica repo), the connection
   that runs the call refreshes at once and every other connection of the
   pool refreshes before its next statement outside a transaction.
   """
-  @spec refresh(Sediment.Engine.db() | DBConnection.conn()) ::
+  @spec refresh(Sediment.Engine.db() | DBConnection.conn(), keyword()) ::
           {:ok, replica_info()} | {:error, term()}
-  def refresh(db) when is_reference(db),
-    do: Telemetry.span([:s3, :refresh], %{}, fn -> Native.s3_refresh(db) end)
+  def refresh(db, opts \\ [])
 
-  def refresh(conn), do: pool_call(conn, :refresh)
+  def refresh(db, opts) when is_reference(db) do
+    Telemetry.span([:s3, :refresh], %{}, fn ->
+      case Keys.normalize(opts[:encryption]) do
+        %{key_for: key_for} = ring when key_for != nil ->
+          Keys.run(ring, &Native.s3_refresh(db, &1))
+
+        _ ->
+          db |> Native.s3_refresh(nil) |> key_needed()
+      end
+    end)
+  end
+
+  def refresh(conn, _opts), do: pool_call(conn, :refresh)
+
+  # A key a ring with key_for would have resolved, asked of one without.
+  defp key_needed({:error, {:key_needed, id}}),
+    do: {:error, "s3 config: needs key #{id}, which is not in the ring"}
+
+  defp key_needed(other), do: other
 
   @doc """
   Checkpoints the database and uploads a snapshot to S3 now, instead of
@@ -210,7 +280,19 @@ defmodule Sediment.S3 do
   standalone file at `path`, without taking the lease or writing to S3.
 
   Point-in-time restore works over the epochs the writer retains
-  (`retain_epochs: n`): each epoch is a snapshot plus its full log.
+  (`retain_epochs: n`, plus those a rekey kept, see "Rotating keys" in the
+  S3 guide): each epoch is a snapshot plus its full log, and covers the
+  time from its start to the next epoch's start, both taken from the
+  store's clock (the Last-Modified of the seal that closed the epoch
+  before). A moment within the same second as a boundary (the store's
+  resolution) restores the newer epoch. A moment no retained epoch covers
+  is refused (`"time ... is not covered by a retained epoch (retained:
+  [...])"`), never answered with another epoch's state.
+
+  The restored epoch is read with the key its manifest record names, from
+  the `:encryption` ring: `{:error, "s3 config: needs key r1, which is not
+  in the ring"}` without it. The restored file stays encrypted with that
+  key, which the result names (`:key`).
 
   Like `refresh/1`, it returns an error while a writer is taking the
   database over, until that writer sealed the old writer's log.
@@ -220,13 +302,13 @@ defmodule Sediment.S3 do
     * `:at` - a `DateTime`: the state as of that moment.
     * `:epoch` - an epoch sequence number: the state at the start of that
       epoch plus its whole log.
-    * `:encryption` - `[cipher: ..., key: ...]` of an encrypted database (the
-      same as its `:encryption` open option; the restored file stays
-      encrypted with it), or `false` for an unencrypted one. Required, see
-      "Encryption".
+    * `:encryption` - the key ring of an encrypted database (as its
+      `:encryption` open option, holding the key of the epoch restored), or
+      `false` for an unencrypted one. Required, see "Encryption".
 
   Without options, the latest state is restored. Returns `{:ok, info}` with
-  the epoch used and how many log frames were replayed.
+  the epoch used, its key's id (`nil` when unencrypted) and how many log
+  frames were replayed.
 
   `path` must not exist, and neither may its WAL (`path-wal`) or MVCC log
   (`<path without extension>.db-log`): restore returns
@@ -252,14 +334,12 @@ defmodule Sediment.S3 do
         true -> :latest
       end
 
-    encryption = key(opts[:encryption])
+    s3_opts = with_encryption_choice(s3_opts, opts[:encryption])
 
     Telemetry.span([:s3, :restore], %{path: path}, fn ->
-      Native.s3_restore(
-        path,
-        with_encryption_choice(s3_opts, opts[:encryption]),
-        target,
-        encryption
+      Keys.run(
+        Keys.normalize(opts[:encryption]),
+        &Native.s3_restore(path, s3_opts, target, &1)
       )
     end)
   end
@@ -353,11 +433,11 @@ defmodule Sediment.S3 do
       CRC32C must match the new database (every uploaded part also carries
       a SHA-256 the store checks). `:restore`: also download the database
       into a temporary file and compare.
-    * `:encryption` - `[cipher: ..., key: ...]`: the new database is
-      encrypted with it (open it with the same `:encryption`); `false`
-      stores it unencrypted. Required, see "Encryption".
-    * `:source_encryption` - the key of an encrypted source (a plaintext
-      source is read without it).
+    * `:encryption` - a key ring: the new database is encrypted with its
+      active key (open it with a ring holding that key); `false` stores it
+      unencrypted. Required, see "Encryption".
+    * `:source_encryption` - the key of an encrypted source,
+      `[cipher: ..., key: ...]` (a plaintext source is read without it).
 
   Returns `{:ok, info}` with `:epoch`, `:size` (bytes of the new database
   file), `:stored_size` (bytes in S3, compressed), `:objects` (tables,
@@ -388,13 +468,13 @@ defmodule Sediment.S3 do
     path = to_string(path)
     verify = Keyword.get(opts, :verify, :checksum)
 
+    s3_opts = with_encryption_choice(s3_opts, opts[:encryption])
+    source = opts[:source_encryption] |> Keys.normalize() |> Keys.native()
+
     Telemetry.span([:s3, :import], %{path: path}, fn ->
-      case Native.s3_import(
-             path,
-             with_encryption_choice(s3_opts, opts[:encryption]),
-             verify,
-             key(opts[:encryption]),
-             key(opts[:source_encryption])
+      case Keys.run(
+             Keys.normalize(opts[:encryption]),
+             &Native.s3_import(path, s3_opts, verify, &1, source)
            ) do
         {:ok, %{sequences_not_advanced: [_ | _] = tables} = info} ->
           Logger.warning(
@@ -423,6 +503,132 @@ defmodule Sediment.S3 do
   @spec generate_key() :: String.t()
   def generate_key, do: 32 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower)
 
+  @doc """
+  Moves the database at the S3 location in `s3_opts` to another key of its
+  ring: the active one, or `:to`.
+
+  `path` is a local working copy (like an open's path; the database's files
+  there are replaced). The rekey is a writer open that re-encrypts what it
+  restored, then a clean close, which leaves the copy warm under the new
+  key, so the next open of `path` downloads nothing. It:
+
+    1. takes the writer lease; like `destroy/2`, it refuses while the
+       database is open in this VM, and any unexpired lease (this owner's
+       too) unless `force: true`;
+    2. takes the database over, resolves its current key from the ring (by
+       id and fingerprint), and restores and checkpoints it under that key;
+    3. re-encrypts the file page by page under the new key, checks that
+       every page's plaintext is unchanged and runs `PRAGMA
+       integrity_check` on the result;
+    4. uploads it as a full snapshot and publishes it as a new epoch whose
+       manifest record names the new key, with `If-Match` on its takeover.
+
+  A writer that took the database over meanwhile makes the last step fail
+  (`"s3 writer fenced: ..."`) with nothing switched, and keeps everything it
+  committed. A crash or error before it leaves the database under the old
+  key, working; run the rekey again (`force: true`, or after the lease's
+  TTL, when the crashed run still holds it).
+
+  The epoch it ends and every epoch retained then are kept, whatever
+  `retain_epochs` is, until `release_key/4`: point-in-time restore still
+  reaches the time before the rekey, with the old key. The old key is
+  recorded as retired: a later rekey to it (by id or by key) is refused
+  unless `allow_reuse: true`, and even then only once its epochs were
+  released.
+
+  Every node that opens the database needs the new key in its ring before
+  the rekey (or a `key_for` that returns it): an open whose ring lacks it
+  is refused.
+
+  ## Options
+
+    * `:encryption` - the key ring (required): it must hold the current key
+      and the new one (or resolve them with `key_for`).
+    * `:to` - the id of the key to move to (default: the ring's active key).
+      Both keys must use the same cipher.
+    * `:force` - take the lease even while a writer holds it (it is fenced).
+    * `:allow_reuse` - allow a retired key (see above).
+
+  Returns `{:ok, %{from: id, to: id, epoch: epoch}}`, `{:ok, :current}` when
+  the database is under that key already (nothing is written), or
+  `{:error, reason}`. When the publication's answer was lost and the
+  manifest couldn't be read back, the outcome is unknown: `{:error,
+  {:indeterminate, message}}`; `key_census/1` tells which key is current.
+  """
+  @spec rekey(Path.t(), keyword() | map(), keyword()) ::
+          {:ok, %{from: String.t(), to: String.t(), epoch: String.t()} | :current}
+          | {:error, term()}
+  def rekey(path, s3_opts, opts \\ []) do
+    path = to_string(path)
+    to = opts[:to] && to_string(opts[:to])
+    force = Keyword.get(opts, :force, false)
+    allow_reuse = Keyword.get(opts, :allow_reuse, false)
+
+    Telemetry.span([:s3, :rekey], %{path: path}, fn ->
+      opts[:encryption]
+      |> required_ring("rekey/3")
+      |> Keys.run(&Native.s3_rekey(path, s3_opts, &1, to, force, allow_reuse))
+    end)
+  end
+
+  @doc """
+  Drops the retained epochs encrypted under `key_id` from the history of
+  the database at the S3 location in `s3_opts`, and deletes their objects:
+  point-in-time restore no longer reaches the time they cover. Afterwards
+  `key_census/1` no longer lists the key, and it can leave the ring.
+
+  It refuses the current key (rekey first). It is a writer open with a
+  clean close at `path`, with the same lease rules as `rekey/3` (`:force`),
+  and needs the `:encryption` ring holding the current key.
+
+  This removes what the manifest references. A bucket with versioning
+  keeps older object versions, and other hosts may keep local working
+  copies under the old key: after a key leaked, purge those too.
+
+  Returns `{:ok, %{key: id, epochs: [epoch]}}` (no epochs, and nothing
+  written, when none was under the key) or `{:error, reason}`.
+  """
+  @spec release_key(Path.t(), keyword() | map(), String.t(), keyword()) ::
+          {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
+  def release_key(path, s3_opts, key_id, opts \\ []) do
+    path = to_string(path)
+    force = Keyword.get(opts, :force, false)
+
+    Telemetry.span([:s3, :release_key], %{path: path}, fn ->
+      opts[:encryption]
+      |> required_ring("release_key/4")
+      |> Keys.run(&Native.s3_release_key(path, s3_opts, &1, to_string(key_id), force))
+    end)
+  end
+
+  defp required_ring(encryption, call) do
+    case Keys.normalize(encryption) do
+      ring when is_map(ring) ->
+        ring
+
+      _ ->
+        raise ArgumentError, "Sediment.S3.#{call} needs the :encryption key ring"
+    end
+  end
+
+  @doc """
+  Which keys the database at the S3 location in `s3_opts` depends on: the
+  current epoch's key, and the retained epochs (point-in-time restore) by
+  the key they are encrypted with. A key can leave the ring once it is
+  neither current nor retained. It reads `manifest.json` only: no lease,
+  no writes.
+
+  Returns `{:ok, %{current: id | nil, retained: %{id => [epoch]}}}`
+  (`current: nil` for an unencrypted database), `{:ok, :no_database}`
+  when the location holds none (also after `destroy/2`), or
+  `{:error, reason}`.
+  """
+  @spec key_census(keyword() | map()) ::
+          {:ok, %{current: String.t() | nil, retained: %{String.t() => [String.t()]}}}
+          | {:ok, :no_database}
+          | {:error, term()}
+  def key_census(s3_opts), do: Native.s3_key_census(s3_opts)
+
   @doc false
   # `encryption: false` (the explicit opt-out of encryption) travels with
   # the S3 options to the native code, which refuses S3 databases that have
@@ -432,10 +638,6 @@ defmodule Sediment.S3 do
   def with_encryption_choice(s3, false) when is_list(s3), do: Keyword.put(s3, :encryption, false)
   def with_encryption_choice(%{} = s3, false), do: Map.put(s3, :encryption, false)
   def with_encryption_choice(s3, _encryption), do: s3
-
-  defp key(nil), do: nil
-  defp key(false), do: nil
-  defp key(enc), do: {to_string(enc[:cipher]), to_string(enc[:key])}
 
   # Runs an S3 operation on one connection of a DBConnection pool; see
   # Sediment.Connection.handle_execute/4.

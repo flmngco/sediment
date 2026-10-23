@@ -205,9 +205,10 @@ defmodule Sediment do
 
   ## Options
 
-    * `:encryption` - the source's key (`[cipher: ..., key: ...]`), or
-      `false` for an unencrypted S3 database (with `:from_s3`, one of them is
-      required, as for an open).
+    * `:encryption` - the source's key (`[cipher: ..., key: ...]`) or key
+      ring (an S3 source is read with its current key, a local file with
+      the ring's active key), or `false` for an unencrypted S3 database
+      (with `:from_s3`, one of them is required, as for an open).
     * `:from_s3` - export the S3 database with these `:s3` options instead
       of a local file (`source` must then be `nil`).
     * `:drop_fts` - leave Turso FTS indexes (`CREATE INDEX ... USING fts`)
@@ -236,14 +237,24 @@ defmodule Sediment do
         s3 -> Sediment.S3.with_encryption_choice(s3, opts[:encryption])
       end
 
-    encryption =
-      case opts[:encryption] do
-        enc when is_list(enc) -> {to_string(enc[:cipher]), to_string(enc[:key])}
-        _ -> nil
-      end
+    ring = Sediment.S3.Keys.normalize(opts[:encryption])
 
     Sediment.Telemetry.span([:export], %{source: source, dest: dest}, fn ->
-      Sediment.Native.export_sqlite(source, dest, from_s3, encryption, opts[:drop_fts] == true)
+      ring
+      |> export_ring(from_s3)
+      |> Sediment.S3.Keys.native()
+      |> then(&Sediment.Native.export_sqlite(source, dest, from_s3, &1, opts[:drop_fts] == true))
     end)
   end
+
+  # An S3 source is read with its current key: a key_for ring resolves it
+  # first (from the manifest, see Sediment.S3.key_census/1).
+  defp export_ring(%{key_for: key_for} = ring, from_s3) when key_for != nil and from_s3 != nil do
+    case Sediment.S3.key_census(from_s3) do
+      {:ok, %{current: id}} when is_binary(id) -> Sediment.S3.Keys.with_key(ring, id)
+      _ -> ring
+    end
+  end
+
+  defp export_ring(ring, _from_s3), do: ring
 end

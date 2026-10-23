@@ -18,7 +18,7 @@ defmodule Sediment.Engine do
   @type open_opt ::
           {:mode, :readwrite | :readonly | :create | [open_mode()]}
           | {:journal_mode, journal_mode() | String.t()}
-          | {:encryption, [cipher: String.t(), key: String.t()] | false}
+          | {:encryption, Sediment.S3.encryption()}
           | {:experimental, [atom()]}
           | {:s3, keyword() | map()}
           | {:mvcc_checkpoint_threshold, non_neg_integer() | nil}
@@ -43,8 +43,9 @@ defmodule Sediment.Engine do
 
     * `:encryption` - `[cipher: "aegis256", key: "<hex key>"]` opens an
       encrypted database (turso extension). With `:s3` it is required:
-      a key, or `false` to store the database unencrypted (see
-      `Sediment.S3`).
+      a key (or a key ring, see "Encryption" in `Sediment.S3`), or `false`
+      to store the database unencrypted. A database without `:s3` opens
+      with the ring's active key.
 
     * `:experimental` - list of experimental turso features to enable, such
       as `:attach`, `:views`, `:vacuum`, `:generated_columns`,
@@ -64,7 +65,10 @@ defmodule Sediment.Engine do
   def open(path, opts \\ []) do
     mode = opts[:mode] || [:readwrite, :create]
 
-    with {:ok, conn} <- Native.open(path, native_open_opts(mode, opts)) do
+    ring = Sediment.S3.Keys.normalize(opts[:encryption])
+
+    with {:ok, conn} <-
+           Sediment.S3.Keys.run(ring, &Native.open(path, native_open_opts(mode, opts, &1))) do
       if opts[:s3], do: flush_s3_at_exit()
       set_mvcc_checkpoint_threshold(conn, opts)
     end
@@ -112,14 +116,14 @@ defmodule Sediment.Engine do
     end
   end
 
-  defp native_open_opts(mode, opts) do
+  defp native_open_opts(mode, opts, ring) do
     modes = modes_from_mode(mode)
 
     %{
       readonly: :readonly in modes,
       create: :create in modes,
       journal_mode: journal_mode(opts[:journal_mode]),
-      encryption: encryption(opts[:encryption]),
+      encryption: ring,
       experimental: Enum.map(opts[:experimental] || [], &to_string/1),
       s3: Sediment.S3.with_encryption_choice(opts[:s3], opts[:encryption])
     }
@@ -127,10 +131,6 @@ defmodule Sediment.Engine do
 
   defp journal_mode(nil), do: nil
   defp journal_mode(mode), do: mode |> to_string() |> String.downcase()
-
-  defp encryption(nil), do: nil
-  defp encryption(false), do: nil
-  defp encryption(opts), do: %{cipher: to_string(opts[:cipher]), key: to_string(opts[:key])}
 
   defp modes_from_mode(:nomutex) do
     raise ArgumentError,

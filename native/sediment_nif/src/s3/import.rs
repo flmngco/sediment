@@ -18,9 +18,9 @@ use turso_core::{Connection, EncryptionOpts, Value};
 use super::layout::{ManifestState, MANIFEST_KEY};
 use super::lease::Lease;
 use super::{
-    check_no_old_objects, create_database, default_owner, live_storage, open_local, probe, purge,
-    refuse_newer, require_encryption_choice, restore, snapshot::Digests, with_local_connection,
-    Result, S3Config, S3Error,
+    check_no_old_objects, create_database, default_owner, keys::Key, live_storage,
+    new_database_key, open_local, probe, purge, refuse_newer, require_encryption_choice, restore,
+    snapshot::Digests, with_local_connection, Result, S3Config, S3Error,
 };
 
 /// What [`import`] checks once the database is in S3.
@@ -125,6 +125,8 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     }
     let remote = cfg.remote()?;
     require_encryption_choice(cfg, &remote)?;
+    // Before anything is copied: a key_for ring may lack it.
+    let key = new_database_key(cfg)?;
     // turso keeps a symlinked database's log next to the file it points to.
     let source = &std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     // The source's log is copied with it: it must be the source's own.
@@ -140,7 +142,7 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     let copied = copy_database(
         &work,
         opts.source_encryption.as_ref(),
-        cfg.encryption.as_ref(),
+        key.as_ref().map(Key::opts).as_ref(),
     )?;
     let converted = Digests::of_file(&work.db)?;
     if converted.size > MAX_SNAPSHOT_BYTES {
@@ -171,7 +173,7 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     let over = over
         .as_ref()
         .map(|(tombstone, version)| (tombstone, version.clone()));
-    let manifest = match create_database(&remote, cfg, generation, owner, &work.db, over) {
+    let manifest = match create_database(&remote, key.as_ref(), generation, owner, &work.db, over) {
         Ok((manifest, _, _)) => manifest,
         Err(S3Error::Conflict(_)) => return Err(already_holds(cfg)),
         // The answer to the manifest PUT may be what got lost: the manifest
@@ -195,6 +197,7 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
         )));
     }
     if opts.verify == Verify::Restore {
+        let remote = remote.clone().for_key(key.as_ref())?;
         restore::restore(&remote, &manifest, &work.restored, cfg.download_concurrency)?;
         let restored = Digests::of_file(&work.restored)?;
         if (restored.size, restored.crc32c) != (converted.size, converted.crc32c) {

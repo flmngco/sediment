@@ -68,10 +68,11 @@ pub struct S3Config {
     pub must_exist: bool,
     /// Open a read-only replica: restore without the lease, never write to S3.
     pub replica: bool,
-    /// The database's encryption (cipher and hex key), from the `:encryption`
-    /// open option: snapshots and log frames are then encrypted at rest, and
-    /// restoring needs the key.
-    pub encryption: Option<turso_core::EncryptionOpts>,
+    /// The keys the database may be encrypted with, from the `:encryption`
+    /// open option: snapshots and log frames are encrypted at rest, each
+    /// epoch with the key its manifest record names, which an open resolves
+    /// from this ring. New databases use the ring's active key.
+    pub encryption: Option<super::keys::KeyRing>,
     /// `encryption: false`: the database is stored unencrypted on purpose.
     /// Without it (or a key) S3 databases are refused: encryption is the
     /// default, opting out explicit.
@@ -258,7 +259,7 @@ impl S3Config {
             "bucket={} prefix={} endpoint={} region={} owner={} lease_ttl_ms={} \
              group_commit={} incremental_snapshots={} durability={} max_lag_ms={} \
              upload_interval_ms={} \
-             max_pending_bytes={} retain_epochs={} checkpoint_threshold={} encryption={}",
+             max_pending_bytes={} retain_epochs={} checkpoint_threshold={}",
             self.bucket,
             self.prefix,
             self.endpoint.as_deref().unwrap_or("aws"),
@@ -278,9 +279,6 @@ impl S3Config {
             self.retain_epochs,
             self.checkpoint_threshold
                 .map_or("(default)".to_string(), |t| t.to_string()),
-            self.encryption
-                .as_ref()
-                .map_or("none", |e| e.cipher.as_str()),
         )
     }
 
@@ -303,33 +301,14 @@ impl S3Config {
     }
 
     /// The store scoped to this database's prefix. Every operation is bounded
-    /// by the time its retries may take, even with a custom `store`.
+    /// by the time its retries may take, even with a custom `store`. Reading
+    /// an encrypted log needs [`super::remote::Remote::for_key`] first.
     pub(crate) fn remote(&self) -> Result<super::remote::Remote> {
         let attempts = self.max_retries as u32 + 1;
-        let log_encryption = self
-            .encryption_ctx()?
-            .map(|ctx| (ctx.tag_size(), ctx.nonce_size()));
         Ok(
             super::remote::Remote::new(self.build_store()?, &self.prefix)
-                .with_deadline(self.request_timeout * attempts)
-                .with_log_encryption(log_encryption),
+                .with_deadline(self.request_timeout * attempts),
         )
-    }
-
-    /// The logical log's encryption context, if the database is encrypted.
-    pub(crate) fn encryption_ctx(&self) -> Result<Option<turso_core::EncryptionContext>> {
-        let Some(opts) = &self.encryption else {
-            return Ok(None);
-        };
-        let cipher = turso_core::CipherMode::try_from(opts.cipher.as_str())
-            .map_err(|e| S3Error::Config(format!("encryption: {e}")))?;
-        let key = turso_core::EncryptionKey::from_hex_string(&opts.hexkey)
-            .map_err(|e| S3Error::Config(format!("encryption: {e}")))?;
-        // The page size only matters for page encryption; the log is
-        // encrypted in fixed-size chunks.
-        turso_core::EncryptionContext::new(cipher, &key, 4096)
-            .map(Some)
-            .map_err(|e| S3Error::Config(format!("encryption: {e}")))
     }
 
     pub(crate) fn build_store(&self) -> Result<Arc<dyn ObjectStore>> {

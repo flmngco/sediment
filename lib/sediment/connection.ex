@@ -33,6 +33,9 @@ defmodule Sediment.Connection do
     :before_disconnect,
     pending_begin: false,
     s3_generation: 0,
+    # The :encryption option: a replica's refresh resolves keys through its
+    # key_for, if it has one.
+    encryption: nil,
     generation_key: nil,
     stmt_cache: %{}
   ]
@@ -75,7 +78,7 @@ defmodule Sediment.Connection do
           | {:journal_size_limit, integer()}
           | {:soft_heap_limit, integer()}
           | {:hard_heap_limit, integer()}
-          | {:encryption, [cipher: String.t(), key: String.t()] | false}
+          | {:encryption, Sediment.S3.encryption()}
           | {:experimental, [atom()]}
           | {:s3, keyword() | map()}
           | {:custom_pragmas, [{keyword(), integer() | boolean() | String.t()}]}
@@ -136,7 +139,8 @@ defmodule Sediment.Connection do
     * `:chunk_size` - The chunk size for bulk fetching. Defaults to `50`.
     * `:encryption` - `[cipher: "aegis256", key: "<hex key>"]` to open an
       encrypted database (turso extension). With `:s3` it is required: a
-      key, or `false` to store the database unencrypted.
+      key or a key ring (see "Encryption" in `Sediment.S3`), or `false` to
+      store the database unencrypted.
     * `:mvcc_checkpoint_threshold` - MVCC log bytes between automatic
       checkpoints; defaults to 256 KiB for non-S3 MVCC databases. See
       `Sediment.Engine.open/2`.
@@ -440,7 +444,7 @@ defmodule Sediment.Connection do
   defp s3_operation(:snapshot, state), do: {S3.snapshot(state.db), state}
 
   defp s3_operation(:refresh, %{transaction_status: :idle} = state) do
-    case S3.refresh(state.db) do
+    case S3.refresh(state.db, encryption: state.encryption) do
       {:ok, _info} = ok ->
         {ok, %{state | s3_generation: S3.bump_generation(state.path), stmt_cache: %{}}}
 
@@ -466,7 +470,7 @@ defmodule Sediment.Connection do
   defp maybe_refresh(state), do: {:ok, state}
 
   defp refresh_to(generation, state) do
-    case S3.refresh(state.db) do
+    case S3.refresh(state.db, encryption: state.encryption) do
       {:ok, _} ->
         {:ok, %{state | s3_generation: generation, stmt_cache: %{}}}
 
@@ -952,6 +956,7 @@ defmodule Sediment.Connection do
         status: :idle,
         chunk_size: Keyword.get(options, :chunk_size),
         s3_generation: S3.generation(database),
+        encryption: options[:encryption],
         generation_key: S3.generation_key(database),
         before_disconnect: Keyword.get(options, :before_disconnect, nil)
       }

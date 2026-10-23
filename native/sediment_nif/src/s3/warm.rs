@@ -22,15 +22,14 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use super::config::S3Config;
 use super::error::Result;
 use super::layout::{parse_segment_key, Manifest};
 use super::logfmt::{verify_segments_from, LogState};
 use super::remote::Remote;
 use super::restore;
 
-/// 2: the files' SHA-256. A sidecar of another version is never reused.
-const VERSION: u32 = 2;
+/// 3: the key's fingerprint. A sidecar of another version is never reused.
+const VERSION: u32 = 3;
 
 /// What a clean close records about the local working copy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,8 +46,9 @@ pub struct Sidecar {
     /// catches damage, not a change made to keep it.
     pub db_sha256: String,
     pub log_sha256: String,
-    pub encrypted: bool,
-    pub cipher: Option<String>,
+    /// The fingerprint of the key the copy is under (`None`: unencrypted):
+    /// a copy is never reused under another key.
+    pub key_fingerprint: Option<String>,
 }
 
 pub fn sidecar_path(db_path: &Path) -> PathBuf {
@@ -141,7 +141,7 @@ pub struct Closing<'a> {
     pub manifest: &'a Manifest,
     pub generation: u64,
     pub log_offset: u64,
-    pub encryption: Option<&'a turso_core::EncryptionOpts>,
+    pub key: Option<&'a super::keys::Key>,
     pub log_encryption: Option<(usize, usize)>,
 }
 
@@ -185,8 +185,7 @@ pub fn write(closing: &Closing) -> Result<bool> {
         db_crc32c,
         db_sha256,
         log_sha256: sha256(&log_bytes),
-        encrypted: closing.encryption.is_some(),
-        cipher: closing.encryption.map(|e| e.cipher.clone()),
+        key_fingerprint: closing.key.map(|key| key.fingerprint().to_string()),
     };
     let path = sidecar_path(closing.db_path);
     let tmp = tmp_path(&path);
@@ -200,12 +199,12 @@ pub fn write(closing: &Closing) -> Result<bool> {
 }
 
 /// Whether the copy at `db_path` may be reused for `manifest` (as it was
-/// before this open's takeover): returns the local log's state to continue
-/// from, or why not.
+/// before this open's takeover), whose key the open resolved to `key`:
+/// returns the local log's state to continue from, or why not.
 pub fn check(
     sidecar: &Sidecar,
     manifest: &Manifest,
-    cfg: &S3Config,
+    key: Option<&super::keys::Key>,
     remote: &Remote,
     db_path: &Path,
 ) -> std::result::Result<LogState, String> {
@@ -218,9 +217,11 @@ pub fn check(
     if manifest.generation != sidecar.generation || manifest.epoch.to_string() != sidecar.epoch {
         return Err("S3 moved on since the copy was closed".into());
     }
-    let cipher = cfg.encryption.as_ref().map(|e| e.cipher.clone());
-    if (sidecar.encrypted, &sidecar.cipher) != (cfg.encryption.is_some(), &cipher) {
-        return Err("another encryption choice".into());
+    let fingerprint = key.map(|key| key.fingerprint().to_string());
+    if sidecar.key_fingerprint != fingerprint
+        || manifest.key.as_ref().map(|key| &key.fingerprint) != fingerprint.as_ref()
+    {
+        return Err("another key".into());
     }
     let (size, crc, sha) = file_digest(db_path).map_err(|e| e.to_string())?;
     if (size, crc, &sha) != (sidecar.db_size, sidecar.db_crc32c, &sidecar.db_sha256)
