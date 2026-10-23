@@ -81,34 +81,35 @@ defmodule Sediment.S3KeysTest do
 
   # Every way a process's state is printed: inspect and Erlang's ~p, of the
   # status (:sys.get_status/1) and of the state a termination report shows.
+  # The path of the database the process has open, if it is a connection.
   defp refute_in_process(pid) do
     status = :sys.get_status(pid)
-    printed = [inspect(status, limit: :infinity), to_string(:io_lib.format(~c"~tp", [status]))]
+    state = :sys.get_state(pid)
 
-    terminate =
-      case :sys.get_state(pid) do
-        {_state, %{mod: _, state: _} = data} ->
-          [DBConnection.Connection.format_status(:terminate, [[], :no_state, data])]
+    {terminate, path} =
+      case state do
+        {_state, %{mod: _, state: %Sediment.Connection{path: path}} = data} ->
+          {[DBConnection.Connection.format_status(:terminate, [[], :no_state, data])], path}
 
         _ ->
-          []
+          {[], nil}
       end
 
-    for term <- terminate,
+    for term <- [status | terminate],
         text <- [inspect(term, limit: :infinity), to_string(:io_lib.format(~c"~tp", [term]))] do
       refute text =~ @k1
       refute text =~ @k2
     end
 
-    for text <- printed do
-      refute text =~ @k1
-      refute text =~ @k2
-    end
+    path
+  catch
+    # Another test's pool, stopping meanwhile.
+    :exit, _ -> nil
   end
 
-  # A pool's processes: the pool, and its connections' supervisors (which
-  # keep their child specs) and connections, started under DBConnection's
-  # application supervisor. Every pool's: any pool open now.
+  # The pool, and every pool's connection supervisors (which keep their
+  # child specs) and connections, started under DBConnection's application
+  # supervisor; other tests' pools may stop meanwhile.
   defp pool_processes(pool) do
     supervisors =
       for {_, pid, _, _} <- Supervisor.which_children(DBConnection.ConnectionPool.Supervisor),
@@ -117,11 +118,17 @@ defmodule Sediment.S3KeysTest do
 
     connections =
       for supervisor <- supervisors,
-          {_, pid, _, _} <- Supervisor.which_children(supervisor),
+          {_, pid, _, _} <- children(supervisor),
           is_pid(pid),
           do: pid
 
     [pool | supervisors] ++ connections
+  end
+
+  defp children(supervisor) do
+    Supervisor.which_children(supervisor)
+  catch
+    :exit, _ -> []
   end
 
   test "a connection's state and a pool's processes never show a key" do
@@ -138,9 +145,9 @@ defmodule Sediment.S3KeysTest do
 
     {:ok, pool} = Sediment.start_link(database: path, encryption: ring(), pool_size: 2)
     assert {:ok, _} = Sediment.query(pool, "SELECT 1", [])
-    processes = pool_processes(pool)
-    assert length(processes) >= 4
-    Enum.each(processes, &refute_in_process/1)
+    paths = pool |> pool_processes() |> Enum.map(&refute_in_process/1)
+    # Both of this pool's connections were looked at.
+    assert Enum.count(paths, &(&1 == path)) == 2
     GenServer.stop(pool)
   end
 
