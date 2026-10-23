@@ -298,7 +298,7 @@ fn a_sequence_standing_at_one_carries_over() {
     // replaced the row that had it.
     let dir = TempDir::new();
     for (inserted, deleted) in [(1, 0), (1, 1), (2, 0), (2, 2), (3, 1)] {
-        for (mvcc, key) in [(false, None), (true, None), (true, Some(encryption("cd")))] {
+        for (mvcc, key) in [(false, None), (true, None), (true, Some(super::opts("cd")))] {
             let name = format!("{inserted}-{deleted}-{mvcc}-{}", key.is_some());
             let path = dir.db(&format!("src-{name}.db"));
             sequence_source(&path, mvcc, key.as_ref(), inserted, deleted);
