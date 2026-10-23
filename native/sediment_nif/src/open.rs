@@ -256,9 +256,10 @@ impl<'a> OpenConfig<'a> {
                     "{} is open with S3 durability here with another :encryption choice; \
                      open it with a ring holding its key{}",
                     self.path,
-                    storage
-                        .encryption()
-                        .map_or(String::new(), |key| format!(" ({})", key.id()))
+                    storage.encryption().map_or(String::new(), |key| format!(
+                        " ({})",
+                        crate::s3::shown(key.id())
+                    ))
                 )
                 .into());
             }

@@ -156,7 +156,7 @@ pub(crate) fn reencrypt(path: &Path, from: &Key, to: &Key) -> Result<()> {
             let plain = from_ctx.decrypt_page(page, id).map_err(|e| {
                 failed(format!(
                     "page {id} doesn't decrypt with key {}: {e}",
-                    from.id()
+                    super::shown(from.id())
                 ))
             })?;
             let encrypted = to_ctx
@@ -194,7 +194,7 @@ pub(crate) fn reencrypt(path: &Path, from: &Key, to: &Key) -> Result<()> {
             let plain = to_ctx.decrypt_page(page, id).map_err(|e| {
                 failed(format!(
                     "page {id} doesn't decrypt with key {}: {e}",
-                    to.id()
+                    super::shown(to.id())
                 ))
             })?;
             Ok((hash(&plain), None))

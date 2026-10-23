@@ -119,7 +119,9 @@ pub fn error_term<'a>(env: Env<'a>, err: &S3Error) -> Term<'a> {
             let pairs = [
                 (
                     "current_key",
-                    key.as_ref().map(|k| k.id.clone()).encode(env),
+                    key.as_ref()
+                        .map(|k| s3::shown(&k.id).into_owned())
+                        .encode(env),
                 ),
                 (
                     "fingerprint",
@@ -574,7 +576,7 @@ fn s3_release_key<'a>(
                 &[
                     (
                         Atom::from_str(env, "key").unwrap().encode(env),
-                        key.encode(env),
+                        s3::shown(&key).encode(env),
                     ),
                     (
                         Atom::from_str(env, "epochs").unwrap().encode(env),

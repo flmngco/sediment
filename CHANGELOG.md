@@ -14,7 +14,8 @@
   that id. New forms: `[keys: [{"r2", k2}, {"r1", k1}], cipher: c]` (the
   first key is active, an entry may give its own `cipher:`) and
   `[key_for: fun | {m, f, a}, active: "r2"]`. Ids match
-  `[a-z0-9][a-z0-9_-]{0,31}`; a ring can't hold an id or a key twice.
+  `[a-z0-9][a-z0-9_-]{0,31}` and are not 32 hex digits (an AES-128 key
+  would pass as one); a ring can't hold an id or a key twice.
 * An open with a wrong key is refused by the key's fingerprint before the
   takeover (`"key default in the ring is not the key that encrypted this
   database ..."`), instead of failing to decrypt after the download.
@@ -63,9 +64,13 @@
 
 ### Fixed
 
-* A key ring entry given as `{key, id}` is refused without showing the
-  key: errors about a ring entry name it by its position, and never show
-  an id that was refused or that could be a key.
+* A mistyped `:encryption` never shows a key: an entry given as
+  `{key, id}`, a key given as `active:`, `to:`, a release's key id or
+  `cipher:`, an entry of the wrong shape, a `key_for` that raises. Errors
+  name ring entries by position; they never show a refused id or cipher,
+  nor a value of the wrong type; an id that could be a key is shown as
+  `<an id that looks like a key>`; a `key_for` that fails is reported by
+  the id and the exception's type only, without stack frame arguments.
 * A pool (`Sediment.start_link/1`, `Sediment.child_spec/1`) and a
   connection's state keep the `:encryption` option hidden: crash and
   termination reports, `:sys.get_status/1` and `inspect` show

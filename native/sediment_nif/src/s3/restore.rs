@@ -118,7 +118,7 @@ pub fn choose(manifest: &Manifest, target: Target) -> Result<Point> {
                 .map(|r| format!(
                     "epoch {} under key {}: {}..{}",
                     r.epoch.seq,
-                    r.key_id(),
+                    super::shown(r.key_id()),
                     r.started_at_ms,
                     r.ended_at_ms
                         .map_or("now".to_string(), |end| end.to_string())

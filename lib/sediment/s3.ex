@@ -67,7 +67,10 @@ defmodule Sediment.S3 do
   The first key is the active one: new databases are created under it, and
   `rekey/3` moves databases to it. An entry may give its own cipher,
   `{"r1", key1, cipher: "aegis256"}` (`"aegis256"` by default). Ids match
-  `[a-z0-9][a-z0-9_-]{0,31}`; ids and keys must be unique in a ring.
+  `[a-z0-9][a-z0-9_-]{0,31}` and are not 32 hex digits (an AES-128 key
+  would pass as one); ids and keys must be unique in a ring. No error
+  shows a key, nor an id or cipher that was refused (it may be a key given
+  in the wrong place): ring entries are named by position.
 
   Keys can also come from a function, called only with an id the database
   needs:
@@ -255,7 +258,7 @@ defmodule Sediment.S3 do
 
   # A key a ring with key_for would have resolved, asked of one without.
   defp key_needed({:error, {:key_needed, id}}),
-    do: {:error, "s3 config: needs key #{id}, which is not in the ring"}
+    do: {:error, "s3 config: needs key #{Keys.shown(id)}, which is not in the ring"}
 
   defp key_needed(other), do: other
 
@@ -592,7 +595,7 @@ defmodule Sediment.S3 do
           | {:error, term()}
   def rekey(path, s3_opts, opts \\ []) do
     path = to_string(path)
-    to = opts[:to] && to_string(opts[:to])
+    to = opts[:to] && key_id!(opts[:to], ":to", "rekey/3")
     force = boolean!(opts, :force, "rekey/3")
     allow_reuse = boolean!(opts, :allow_reuse, "rekey/3")
 
@@ -628,12 +631,13 @@ defmodule Sediment.S3 do
           {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
   def release_key(path, s3_opts, key_id, opts \\ []) do
     path = to_string(path)
+    key_id = key_id!(key_id, "the key id", "release_key/4")
     force = boolean!(opts, :force, "release_key/4")
 
     Telemetry.span([:s3, :release_key], %{path: path}, fn ->
       opts[:encryption]
       |> required_ring("release_key/4")
-      |> Keys.run(&Native.s3_release_key(path, s3_opts, &1, to_string(key_id), force))
+      |> Keys.run(&Native.s3_release_key(path, s3_opts, &1, key_id, force))
     end)
   end
 
@@ -645,6 +649,16 @@ defmodule Sediment.S3 do
       _ -> raise ArgumentError, "Sediment.S3.#{call}: #{inspect(name)} must be true or false"
     end
   end
+
+  # A key id given as a string or an atom; never shown (it may be a key
+  # given in its place). The native code checks its form.
+  defp key_id!(id, _what, _call) when is_binary(id), do: id
+
+  defp key_id!(id, _what, _call) when is_atom(id) and id not in [nil, true, false],
+    do: Atom.to_string(id)
+
+  defp key_id!(_id, what, call),
+    do: raise(ArgumentError, "Sediment.S3.#{call}: #{what} must be a string")
 
   defp required_ring(encryption, call) do
     case Keys.normalize(encryption) do

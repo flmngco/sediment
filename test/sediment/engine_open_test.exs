@@ -72,7 +72,7 @@ defmodule Sediment.EngineOpenTest do
 
       assert {:error, "File is not a database"} = Engine.open(path)
 
-      assert {:error, ~s(encryption: ring entry 1: key default: unknown cipher "nope")} =
+      assert {:error, "encryption: ring entry 1: key default: unknown cipher (supported: " <> _} =
                Engine.open(Temp.path!(), encryption: [cipher: "nope", key: @key])
     end
   end

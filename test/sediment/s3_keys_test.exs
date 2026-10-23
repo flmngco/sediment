@@ -151,32 +151,96 @@ defmodule Sediment.S3KeysTest do
     GenServer.stop(pool)
   end
 
-  test "an entry given as {key, id} is refused without showing the key" do
-    # aegis256: a 64-hex key in the id's place; aes128gcm: a 32-hex key,
-    # which is a valid id.
-    for {cipher, key} <- [{"aegis256", @k1}, {"aes128gcm", String.slice(@k2, 0, 32)}] do
-      ring = [keys: [{key, "r2"}], cipher: cipher]
-      secrets = [key, String.slice(key, 0, 16)]
+  @k128 String.duplicate("4d", 16)
+  @uuid String.duplicate("5e", 16)
 
-      assert {:error, message} = Engine.open(Temp.path!(), encryption: ring)
-      assert message =~ "ring entry 1"
-      for secret <- secrets, do: refute(message =~ secret)
+  # Every way the reviews found a mistyped :encryption to show a key: the
+  # option, and the key it must never show.
+  defp mistyped do
+    [
+      {"{key, r2}, aegis256", [keys: [{@k1, "r2"}], cipher: "aegis256"], @k1},
+      {"{key, r2}, aes128gcm", [keys: [{@k128, "r2"}], cipher: "aes128gcm"], @k128},
+      {"{key, uuid}, aes128gcm", [keys: [{@k128, @uuid}], cipher: "aes128gcm", active: @uuid],
+       @k128},
+      {"{key, uuid}, aegis256", [keys: [{@k1, @uuid}], cipher: "aegis256"], @k1},
+      {"active: key", [keys: [{"r1", @k128}], cipher: "aes128gcm", active: @k128], @k128},
+      {"cipher: key, key: cipher", [cipher: @k1, key: "aegis256"], @k1},
+      {"nested [key: k] entry", [keys: [{"r1", [key: @k1]}]], @k1},
+      {"atom-keyed entry", [keys: [{"r1", String.to_atom(@k1)}]], @k1},
+      {"raising key_for MFA", [key_for: {:maps, :get, [%{"r1" => @k1}]}, active: "r2"], @k1}
+    ]
+  end
 
-      assert {:error, %Sediment.Error{message: message}} =
-               Sediment.Connection.connect(database: Temp.path!(), encryption: ring)
+  # What a call shows: its result, or its exception (message, inspect,
+  # stack trace); a returned exception as DBConnection logs it.
+  defp shown(fun) do
+    case fun.() do
+      {:ok, _} = ok ->
+        {:ok, [inspect(ok)]}
 
-      for secret <- secrets, do: refute(message =~ secret)
+      {:error, %{__exception__: true} = error} = result ->
+        {:error, [Exception.format_banner(:error, error), inspect(result, limit: :infinity)]}
 
-      # A pool logs every failed connect.
+      result ->
+        {:error, [inspect(result, limit: :infinity)]}
+    end
+  rescue
+    exception ->
+      {:raised,
+       [
+         Exception.format(:error, exception, __STACKTRACE__),
+         inspect(exception, limit: :infinity),
+         inspect(__STACKTRACE__, limit: :infinity)
+       ]}
+  end
+
+  defp refute_key(texts, key, case) do
+    for text <- texts, i <- 0..(byte_size(key) - 16) do
+      refute text =~ binary_part(key, i, 16), "#{case}: #{text}"
+    end
+  end
+
+  test "a mistyped :encryption never shows a key" do
+    for {case, encryption, key} <- mistyped(),
+        {call, fun} <- [
+          open: fn -> Engine.open(Temp.path!(), encryption: encryption) end,
+          connect: fn ->
+            Sediment.Connection.connect(database: Temp.path!(), encryption: encryption)
+          end
+        ] do
+      {outcome, texts} = shown(fun)
+      assert outcome != :ok, "#{case} (#{call}) opened"
+      refute_key(texts, key, "#{case} (#{call})")
+    end
+
+    # A key given as a rekey's :to or a release's key id, as a string or not.
+    ring = [keys: [{"r1", @k128}], cipher: "aes128gcm"]
+
+    for {case, key, fun} <- [
+          {"to: key", @k128, fn -> S3.rekey(Temp.path!(), s3(), encryption: ring, to: @k128) end},
+          {"to: key256", @k1, fn -> S3.rekey(Temp.path!(), s3(), encryption: ring, to: @k1) end},
+          {"release key", @k128,
+           fn -> S3.release_key(Temp.path!(), s3(), @k128, encryption: ring) end},
+          {"release [key: k]", @k1,
+           fn -> S3.release_key(Temp.path!(), s3(), [key: @k1], encryption: ring) end}
+        ] do
+      {outcome, texts} = shown(fun)
+      assert outcome != :ok, "#{case} succeeded"
+      refute_key(texts, key, case)
+    end
+  end
+
+  test "a pool logs a mistyped ring's failed connects without the key" do
+    for {case, encryption, key} <- Enum.take(mistyped(), 3) do
       log =
         ExUnit.CaptureLog.capture_log([level: :error], fn ->
-          {:ok, pool} = Sediment.start_link(database: Temp.path!(), encryption: ring)
+          {:ok, pool} = Sediment.start_link(database: Temp.path!(), encryption: encryption)
           Process.sleep(300)
           GenServer.stop(pool)
         end)
 
-      assert log =~ "ring entry 1"
-      for secret <- secrets, do: refute(log =~ secret)
+      assert log =~ "ring entry 1", case
+      refute_key([log], key, case)
     end
   end
 

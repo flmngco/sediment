@@ -41,7 +41,7 @@ pub use config::S3Config;
 pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
-pub use keys::{Key, KeyRecord, KeyRing};
+pub use keys::{shown, Key, KeyRecord, KeyRing};
 pub use rekey::{rekey, release_key, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;
@@ -644,7 +644,7 @@ fn rekey_target(
     };
     let target = match to {
         Some(id) => ring.need(id, |ring| {
-            format!("rekey: key {id} is not in the ring (ring: {ring})")
+            format!("rekey: key {} is not in the ring (ring: {ring})", shown(id))
         })?,
         None => ring.active()?,
     };
@@ -657,9 +657,9 @@ fn rekey_target(
     if target.cipher() != current.cipher() {
         return Err(S3Error::Config(format!(
             "rekey: key {} is for {}, the database's key {} for {}: a rekey keeps the cipher",
-            target.id(),
+            shown(target.id()),
             target.cipher(),
-            current.id(),
+            shown(current.id()),
             current.cipher()
         )));
     }
@@ -667,8 +667,8 @@ fn rekey_target(
         return Err(S3Error::Config(format!(
             "rekey: key {} is the database's key {} under another id; a rekey moves to \
              another key",
-            target.id(),
-            current.id()
+            shown(target.id()),
+            shown(current.id())
         )));
     }
     // Retired by id or by key material: a key comes back, under any id,
@@ -686,10 +686,10 @@ fn rekey_target(
                 "rekey: key {} (fingerprint {}) was retired from this database at {} (unix ms) \
                  as key {}; a rekey moves to a new key (allow_reuse: true to move back, once \
                  its retained epochs are released)",
-                target.id(),
+                shown(target.id()),
                 target.fingerprint(),
                 first.retired_at_ms,
-                first.id
+                shown(&first.id)
             )));
         }
     }
@@ -710,8 +710,8 @@ fn rekey_target(
         return Err(S3Error::Config(format!(
             "rekey: key {} still has retained epochs from when it was current; release them \
              first (Sediment.S3.release_key/4), then reuse {}",
-            key.id,
-            target.id()
+            shown(&key.id),
+            shown(target.id())
         )));
     }
     Ok(Some(target.clone()))
@@ -755,7 +755,7 @@ fn publish_manifest(
                     message: format!(
                         "{err}; another writer has the database now (its manifest names key \
                          {}), and this open's write of epoch {} may have landed before it",
-                        key.as_ref().map_or("none", |key| key.id.as_str()),
+                        key.as_ref().map_or("none".into(), |key| shown(&key.id)),
                         manifest.epoch
                     ),
                     key,
@@ -775,7 +775,8 @@ fn publish_manifest(
 fn released_epochs(manifest: &Manifest, id: &str) -> Result<Vec<Epoch>> {
     if manifest.key.as_ref().is_some_and(|key| key.id == id) {
         return Err(S3Error::Config(format!(
-            "key {id} is the current key of this database: rekey it to another key first"
+            "key {} is the current key of this database: rekey it to another key first",
+            shown(id)
         )));
     }
     Ok(manifest
@@ -984,7 +985,7 @@ pub fn check_same_encryption(existing: Option<&Key>, cfg: &S3Config) -> Result<(
                 format!(
                     "the database at this S3 prefix is open in this VM under key {}, which is \
                      not in the ring (ring: {ring}); every open needs the key it is under",
-                    open.id()
+                    shown(open.id())
                 )
             })?;
             keys::check_matches(key, &open.record())
@@ -1012,7 +1013,7 @@ fn overtaken_at_takeover(remote: &remote::Remote, err: S3Error) -> S3Error {
         message: format!(
             "manifest changed concurrently: {message}; another writer has the database (its \
              manifest names key {}), and this open switched nothing",
-            key.as_ref().map_or("none", |key| key.id.as_str())
+            key.as_ref().map_or("none".into(), |key| shown(&key.id))
         ),
         key,
     }

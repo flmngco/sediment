@@ -13,6 +13,10 @@ use super::error::{Result, S3Error};
 
 const FINGERPRINT_CONTEXT: &[u8] = b"sediment/key-fingerprint/v1";
 
+/// The ciphers turso takes, for messages.
+const CIPHERS: &str =
+    "aes128gcm, aes256gcm, aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4";
+
 /// What the manifest records about a key: enough to pick it from a ring and
 /// to tell whether a ring's key under that id is the same key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,8 +51,13 @@ impl Key {
     /// [`named`]).
     pub fn new(id: &str, cipher: &str, hexkey: &str) -> Result<Self> {
         check_id(id)?;
-        let mode = turso_core::CipherMode::try_from(cipher)
-            .map_err(|_| S3Error::Config(format!("{}: unknown cipher {cipher:?}", named(id))))?;
+        // Never echo the cipher: a key given in its place would show.
+        let mode = turso_core::CipherMode::try_from(cipher).map_err(|_| {
+            S3Error::Config(format!(
+                "{}: unknown cipher (supported: {CIPHERS})",
+                named(id)
+            ))
+        })?;
         let size = mode.required_key_size();
         let bytes = decode_hex(hexkey).ok_or_else(|| {
             S3Error::Config(format!(
@@ -121,27 +130,45 @@ impl Key {
     /// The encryption context of a database file with pages of `page_size`.
     pub fn page_context(&self, page_size: usize) -> Result<turso_core::EncryptionContext> {
         let cipher = turso_core::CipherMode::try_from(self.cipher.as_str())
-            .map_err(|e| S3Error::Config(format!("key {}: {e}", self.id)))?;
+            .map_err(|e| S3Error::Config(format!("key {}: {e}", shown(&self.id))))?;
         let key = turso_core::EncryptionKey::from_hex_string(&self.hexkey)
-            .map_err(|_| S3Error::Config(format!("key {}: not a valid key", self.id)))?;
+            .map_err(|_| S3Error::Config(format!("key {}: not a valid key", shown(&self.id))))?;
         turso_core::EncryptionContext::new(cipher, &key, page_size)
-            .map_err(|e| S3Error::Config(format!("key {}: {e}", self.id)))
+            .map_err(|e| S3Error::Config(format!("key {}: {e}", shown(&self.id))))
     }
 }
 
-/// `key <id>` for a message about a key that was refused, unless the id
-/// could be key material: an entry given as `{key, id}` has its key as the
-/// id, and an AES-128 key (32 hex digits) is a valid id.
+/// Whether `id` could be key material: hex of a key's length (32 hex
+/// digits or more; the smallest keys are 16 bytes). An entry given as
+/// `{key, id}` has its key as the id.
+fn looks_like_a_key(id: &str) -> bool {
+    id.len() >= 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// An id as every message (and result) shows it: as is, unless it could be
+/// key material. [`check_id`] refuses such ids, so only an id that wasn't
+/// checked is ever redacted.
+pub fn shown(id: &str) -> std::borrow::Cow<'_, str> {
+    if looks_like_a_key(id) {
+        "<an id that looks like a key>".into()
+    } else {
+        id.into()
+    }
+}
+
+/// `key <id>` for a message about a key that was refused.
 fn named(id: &str) -> String {
-    if id.len() >= 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if looks_like_a_key(id) {
         "a key whose id looks like a key (an entry given as {key, id}?)".into()
     } else {
         format!("key {id}")
     }
 }
 
-/// Key ids: short, lowercase, safe in messages and file names. The error
-/// never shows the id refused: it may be a key given in its place.
+/// Key ids: short, lowercase, safe in messages, manifests and file names,
+/// and never hex of a key's length (32 hex digits), which is refused: the
+/// id is recorded in S3 and shown in messages, and an AES-128 key would
+/// pass as one. The error never shows the id refused: it may be a key.
 pub(crate) fn check_id(id: &str) -> Result<()> {
     let mut bytes = id.bytes();
     let first_ok = bytes
@@ -149,16 +176,17 @@ pub(crate) fn check_id(id: &str) -> Result<()> {
         .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     let rest_ok =
         bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
-    if first_ok && rest_ok && id.len() <= 32 {
+    if looks_like_a_key(id) {
+        Err(S3Error::Config(format!(
+            "invalid key id ({} hex digits): it looks like a key (an entry given as {{key, id}}?); \
+             an id of 32 hex digits is refused",
+            id.len()
+        )))
+    } else if first_ok && rest_ok && id.len() <= 32 {
         Ok(())
     } else {
-        let swapped = if id.len() >= 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            " (it looks like a key: an entry given as {key, id}?)"
-        } else {
-            ""
-        };
         Err(S3Error::Config(format!(
-            "invalid key id ({} characters){swapped}: ids match [a-z0-9][a-z0-9_-]{{0,31}}",
+            "invalid key id ({} characters): ids match [a-z0-9][a-z0-9_-]{{0,31}}",
             id.chars().count()
         )))
     }
@@ -207,13 +235,14 @@ impl KeyRing {
                 if other.id == key.id {
                     return Err(S3Error::Config(format!(
                         "key id {} appears twice in the ring",
-                        key.id
+                        shown(&key.id)
                     )));
                 }
                 if other.fingerprint == key.fingerprint {
                     return Err(S3Error::Config(format!(
                         "keys {} and {} in the ring are the same key",
-                        other.id, key.id
+                        shown(&other.id),
+                        shown(&key.id)
                     )));
                 }
             }
@@ -253,7 +282,7 @@ impl KeyRing {
         self.need(&self.active.clone(), |ring| {
             format!(
                 "the active key {} is not in the ring (ring: {ring})",
-                self.active
+                shown(&self.active)
             )
         })
     }
@@ -269,7 +298,7 @@ impl KeyRing {
         }
         self.keys
             .iter()
-            .map(|key| key.id.as_str())
+            .map(|key| shown(&key.id))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -287,7 +316,7 @@ impl KeyRing {
     /// The key `record` names, checked against its fingerprint.
     pub fn resolve(&self, record: &KeyRecord) -> Result<&Key> {
         let key = self.need(&record.id, |ring| {
-            format!("unknown key id {} (ring: {ring})", record.id)
+            format!("unknown key id {} (ring: {ring})", shown(&record.id))
         })?;
         check_matches(key, record)?;
         Ok(key)
@@ -297,7 +326,7 @@ impl KeyRing {
     /// `record`'s key.
     pub fn resolve_for_restore(&self, record: &KeyRecord) -> Result<&Key> {
         let key = self.need(&record.id, |_| {
-            format!("needs key {}, which is not in the ring", record.id)
+            format!("needs key {}, which is not in the ring", shown(&record.id))
         })?;
         check_matches(key, record)?;
         Ok(key)
@@ -317,13 +346,17 @@ pub fn check_matches(key: &Key, record: &KeyRecord) -> Result<()> {
         return Err(S3Error::Config(format!(
             "key {} in the ring is not the key that encrypted this database (fingerprint {}, \
              recorded {})",
-            record.id, key.fingerprint, record.fingerprint
+            shown(&record.id),
+            key.fingerprint,
+            record.fingerprint
         )));
     }
     if key.cipher != record.cipher {
         return Err(S3Error::Config(format!(
             "key {} in the ring is for {}, but this database was encrypted with {}",
-            record.id, key.cipher, record.cipher
+            shown(&record.id),
+            key.cipher,
+            record.cipher
         )));
     }
     Ok(())
@@ -344,24 +377,73 @@ mod tests {
         message
     }
 
+    /// Every way a mistyped ring has put a key in a message (Opus and Codex
+    /// reviews): the message never holds the key, or any 16 hex digits of it.
     #[test]
-    fn an_entry_given_as_key_then_id_never_shows_the_key() {
-        // aegis256: the 64-hex key in the id's place is not a valid id.
-        let message = err(Key::new(A, "aegis256", "r2"));
-        assert!(
-            message.contains("invalid key id (64 characters)"),
-            "{message}"
-        );
-        assert!(message.contains("{key, id}"), "{message}");
-        // aes128gcm: the 32-hex key is a valid id; the hex check fails on "r2".
-        let message = err(Key::new(&A[..32], "aes128gcm", "r2"));
-        assert!(!message.contains(&A[..32]), "{message}");
-        assert!(message.contains("must be hex encoded"), "{message}");
-        assert!(message.contains("{key, id}"), "{message}");
-        let message = err(Key::new(&A[..32], "aes128gcm", "abab"));
-        assert!(message.contains("16-byte key"), "{message}");
-        // Neither cipher's error names the rejected id.
-        for id in ["R1", "-r", &A[..40]] {
+    fn a_mistyped_ring_never_shows_a_key() {
+        let k128 = &A[..32];
+        let uuid = &B[..32];
+        let ring = |keys: Vec<Key>, active: Option<&str>| {
+            KeyRing::new(keys, active.map(str::to_string), false).map(|_| ())
+        };
+        let cases: Vec<(&str, &str, Result<()>)> = vec![
+            (
+                "{key, r2}, aegis256",
+                A,
+                Key::new(A, "aegis256", "r2").map(|_| ()),
+            ),
+            (
+                "{key, r2}, aes128gcm",
+                k128,
+                Key::new(k128, "aes128gcm", "r2").map(|_| ()),
+            ),
+            // Both fields are 32 hex digits: the key is a valid-looking id,
+            // the uuid a valid-looking 16-byte key.
+            (
+                "{key, uuid}, aes128gcm",
+                k128,
+                Key::new(k128, "aes128gcm", uuid).map(|_| ()),
+            ),
+            (
+                "{key, uuid}, aegis256",
+                A,
+                Key::new(A, "aegis256", uuid).map(|_| ()),
+            ),
+            (
+                "cipher: key, key: cipher",
+                A,
+                Key::new("default", A, "aegis256").map(|_| ()),
+            ),
+            (
+                "cipher: key128, key: cipher",
+                k128,
+                Key::new("default", k128, "aes128gcm").map(|_| ()),
+            ),
+            (
+                "active: key",
+                k128,
+                ring(vec![Key::new("r1", "aes128gcm", k128).unwrap()], Some(k128)),
+            ),
+            (
+                "active: key256",
+                A,
+                ring(vec![Key::new("r1", "aegis256", A).unwrap()], Some(A)),
+            ),
+            ("to:/release id = key128", k128, check_id(k128)),
+            ("to:/release id = key256", A, check_id(A)),
+        ];
+        for (case, key, result) in cases {
+            let message = result.expect_err(case).to_string();
+            for i in 0..=key.len() - 16 {
+                assert!(!message.contains(&key[i..i + 16]), "{case}: {message}");
+            }
+        }
+        // A ring whose ids could be keys (not built by Key::new, which
+        // refuses them) shows none of them.
+        assert_eq!(shown(k128), "<an id that looks like a key>");
+        assert_eq!(shown("r1"), "r1");
+        // Refused ids are never echoed.
+        for id in ["R1", "-r", &A[..40], &"r".repeat(33)] {
             let message = err(Key::new(id, "aegis256", B));
             assert!(!message.contains(id), "{message}");
         }

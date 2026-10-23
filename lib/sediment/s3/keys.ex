@@ -52,28 +52,31 @@ defmodule Sediment.S3.Keys do
 
   @doc false
   @spec normalize(keyword() | map() | Hidden.t() | false | nil) :: ring() | false | nil
-  def normalize(encryption), do: scrubbed(fn -> do_normalize(encryption) end)
+  def normalize(encryption), do: sealed(fn -> do_normalize(encryption) end)
 
   defp do_normalize(nil), do: nil
   defp do_normalize(false), do: false
   defp do_normalize(%Hidden{get: get}), do: do_normalize(get.())
   defp do_normalize(%{} = opts), do: opts |> Map.to_list() |> do_normalize()
 
+  # Every value is checked by type here (the native code checks ids and
+  # keys), with fixed messages: a message never shows a value, which may be
+  # a key given in the wrong place.
   defp do_normalize(opts) when is_list(opts) do
-    cipher = to_string(Keyword.get(opts, :cipher, @default_cipher))
+    cipher = cipher!(Keyword.get(opts, :cipher, @default_cipher), "the cipher")
 
     cond do
       Keyword.has_key?(opts, :keys) or Keyword.has_key?(opts, :key_for) ->
         %{
-          keys: Enum.map(Keyword.get(opts, :keys, []), &entry(&1, cipher)),
-          active: opts[:active] && to_string(opts[:active]),
+          keys: entries(Keyword.get(opts, :keys, []), cipher),
+          active: opts[:active] && id!(opts[:active], ":active"),
           cipher: cipher,
           key_for: key_for(opts[:key_for])
         }
 
       Keyword.has_key?(opts, :key) ->
         %{
-          keys: [{"default", cipher, to_string(opts[:key])}],
+          keys: [{"default", cipher, key!(opts[:key], ":key")}],
           active: nil,
           cipher: cipher,
           key_for: nil
@@ -91,15 +94,39 @@ defmodule Sediment.S3.Keys do
           "encryption: expected a keyword list (see Sediment.S3, \"Encryption\") or false"
   end
 
-  defp entry({id, key}, cipher), do: {to_string(id), cipher, to_string(key)}
-
-  defp entry({id, key, opts}, cipher) when is_list(opts),
-    do: {to_string(id), to_string(Keyword.get(opts, :cipher, cipher)), to_string(key)}
-
-  # Never inspect an entry: it holds a key.
-  defp entry(_other, _cipher) do
-    raise ArgumentError, "encryption: each of :keys is {id, hex_key} or {id, hex_key, cipher: c}"
+  defp entries(entries, cipher) when is_list(entries) do
+    entries
+    |> Enum.with_index(1)
+    |> Enum.map(fn {entry, n} -> entry(entry, cipher, "ring entry #{n}") end)
   end
+
+  defp entries(_other, _cipher),
+    do: raise(ArgumentError, "encryption: :keys is a list of {id, hex_key} entries")
+
+  defp entry({id, key}, cipher, at), do: {id!(id, at), cipher, key!(key, at)}
+
+  defp entry({id, key, opts}, cipher, at) when is_list(opts),
+    do: {id!(id, at), cipher!(Keyword.get(opts, :cipher, cipher), at), key!(key, at)}
+
+  defp entry(_other, _cipher, at) do
+    raise ArgumentError,
+          "encryption: #{at}: expected {id, hex_key} or {id, hex_key, cipher: c}"
+  end
+
+  defp id!(id, _at) when is_binary(id), do: id
+  defp id!(id, _at) when is_atom(id) and id not in [nil, true, false], do: Atom.to_string(id)
+  defp id!(_id, at), do: raise(ArgumentError, "encryption: #{at}: the id must be a string")
+
+  defp key!(key, _at) when is_binary(key), do: key
+  defp key!(_key, at), do: raise(ArgumentError, "encryption: #{at}: the key must be a hex string")
+
+  defp cipher!(cipher, _at) when is_binary(cipher), do: cipher
+
+  defp cipher!(cipher, _at) when is_atom(cipher) and cipher not in [nil, true, false],
+    do: Atom.to_string(cipher)
+
+  defp cipher!(_cipher, at),
+    do: raise(ArgumentError, "encryption: #{at}: the cipher must be a string")
 
   defp key_for(nil), do: nil
   defp key_for(fun) when is_function(fun, 1), do: fun
@@ -155,8 +182,61 @@ defmodule Sediment.S3.Keys do
     end
   end
 
-  defp call(fun, id) when is_function(fun, 1), do: fun.(id)
-  defp call({m, f, a}, id), do: apply(m, f, [id | a])
+  # A key_for that fails is reported by the id and the exception's type
+  # only: its exception and its stack frames' arguments may hold keys (a
+  # resolver's map of them, say).
+  defp call(key_for, id) do
+    apply_key_for(key_for, id)
+  rescue
+    exception ->
+      reraise key_for_failed(id, "raised #{inspect(exception.__struct__)}"),
+              Enum.map(__STACKTRACE__, &scrub_frame/1)
+  catch
+    kind, _reason ->
+      reraise key_for_failed(id, "#{kind}"), Enum.map(__STACKTRACE__, &scrub_frame/1)
+  end
+
+  defp apply_key_for(fun, id) when is_function(fun, 1), do: fun.(id)
+  defp apply_key_for({m, f, a}, id), do: apply(m, f, [id | a])
+
+  defp key_for_failed(id, how) do
+    %RuntimeError{
+      message:
+        "encryption: key_for failed for key #{shown(id)} (#{how}; details withheld: " <>
+          "they may hold keys)"
+    }
+  end
+
+  @doc false
+  # An id as messages show it: as is, unless it could be a key (32 or more
+  # hex digits; the native code refuses such ids).
+  @spec shown(String.t()) :: String.t()
+  def shown(id) do
+    if String.match?(id, ~r/\A[0-9a-fA-F]{32,}\z/), do: "<an id that looks like a key>", else: id
+  end
+
+  # Normalization's own errors are ArgumentErrors starting "encryption: ";
+  # anything else raised meanwhile (a value of an unexpected type, say) may
+  # show the value, so it is replaced, and every frame's arguments dropped.
+  defp sealed(fun) do
+    fun.()
+  rescue
+    exception ->
+      safe =
+        case exception do
+          %ArgumentError{message: "encryption: " <> _} ->
+            exception
+
+          other ->
+            %ArgumentError{
+              message:
+                "encryption: invalid option (#{inspect(other.__struct__)}; details withheld: " <>
+                  "it may hold keys)"
+            }
+        end
+
+      reraise safe, Enum.map(__STACKTRACE__, &scrub_frame/1)
+  end
 
   @doc false
   # Runs `fun`. An exception raised in it is raised again with every stack

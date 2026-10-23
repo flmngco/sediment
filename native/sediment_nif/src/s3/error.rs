@@ -79,7 +79,11 @@ impl fmt::Display for S3Error {
             S3Error::Overtaken { message, .. } => write!(f, "s3 writer fenced: {message}"),
             S3Error::Indeterminate(msg) => write!(f, "s3 indeterminate: {msg}"),
             S3Error::KeyNeeded(id) => {
-                write!(f, "s3 config: needs key {id}, which is not in the ring")
+                write!(
+                    f,
+                    "s3 config: needs key {}, which is not in the ring",
+                    super::keys::shown(id)
+                )
             }
         }
     }
