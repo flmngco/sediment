@@ -239,28 +239,93 @@ defmodule Sediment.S3.Keys do
   end
 
   @doc false
-  # Runs `fun`. An exception raised in it is raised again with every stack
-  # frame's arguments replaced by their count: a NIF that can't decode an
-  # argument raises badarg with all its arguments (key rings, S3
-  # credentials) in the top frame, which consoles, crash reports and error
-  # trackers would show. Exceptions that carry their arguments are replaced
-  # by an ArgumentError naming only their type.
+  # Every public function taking keys (`:encryption`, `:source_encryption`,
+  # S3 options) runs all of its argument handling and its NIF call in here:
+  # no exception raised meanwhile can carry an argument. Each stack frame's
+  # arguments are replaced by their count (a function clause that doesn't
+  # match a map of options, or a NIF that can't decode an argument, puts
+  # them all, key rings and S3 credentials included, in the top frame,
+  # which consoles, crash reports and error trackers would show). Only
+  # Sediment's own exceptions keep their message (see `ours?/2`); any other
+  # (a FunctionClauseError, KeyError or MatchError holds the value it
+  # failed on) becomes an ArgumentError naming only its type.
   @spec scrubbed((-> result)) :: result when result: term()
   def scrubbed(fun) do
     fun.()
   rescue
-    exception -> reraise scrub(exception), Enum.map(__STACKTRACE__, &scrub_frame/1)
+    exception ->
+      stacktrace = __STACKTRACE__
+      safe = if ours?(exception, stacktrace), do: exception, else: withheld(exception)
+      reraise safe, Enum.map(stacktrace, &scrub_frame/1)
   end
 
-  defp scrub(%ArgumentError{} = exception), do: exception
-  defp scrub(%ErlangError{original: original} = exception) when is_atom(original), do: exception
+  # Raised by Sediment's own code, whose messages never show a value: a
+  # key ring's errors (normalization, a failed key_for) and the
+  # ArgumentErrors, RuntimeErrors and Sediment.Errors raised in a module of
+  # Sediment's (a NIF's badarg is raised in Sediment.Native, with the plain
+  # message "argument error").
+  defp ours?(%type{message: "encryption: " <> _}, _stacktrace)
+       when type in [ArgumentError, RuntimeError],
+       do: true
 
-  defp scrub(exception) do
+  defp ours?(%ErlangError{original: original}, _stacktrace) when is_atom(original), do: true
+
+  defp ours?(%type{}, [{module, _fun, _args, _location} | _])
+       when type in [ArgumentError, RuntimeError, Sediment.Error],
+       do: sediment_module?(module)
+
+  defp ours?(_exception, _stacktrace), do: false
+
+  defp sediment_module?(module) do
+    case Atom.to_string(module) do
+      "Elixir." <> _ -> "Sediment" in Module.split(module)
+      _erlang -> false
+    end
+  end
+
+  defp withheld(exception) do
     %ArgumentError{
       message:
         "#{inspect(exception.__struct__)} (details withheld: the arguments may hold keys or credentials)"
     }
   end
+
+  @ring_options [:key, :keys, :key_for, :cipher, :active]
+
+  @doc false
+  # The options of a public function taking keys, checked before anything
+  # reads them, with fixed messages: a keyword list, without a key ring's
+  # own options at the top level (a ring given in place of the options
+  # would otherwise be ignored, opening an unencrypted database). `except`:
+  # ring options the caller refuses itself.
+  @spec options(term(), String.t(), [atom()]) :: :ok | {:error, String.t()}
+  def options(opts, call, except \\ []) do
+    cond do
+      not keyword?(opts) ->
+        {:error, "#{call}: the options must be a keyword list"}
+
+      option = Enum.find(@ring_options -- except, &Keyword.has_key?(opts, &1)) ->
+        {:error,
+         "#{call}: #{inspect(option)} is an option of the key ring, given as " <>
+           "encryption: [...] (see Sediment.S3, \"Encryption\")"}
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc false
+  @spec options!(term(), String.t(), [atom()]) :: keyword()
+  def options!(opts, call, except \\ []) do
+    case options(opts, call, except) do
+      :ok -> opts
+      {:error, message} -> raise ArgumentError, message
+    end
+  end
+
+  defp keyword?([]), do: true
+  defp keyword?([{key, _value} | rest]) when is_atom(key), do: keyword?(rest)
+  defp keyword?(_other), do: false
 
   defp scrub_frame({module, fun, args, location}) when is_list(args),
     do: {module, fun, length(args), location}

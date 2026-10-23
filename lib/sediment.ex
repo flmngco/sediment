@@ -18,16 +18,24 @@ defmodule Sediment do
   """
   @spec start_link([Connection.connection_opt()]) :: {:ok, pid()} | {:error, Error.t()}
   def start_link(opts) do
-    DBConnection.start_link(Connection, opts |> hide_keys() |> with_s3_shutdown())
+    # Its options hold keys: see Sediment.S3.Keys.scrubbed/1 (`:key` is left
+    # to connect/1, which refuses it as an unsupported option).
+    Sediment.S3.Keys.scrubbed(fn ->
+      opts = Sediment.S3.Keys.options!(opts, "Sediment.start_link/1", [:key])
+      DBConnection.start_link(Connection, opts |> hide_keys() |> with_s3_shutdown())
+    end)
   end
 
   # The pool's processes keep their options (and supervisors their child
   # specs): the keys in them are hidden from crash reports and inspection.
+  # `:key` too: connect/1 refuses it, but the pool keeps it meanwhile.
   defp hide_keys(opts) do
-    case Keyword.fetch(opts, :encryption) do
-      {:ok, encryption} -> Keyword.put(opts, :encryption, Sediment.S3.Keys.hide(encryption))
-      :error -> opts
-    end
+    Enum.reduce([:encryption, :key], opts, fn option, opts ->
+      case Keyword.fetch(opts, option) do
+        {:ok, value} -> Keyword.put(opts, option, Sediment.S3.Keys.hide(value))
+        :error -> opts
+      end
+    end)
   end
 
   # Closing an async S3 connection drains pending uploads; the pool must wait
@@ -176,15 +184,18 @@ defmodule Sediment do
   """
   @spec child_spec([Connection.connection_opt()]) :: :supervisor.child_spec()
   def child_spec(opts) do
-    opts = opts |> hide_keys() |> with_s3_shutdown()
-    spec = DBConnection.child_spec(Connection, opts)
+    Sediment.S3.Keys.scrubbed(fn ->
+      opts = Sediment.S3.Keys.options!(opts, "Sediment.child_spec/1", [:key])
+      opts = opts |> hide_keys() |> with_s3_shutdown()
+      spec = DBConnection.child_spec(Connection, opts)
 
-    # The pool's supervisor must wait as long as the pool waits for its
-    # connections, or it kills the pool while they are still closing.
-    case opts[:shutdown] do
-      nil -> spec
-      shutdown -> Supervisor.child_spec(spec, shutdown: shutdown)
-    end
+      # The pool's supervisor must wait as long as the pool waits for its
+      # connections, or it kills the pool while they are still closing.
+      case opts[:shutdown] do
+        nil -> spec
+        shutdown -> Supervisor.child_spec(spec, shutdown: shutdown)
+      end
+    end)
   end
 
   @doc """
@@ -237,23 +248,30 @@ defmodule Sediment do
   """
   @spec export_sqlite(Path.t() | nil, Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def export_sqlite(source, dest, opts \\ []) do
-    source = source && to_string(source)
-    dest = to_string(dest)
+    Sediment.S3.Keys.scrubbed(fn ->
+      opts = Sediment.S3.Keys.options!(opts, "Sediment.export_sqlite/3")
+      source = source && to_string(source)
+      dest = to_string(dest)
 
-    from_s3 =
-      case opts[:from_s3] do
-        nil -> nil
-        s3 -> Sediment.S3.with_encryption_choice(s3, opts[:encryption])
-      end
+      from_s3 =
+        case opts[:from_s3] do
+          nil -> nil
+          s3 -> Sediment.S3.with_encryption_choice(s3, opts[:encryption])
+        end
 
-    ring = Sediment.S3.Keys.normalize(opts[:encryption])
-
-    Sediment.Telemetry.span([:export], %{source: source, dest: dest}, fn ->
-      ring = ring |> export_ring(from_s3) |> Sediment.S3.Keys.native()
+      ring = Sediment.S3.Keys.normalize(opts[:encryption])
       drop_fts = opts[:drop_fts] == true
-      export = fn -> Sediment.Native.export_sqlite(source, dest, from_s3, ring, drop_fts) end
-      Sediment.S3.Keys.scrubbed(export)
+
+      Sediment.Telemetry.span([:export], %{source: source, dest: dest}, fn ->
+        export(source, dest, from_s3, ring, drop_fts)
+      end)
     end)
+  end
+
+  defp export(source, dest, from_s3, ring, drop_fts) do
+    ring = ring |> export_ring(from_s3) |> Sediment.S3.Keys.native()
+    export = fn -> Sediment.Native.export_sqlite(source, dest, from_s3, ring, drop_fts) end
+    Sediment.S3.Keys.scrubbed(export)
   end
 
   # An S3 source is read with its current key: a key_for ring resolves it

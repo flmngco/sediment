@@ -41,7 +41,7 @@ pub use config::S3Config;
 pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
-pub use keys::{shown, Key, KeyRecord, KeyRing};
+pub use keys::{shown, shown_value, Key, KeyRecord, KeyRing};
 pub use rekey::{rekey, release_key, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;

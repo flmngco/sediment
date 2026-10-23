@@ -151,7 +151,9 @@ impl S3Config {
                 "access_key_id" => cfg.access_key_id = Some(value),
                 "secret_access_key" => cfg.secret_access_key = Some(value),
                 "session_token" => cfg.session_token = Some(value),
-                "virtual_hosted_style" => cfg.virtual_hosted_style = Some(parse_bool(&value)?),
+                "virtual_hosted_style" => {
+                    cfg.virtual_hosted_style = Some(parse_bool(&key, &value)?)
+                }
                 "lease_ttl_ms" => cfg.lease_ttl = Duration::from_millis(parse_num(&key, &value)?),
                 "owner" => cfg.owner = Some(value),
                 "checkpoint_threshold" => cfg.checkpoint_threshold = Some(parse_num(&key, &value)?),
@@ -161,16 +163,14 @@ impl S3Config {
                 "max_retries" => cfg.max_retries = parse_num(&key, &value)?,
                 "download_concurrency" => cfg.download_concurrency = parse_num(&key, &value)?,
                 "retain_epochs" => cfg.retain_epochs = parse_num(&key, &value)?,
-                "group_commit" => cfg.group_commit = parse_bool(&value)?,
-                "incremental_snapshots" => cfg.incremental_snapshots = parse_bool(&value)?,
+                "group_commit" => cfg.group_commit = parse_bool(&key, &value)?,
+                "incremental_snapshots" => cfg.incremental_snapshots = parse_bool(&key, &value)?,
                 "durability" => {
                     cfg.async_durability = match value.as_str() {
                         "async" => true,
                         "sync" => false,
-                        other => {
-                            return Err(S3Error::Config(format!(
-                                "durability must be async or sync, got {other:?}"
-                            )))
+                        _ => {
+                            return Err(S3Error::Config("durability must be async or sync".into()))
                         }
                     }
                 }
@@ -182,11 +182,13 @@ impl S3Config {
                 "close_timeout_ms" => {
                     cfg.close_timeout = Duration::from_millis(parse_num(&key, &value)?)
                 }
-                "verify_conditional_writes" => cfg.verify_conditional_writes = parse_bool(&value)?,
-                "must_exist" => cfg.must_exist = parse_bool(&value)?,
+                "verify_conditional_writes" => {
+                    cfg.verify_conditional_writes = parse_bool(&key, &value)?
+                }
+                "must_exist" => cfg.must_exist = parse_bool(&key, &value)?,
                 // Forwarded from the top-level `encryption: false` open option.
                 "encryption" => {
-                    if parse_bool(&value)? {
+                    if parse_bool(&key, &value)? {
                         return Err(S3Error::Config(
                             "set the key with the :encryption option \
                              ([cipher: \"aegis256\", key: \"<64 hex chars>\"]), not inside :s3"
@@ -199,14 +201,15 @@ impl S3Config {
                     cfg.replica = match value.as_str() {
                         "writer" => false,
                         "replica" => true,
-                        other => {
-                            return Err(S3Error::Config(format!(
-                                "mode must be writer or replica, got {other:?}"
-                            )))
-                        }
+                        _ => return Err(S3Error::Config("mode must be writer or replica".into())),
                     }
                 }
-                other => return Err(S3Error::Config(format!("unknown option {other:?}"))),
+                other => {
+                    return Err(S3Error::Config(format!(
+                        "unknown option {:?}",
+                        super::keys::shown_value(other)
+                    )))
+                }
             }
         }
         cfg.validate()?;
@@ -220,9 +223,14 @@ impl S3Config {
                 .or_else(|| endpoint.strip_prefix("https://"));
             let host = rest.map(|r| r.split('/').next().unwrap_or(""));
             if !host.is_some_and(|h| !h.is_empty() && !h.contains(char::is_whitespace)) {
-                return Err(S3Error::Config(format!(
-                    "invalid endpoint {endpoint:?}: expected http(s)://host[:port]"
-                )));
+                // Shown only with its scheme: anything else could be a
+                // key or a credential given in the wrong place.
+                return Err(S3Error::Config(match rest {
+                    Some(_) => {
+                        format!("invalid endpoint {endpoint:?}: expected http(s)://host[:port]")
+                    }
+                    None => "invalid endpoint: expected http(s)://host[:port]".into(),
+                }));
             }
         }
         if self.store.is_none() && self.bucket.is_empty() {
@@ -359,19 +367,24 @@ fn normalize_prefix(prefix: &str) -> String {
     prefix.trim_matches('/').to_string()
 }
 
-fn parse_bool(value: &str) -> Result<bool> {
+// A value that doesn't parse is never shown, only its option: it may be a
+// key or a credential given in the wrong place (`encryption: "<key>"`).
+fn parse_bool(key: &impl AsRef<str>, value: &str) -> Result<bool> {
     match value {
         "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
-        _ => Err(S3Error::Config(format!("expected boolean, got {value:?}"))),
+        _ => Err(S3Error::Config(format!(
+            "{}: expected a boolean",
+            super::keys::shown_value(key.as_ref())
+        ))),
     }
 }
 
 fn parse_num<T: std::str::FromStr>(key: &impl AsRef<str>, value: &str) -> Result<T> {
     value.parse().map_err(|_| {
         S3Error::Config(format!(
-            "{}: expected a number, got {value:?}",
-            key.as_ref()
+            "{}: expected a number",
+            super::keys::shown_value(key.as_ref())
         ))
     })
 }
@@ -427,5 +440,46 @@ mod tests {
         assert!(err(&[("bucket", "b"), ("group_commit", "maybe")]).contains("boolean"));
         assert!(err(&[("bucket", "b"), ("mode", "primary")]).contains("writer or replica"));
         assert!(err(&[("bucket", "b"), ("download_concurrency", "0")]).contains("> 0"));
+    }
+
+    // A key given among the S3 options, as any option's value or as an
+    // option's name (a ring's `{key, id}` entry given as the options).
+    #[test]
+    fn a_key_in_the_options_never_shows() {
+        let k256 = "1a".repeat(32);
+        let k128 = "4d".repeat(16);
+        for key in [k256.as_str(), k128.as_str()] {
+            let mut cases: Vec<Vec<(&str, &str)>> = [
+                "encryption",
+                "virtual_hosted_style",
+                "group_commit",
+                "incremental_snapshots",
+                "verify_conditional_writes",
+                "must_exist",
+                "lease_ttl_ms",
+                "checkpoint_threshold",
+                "request_timeout_ms",
+                "max_retries",
+                "download_concurrency",
+                "retain_epochs",
+                "max_lag_ms",
+                "upload_interval_ms",
+                "max_pending_bytes",
+                "close_timeout_ms",
+                "durability",
+                "mode",
+                "endpoint",
+            ]
+            .into_iter()
+            .map(|option| vec![("bucket", "b"), (option, key)])
+            .collect();
+            cases.push(vec![("bucket", "b"), (key, "r1")]);
+            for pairs in cases {
+                let message = err(&pairs);
+                for i in 0..=key.len() - 16 {
+                    assert!(!message.contains(&key[i..i + 16]), "{pairs:?}: {message}");
+                }
+            }
+        }
     }
 }

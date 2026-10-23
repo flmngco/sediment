@@ -101,7 +101,10 @@ impl<'a> OpenConfig<'a> {
                     .decode::<String>()
                     .map_err(|_| "journal_mode must be a string".to_string())?;
                 if !JOURNAL_MODES.contains(&mode.as_str()) {
-                    return Err(format!("unknown journal mode: {mode}"));
+                    return Err(format!(
+                        "unknown journal mode: {}",
+                        crate::s3::shown_value(&mode)
+                    ));
                 }
                 Some(mode)
             }
@@ -160,7 +163,12 @@ impl<'a> OpenConfig<'a> {
                 "generated_columns" => opts.with_generated_columns(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
-                other => return Err(format!("unknown experimental feature: {other}")),
+                other => {
+                    return Err(format!(
+                        "unknown experimental feature: {}",
+                        crate::s3::shown_value(other)
+                    ))
+                }
             };
         }
         Ok(opts)

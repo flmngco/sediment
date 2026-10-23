@@ -180,6 +180,17 @@ defmodule Sediment.Connection do
   """
   @spec connect([connection_opt()]) :: {:ok, t()} | {:error, Exception.t()}
   def connect(options) do
+    # Its options hold keys and S3 credentials: see Sediment.S3.Keys.scrubbed/1
+    # (`:key` is refused below, as an unsupported option).
+    Sediment.S3.Keys.scrubbed(fn ->
+      case Sediment.S3.Keys.options(options, "Sediment.Connection.connect/1", [:key]) do
+        :ok -> connect_checked(options)
+        {:error, message} -> {:error, %Error{message: message}}
+      end
+    end)
+  end
+
+  defp connect_checked(options) do
     database = Keyword.get(options, :database)
 
     options =

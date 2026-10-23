@@ -230,6 +230,120 @@ defmodule Sediment.S3KeysTest do
     end
   end
 
+  # Options of the wrong shape, around a correct ring: a map, a tuple, a
+  # key, a bare ring, a list that isn't a keyword list, a ring option at
+  # the top level.
+  defp misshapen(ring) do
+    [
+      {"map", %{encryption: ring}},
+      {"tuple", {:encryption, ring}},
+      {"a key", @k1},
+      {"a bare ring", ring},
+      {"a bare [cipher:, key:]", [cipher: "aegis256", key: @k1]},
+      {"a list of entries", [{"r1", @k1}]},
+      {"an improper list", [{:encryption, ring} | @k1]},
+      {"keys: beside encryption:", [encryption: ring, keys: [{"r3", @k1}]]}
+    ]
+  end
+
+  # S3 options holding a key: as an option's value, as an option's name
+  # (a ring entry given as the options), as a map, a tuple or a bare ring.
+  defp misshapen_s3 do
+    s3 = Keyword.delete(s3(), :secret_access_key)
+
+    [
+      {"s3 encryption: key", s3 ++ [encryption: @k1]},
+      {"s3 durability: key", s3 ++ [durability: @k1]},
+      {"s3 must_exist: key", s3 ++ [must_exist: @k1]},
+      {"s3 lease_ttl_ms: key", s3 ++ [lease_ttl_ms: @k1]},
+      {"s3 endpoint: key", Keyword.put(s3, :endpoint, @k1)},
+      {"s3 {key, id}", s3 ++ [{@k1, "r1"}]},
+      {"s3 map", Map.new(s3 ++ [encryption: @k1])},
+      {"s3 tuple", {:bucket, @k1}},
+      {"s3 bare ring", ring()},
+      {"s3 [encryption: ring]", s3 ++ [encryption: ring()]}
+    ]
+  end
+
+  test "options of the wrong shape never show a key, at any entry point" do
+    ring = ring()
+    db_path = Temp.path!()
+    {:ok, db} = Engine.open(db_path)
+
+    # Every public function taking keys, with its options.
+    entry_points = [
+      {"Engine.open", &Engine.open(Temp.path!(), &1)},
+      {"Connection.connect", &Sediment.Connection.connect(&1)},
+      {"Sediment.start_link", &Sediment.start_link/1},
+      {"Sediment.child_spec", &Sediment.child_spec/1},
+      {"S3.refresh", &S3.refresh(db, &1)},
+      {"S3.restore", &S3.restore(Temp.path!(), s3(), &1)},
+      {"S3.import", &S3.import(db_path, s3(), &1)},
+      {"S3.rekey", &S3.rekey(Temp.path!(), s3(), &1)},
+      {"S3.release_key", &S3.release_key(Temp.path!(), s3(), "r1", &1)},
+      {"S3.destroy", &S3.destroy(s3(), &1)},
+      {"export_sqlite", &Sediment.export_sqlite(db_path, Temp.path!(), &1)}
+    ]
+
+    for {call, fun} <- entry_points, {case, opts} <- misshapen(ring) do
+      {outcome, texts} = shown(fn -> fun.(opts) end)
+      assert outcome != :ok, "#{call}, #{case}: accepted"
+      for key <- [@k1, @k2], do: refute_key(texts, key, "#{call}, #{case}")
+    end
+
+    # `:key` beside `:encryption` is refused by the pool's connections
+    # (connect/1), and the pool keeps it hidden meanwhile.
+    {:error, _} =
+      result = Sediment.Connection.connect(database: Temp.path!(), encryption: ring, key: @k1)
+
+    refute_key([inspect(result, limit: :infinity)], @k1, "connect, key: beside encryption:")
+    {:ok, pool} = Sediment.start_link(database: Temp.path!(), encryption: ring, key: @k1)
+    pool |> pool_processes() |> Enum.each(&refute_in_process/1)
+    GenServer.stop(pool)
+
+    # Every function taking S3 options, with S3 options holding a key.
+    s3_entry_points = [
+      {"Engine.open", &Engine.open(Temp.path!(), s3: &1, encryption: ring)},
+      {"Connection.connect",
+       &Sediment.Connection.connect(database: Temp.path!(), s3: &1, encryption: ring)},
+      {"S3.restore", &S3.restore(Temp.path!(), &1, encryption: ring)},
+      {"S3.import", &S3.import(db_path, &1, encryption: ring)},
+      {"S3.rekey", &S3.rekey(Temp.path!(), &1, encryption: ring)},
+      {"S3.release_key", &S3.release_key(Temp.path!(), &1, "r1", encryption: ring)},
+      {"S3.destroy", &S3.destroy(&1)},
+      {"S3.exists?", &S3.exists?/1},
+      {"S3.key_census", &S3.key_census/1},
+      {"export_sqlite", &Sediment.export_sqlite(nil, Temp.path!(), from_s3: &1, encryption: ring)}
+    ]
+
+    for {call, fun} <- s3_entry_points, {case, s3} <- misshapen_s3() do
+      {outcome, texts} = shown(fn -> fun.(s3) end)
+      assert outcome != :ok, "#{call}, #{case}: accepted"
+      for key <- [@k1, @k2], do: refute_key(texts, key, "#{call}, #{case}")
+    end
+
+    Engine.close(db)
+  end
+
+  test "options of the wrong shape are refused with a fixed message" do
+    assert_raise ArgumentError, "Sediment.S3.rekey/3: the options must be a keyword list", fn ->
+      S3.rekey(Temp.path!(), s3(), %{encryption: ring()})
+    end
+
+    assert_raise ArgumentError,
+                 ~r"^Sediment.Engine.open/2: :keys is an option of the key ring",
+                 fn -> Engine.open(Temp.path!(), ring()) end
+
+    assert {:error, %Sediment.Error{message: "Sediment.Connection.connect/1: the options " <> _}} =
+             Sediment.Connection.connect(%{database: Temp.path!()})
+
+    # A function clause, a KeyError or a MatchError raised meanwhile holds
+    # the value it failed on: only its type is shown.
+    assert_raise ArgumentError, ~r"^FunctionClauseError \(details withheld", fn ->
+      S3.restore(Temp.path!(), s3(), at: @k1, encryption: ring())
+    end
+  end
+
   test "a pool logs a mistyped ring's failed connects without the key" do
     for {case, encryption, key} <- Enum.take(mistyped(), 3) do
       log =

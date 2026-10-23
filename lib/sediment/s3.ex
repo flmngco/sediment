@@ -243,18 +243,19 @@ defmodule Sediment.S3 do
   def refresh(db, opts \\ [])
 
   def refresh(db, opts) when is_reference(db) do
-    Telemetry.span([:s3, :refresh], %{}, fn ->
-      case Keys.normalize(opts[:encryption]) do
-        %{key_for: key_for} = ring when key_for != nil ->
-          Keys.run(ring, &Native.s3_refresh(db, &1))
-
-        _ ->
-          db |> Native.s3_refresh(nil) |> key_needed()
-      end
+    Keys.scrubbed(fn ->
+      opts = Keys.options!(opts, "Sediment.S3.refresh/2")
+      ring = Keys.normalize(opts[:encryption])
+      Telemetry.span([:s3, :refresh], %{}, fn -> refresh_with(db, ring) end)
     end)
   end
 
   def refresh(conn, _opts), do: pool_call(conn, :refresh)
+
+  defp refresh_with(db, %{key_for: key_for} = ring) when key_for != nil,
+    do: Keys.run(ring, &Native.s3_refresh(db, &1))
+
+  defp refresh_with(db, _ring), do: db |> Native.s3_refresh(nil) |> key_needed()
 
   # A key a ring with key_for would have resolved, asked of one without.
   defp key_needed({:error, {:key_needed, id}}),
@@ -321,12 +322,15 @@ defmodule Sediment.S3 do
   """
   @spec restore(Path.t(), keyword() | map(), keyword()) :: {:ok, map()} | {:error, term()}
   def restore(path, s3_opts, opts \\ []) do
-    path = to_string(path)
+    Keys.scrubbed(fn ->
+      opts = Keys.options!(opts, "Sediment.S3.restore/3")
+      path = to_string(path)
 
-    case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
-      nil -> do_restore(path, s3_opts, opts)
-      existing -> {:error, "restore target exists: #{existing}"}
-    end
+      case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
+        nil -> do_restore(path, s3_opts, opts)
+        existing -> {:error, "restore target exists: #{existing}"}
+      end
+    end)
   end
 
   defp do_restore(path, s3_opts, opts) do
@@ -338,12 +342,10 @@ defmodule Sediment.S3 do
       end
 
     s3_opts = with_encryption_choice(s3_opts, opts[:encryption])
+    ring = Keys.normalize(opts[:encryption])
 
     Telemetry.span([:s3, :restore], %{path: path}, fn ->
-      Keys.run(
-        Keys.normalize(opts[:encryption]),
-        &Native.s3_restore(path, s3_opts, target, &1)
-      )
+      Keys.run(ring, &Native.s3_restore(path, s3_opts, target, &1))
     end)
   end
 
@@ -407,11 +409,16 @@ defmodule Sediment.S3 do
   """
   @spec destroy(keyword() | map(), keyword()) :: {:ok, map()} | {:error, term()}
   def destroy(s3_opts, opts \\ []) do
-    Telemetry.span([:s3, :destroy], %{}, fn ->
+    Keys.scrubbed(fn ->
+      opts = Keys.options!(opts, "Sediment.S3.destroy/2")
       force = boolean!(opts, :force, "destroy/2")
-      Keys.scrubbed(fn -> Native.s3_destroy(s3_opts, force) end)
+
+      Telemetry.span([:s3, :destroy], %{}, fn -> scrubbed_destroy(s3_opts, force) end)
     end)
   end
+
+  defp scrubbed_destroy(s3_opts, force),
+    do: Keys.scrubbed(fn -> Native.s3_destroy(s3_opts, force) end)
 
   @doc """
   Imports the existing database file at `path` (written by SQLite or
@@ -475,30 +482,33 @@ defmodule Sediment.S3 do
   """
   @spec import(Path.t(), keyword() | map(), keyword()) :: {:ok, map()} | {:error, term()}
   def import(path, s3_opts, opts \\ []) do
-    path = to_string(path)
-    verify = Keyword.get(opts, :verify, :checksum)
+    Keys.scrubbed(fn ->
+      opts = Keys.options!(opts, "Sediment.S3.import/3")
+      path = to_string(path)
+      verify = Keyword.get(opts, :verify, :checksum)
 
-    s3_opts = with_encryption_choice(s3_opts, opts[:encryption])
-    source = opts[:source_encryption] |> Keys.normalize() |> Keys.native()
+      s3_opts = with_encryption_choice(s3_opts, opts[:encryption])
+      source = opts[:source_encryption] |> Keys.normalize() |> Keys.native()
+      ring = Keys.normalize(opts[:encryption])
 
-    Telemetry.span([:s3, :import], %{path: path}, fn ->
-      case Keys.run(
-             Keys.normalize(opts[:encryption]),
-             &Native.s3_import(path, s3_opts, verify, &1, source)
-           ) do
-        {:ok, %{sequences_not_advanced: [_ | _] = tables} = info} ->
-          Logger.warning(
-            "S3 import of #{path}: the AUTOINCREMENT sequences of #{Enum.join(tables, ", ")} " <>
-              "(empty tables) start again at 1; ids of their deleted rows can be handed out again"
-          )
-
-          {:ok, info}
-
-        other ->
-          other
-      end
+      Telemetry.span([:s3, :import], %{path: path}, fn ->
+        ring
+        |> Keys.run(&Native.s3_import(path, s3_opts, verify, &1, source))
+        |> warn_sequences(path)
+      end)
     end)
   end
+
+  defp warn_sequences({:ok, %{sequences_not_advanced: [_ | _] = tables}} = result, path) do
+    Logger.warning(
+      "S3 import of #{path}: the AUTOINCREMENT sequences of #{Enum.join(tables, ", ")} " <>
+        "(empty tables) start again at 1; ids of their deleted rows can be handed out again"
+    )
+
+    result
+  end
+
+  defp warn_sequences(result, _path), do: result
 
   @doc """
   Generates a random encryption key for the `:encryption` option: 32 bytes
@@ -594,15 +604,17 @@ defmodule Sediment.S3 do
           {:ok, %{from: String.t(), to: String.t(), epoch: String.t()} | :current}
           | {:error, term()}
   def rekey(path, s3_opts, opts \\ []) do
-    path = to_string(path)
-    to = opts[:to] && key_id!(opts[:to], ":to", "rekey/3")
-    force = boolean!(opts, :force, "rekey/3")
-    allow_reuse = boolean!(opts, :allow_reuse, "rekey/3")
+    Keys.scrubbed(fn ->
+      opts = Keys.options!(opts, "Sediment.S3.rekey/3")
+      path = to_string(path)
+      to = opts[:to] && key_id!(opts[:to], ":to", "rekey/3")
+      force = boolean!(opts, :force, "rekey/3")
+      allow_reuse = boolean!(opts, :allow_reuse, "rekey/3")
+      ring = required_ring(opts[:encryption], "rekey/3")
 
-    Telemetry.span([:s3, :rekey], %{path: path}, fn ->
-      opts[:encryption]
-      |> required_ring("rekey/3")
-      |> Keys.run(&Native.s3_rekey(path, s3_opts, &1, to, force, allow_reuse))
+      Telemetry.span([:s3, :rekey], %{path: path}, fn ->
+        Keys.run(ring, &Native.s3_rekey(path, s3_opts, &1, to, force, allow_reuse))
+      end)
     end)
   end
 
@@ -630,19 +642,21 @@ defmodule Sediment.S3 do
   @spec release_key(Path.t(), keyword() | map(), String.t(), keyword()) ::
           {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
   def release_key(path, s3_opts, key_id, opts \\ []) do
-    path = to_string(path)
-    key_id = key_id!(key_id, "the key id", "release_key/4")
-    force = boolean!(opts, :force, "release_key/4")
+    Keys.scrubbed(fn ->
+      opts = Keys.options!(opts, "Sediment.S3.release_key/4")
+      path = to_string(path)
+      key_id = key_id!(key_id, "the key id", "release_key/4")
+      force = boolean!(opts, :force, "release_key/4")
+      ring = required_ring(opts[:encryption], "release_key/4")
 
-    Telemetry.span([:s3, :release_key], %{path: path}, fn ->
-      opts[:encryption]
-      |> required_ring("release_key/4")
-      |> Keys.run(&Native.s3_release_key(path, s3_opts, &1, key_id, force))
+      Telemetry.span([:s3, :release_key], %{path: path}, fn ->
+        Keys.run(ring, &Native.s3_release_key(path, s3_opts, &1, key_id, force))
+      end)
     end)
   end
 
-  # Checked here: a value the NIF can't decode raises badarg with every
-  # argument (the key ring, S3 credentials) in the stack trace.
+  # Checked here, with a fixed message: a value the NIF can't decode raises
+  # a bare badarg.
   defp boolean!(opts, name, call) do
     case Keyword.get(opts, name, false) do
       value when is_boolean(value) -> value

@@ -33,7 +33,10 @@ pub fn decode_config(term: Term<'_>) -> Result<S3Config, String> {
                 scalar(key).map_err(|_| "s3 option names must be atoms or strings".to_string())?;
             // Values can be credentials: name the option, never echo the value.
             let value = scalar(value).map_err(|_| {
-                format!("s3 option {key}: expected a string, atom, integer or boolean")
+                format!(
+                    "s3 option {}: expected a string, atom, integer or boolean",
+                    s3::shown_value(&key)
+                )
             })?;
             Ok((key, value))
         })

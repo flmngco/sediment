@@ -156,6 +156,16 @@ pub fn shown(id: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Any other value a message names (an option, a mode) as it shows it: as
+/// is, unless it could be a key given in the wrong place.
+pub fn shown_value(value: &str) -> std::borrow::Cow<'_, str> {
+    if looks_like_a_key(value) {
+        "<a value that looks like a key>".into()
+    } else {
+        value.into()
+    }
+}
+
 /// `key <id>` for a message about a key that was refused.
 fn named(id: &str) -> String {
     if looks_like_a_key(id) {

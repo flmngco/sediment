@@ -66,8 +66,13 @@ defmodule Sediment.Engine do
   """
   @spec open(String.t(), [open_opt()]) :: {:ok, db()} | {:error, reason()}
   def open(path, opts \\ []) do
-    mode = opts[:mode] || [:readwrite, :create]
+    # Its options hold keys and S3 credentials: see Sediment.S3.Keys.scrubbed/1.
+    Sediment.S3.Keys.scrubbed(fn -> do_open(path, opts) end)
+  end
 
+  defp do_open(path, opts) do
+    opts = Sediment.S3.Keys.options!(opts, "Sediment.Engine.open/2")
+    mode = opts[:mode] || [:readwrite, :create]
     ring = Sediment.S3.Keys.normalize(opts[:encryption])
 
     with {:ok, conn} <-
@@ -147,7 +152,7 @@ defmodule Sediment.Engine do
 
   defp modes_from_mode(mode) do
     raise ArgumentError,
-          "expected mode to be `:readwrite`, `:readonly` or list of modes, but received #{inspect(mode)}"
+          "expected mode to be `:readwrite`, `:readonly` or list of modes, but received #{shown_mode(mode)}"
   end
 
   defp validate_modes(modes) do
@@ -157,11 +162,16 @@ defmodule Sediment.Engine do
 
       mode ->
         raise ArgumentError,
-              "expected mode to be `:readwrite`, `:readonly`, `:nomutex` or `:create`, but received #{inspect(mode)}"
+              "expected mode to be `:readwrite`, `:readonly`, `:nomutex` or `:create`, but received #{shown_mode(mode)}"
     end)
 
     modes
   end
+
+  # A mode is an atom; anything else is not shown (it could be a key given
+  # in the wrong place).
+  defp shown_mode(mode) when is_atom(mode), do: inspect(mode)
+  defp shown_mode(_mode), do: "a value that is not an atom"
 
   @doc """
   Closes the database and releases any underlying resources.

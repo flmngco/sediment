@@ -387,7 +387,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_text/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -423,7 +423,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_blob/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -454,7 +454,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_integer/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -503,7 +503,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_float/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -570,7 +570,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_null/2" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end

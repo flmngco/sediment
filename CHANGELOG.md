@@ -71,8 +71,25 @@
   nor a value of the wrong type; an id that could be a key is shown as
   `<an id that looks like a key>`; a `key_for` that fails is reported by
   the id and the exception's type only, without stack frame arguments.
+* Options of the wrong shape never show a key either. Every public
+  function taking keys or S3 options (`Sediment.Engine.open/2`,
+  `Sediment.start_link/1`, `child_spec/1`, `export_sqlite/3`,
+  `Sediment.Connection.connect/1`, and `Sediment.S3`'s `refresh/2`,
+  `restore/3`, `import/3`, `rekey/3`, `release_key/4`, `destroy/2`,
+  `exists?/1`, `key_census/1`) handles its arguments inside one boundary:
+  any exception raised there loses its stack frames' arguments, and one
+  that isn't Sediment's own (a `FunctionClauseError` on a map of options,
+  a `KeyError`, a `MatchError`) is replaced by an `ArgumentError` naming
+  its type only. Their options must be a keyword list, without a ring's
+  options (`key:`, `keys:`, `cipher:` ...) at the top level: a map, or a
+  ring given as the options, is refused with a fixed message (a bare ring
+  given to `Sediment.Engine.open/2` used to open an unencrypted database).
+  An S3 option that doesn't parse is named, never shown (it was echoed:
+  `encryption: "<key>"` inside `:s3`), and so is an unknown option, mode
+  or journal mode that could be a key.
 * A pool (`Sediment.start_link/1`, `Sediment.child_spec/1`) and a
-  connection's state keep the `:encryption` option hidden: crash and
+  connection's state keep the `:encryption` option (and a `:key`, which
+  connections refuse) hidden: crash and
   termination reports, `:sys.get_status/1` and `inspect` show
   `#Sediment.S3.Keys.Hidden<redacted>`, never a key.
 * `Sediment.S3.restore/3`, `import/3`, `refresh/2`,
