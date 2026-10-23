@@ -449,6 +449,12 @@ defmodule Sediment.S3 do
       which MVCC doesn't support, has a hot rollback journal, can't be read
       (an encrypted file needs `:source_encryption`), or the new database
       fails `PRAGMA integrity_check`;
+    * a table has columns named `rowid`, `_rowid_` and `oid` (its rowids
+      can't be read);
+    * a table of the new database differs from the source's (its rows with
+      their rowids are compared), or an AUTOINCREMENT sequence doesn't match
+      the source's `sqlite_sequence`: an engine bug, named with its tables;
+      nothing is imported;
     * the file is larger than 5 TiB (a snapshot must fit in one S3
       object);
     * there's no room next to the file for the two temporary copies;
@@ -456,12 +462,12 @@ defmodule Sediment.S3 do
     * an S3 error, the lease held by a writer, or an unenforced conditional
       write (as for an open).
 
-  AUTOINCREMENT sequences carry over, also past rows deleted from the top
-  and in emptied tables. `:sequences_not_advanced` lists the exceptions:
-  emptied AUTOINCREMENT tables whose CHECK constraints refuse a placeholder
-  row (zero, empty text, empty blob in the NOT NULL columns). Their ids start
-  again at 1 instead of after the ids the deleted rows had, and a warning is
-  logged.
+  Rows keep their rowids. AUTOINCREMENT sequences carry over, also past
+  rows deleted from the top and in emptied tables. `:sequences_not_advanced`
+  lists the exceptions: emptied AUTOINCREMENT tables whose CHECK constraints
+  refuse a placeholder row (zero, empty text, empty blob in the NOT NULL
+  columns). Their ids start again at 1 instead of after the ids the deleted
+  rows had, and a warning is logged.
   """
   @spec import(Path.t(), keyword() | map(), keyword()) :: {:ok, map()} | {:error, term()}
   def import(path, s3_opts, opts \\ []) do

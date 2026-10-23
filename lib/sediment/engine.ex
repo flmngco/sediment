@@ -34,6 +34,9 @@ defmodule Sediment.Engine do
       Defaults to `[:readwrite, :create]` (opens for reading and writing and
       creates the file if it does not exist). `:readwrite` alone does not
       create the file. `:nomutex` is accepted for compatibility and ignored.
+      `:readonly` opens an MVCC database with `AUTOINCREMENT` rows
+      read-write with `query_only`: turso_core 0.8.3 writes their sequences
+      when it opens one (see the README).
 
     * `:journal_mode` - journal mode applied right after opening, for
       example `:wal` or `:mvcc`. MVCC is required for `BEGIN CONCURRENT`

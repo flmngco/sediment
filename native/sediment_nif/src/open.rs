@@ -294,13 +294,35 @@ impl<'a> OpenConfig<'a> {
             .encryption(encryption.clone())
             .durable_storage(s3.clone().map(|s| s as Arc<dyn DurableStorage>));
 
-        let db = Database::open(io.clone(), &self.path, options).map_err(|e| {
+        // turso_core 0.8.3's MVCC open rewrites each AUTOINCREMENT table's
+        // sequence watermark from sqlite_sequence (to the same value, or up
+        // to it), a write a read-only open refuses. That write never changes
+        // user data, so such a file is opened read-write instead (never
+        // created), and query_only below keeps the connection read-only.
+        let open_error = |e: turso_core::LimboError| {
             if s3.is_some() && !Path::new(&self.path).exists() {
                 return removed_while_opening(&self.path);
             }
             let message = crate::error::locked_elsewhere(&e).unwrap_or_else(|| e.to_string());
             crate::log_guard::explain_open_error(Path::new(&self.path), message)
-        })?;
+        };
+        let db = match Database::open(io.clone(), &self.path, options.clone()) {
+            Err(turso_core::LimboError::ReadOnly)
+                if self.readonly && crate::log_guard::is_mvcc_file(path) =>
+            {
+                let flags = self.flags() - OpenFlags::ReadOnly;
+                Database::open(io.clone(), &self.path, options.flags(flags)).map_err(|e| {
+                    format!(
+                        "{}: turso_core writes the AUTOINCREMENT sequences of an MVCC database \
+                         when it opens it, so a :readonly open needs write access to the file \
+                         and its log (the connection stays read-only): {}",
+                        self.path,
+                        open_error(e)
+                    )
+                })?
+            }
+            opened => opened.map_err(open_error)?,
+        };
         // What the S3 prepare restored (or created) is an MVCC database; any
         // other file here was put in its place since.
         if s3.is_some() && !db.mvcc_enabled() {
