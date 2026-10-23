@@ -33,13 +33,10 @@ restores it from S3.
   cipher's tag and nonce per 32 KiB chunk to find frame boundaries; the CRC
   covers the ciphertext, so verification needs no key. Snapshots are the
   encrypted database file. Local checkpoints/bootstraps open with the key.
-- The manifest's `encrypted` field records whether the database is
-  encrypted: `true`, `false`, or absent in manifests written before it was
-  always recorded. An open refuses a key on `false` and a missing key on
-  `true` before writing anything. The takeover keeps the field as it was;
-  only the epoch-advance manifest, written after the restore and checkpoint
-  under the open's key (or without one) succeeded, records it, so a wrong
-  key or a missing one can never mark a database the other way.
+- The manifest's `key` field records the key of the current epoch (`{id,
+  cipher, fingerprint}`, `null` for an unencrypted database), and every
+  retained epoch records its own. An open resolves the key from its ring
+  before writing anything; see "Keys and key rotation".
 
 ### Hook sequence (observed with a tracing wrapper)
 
@@ -78,7 +75,7 @@ empty between checkpoints. So the full state is always
 
 ```
 lease.json                           {owner, generation, expires_at_ms}
-manifest.json                        {version, generation, epoch, epoch_id, snapshot, database_id, ...}
+manifest.json                        {version: 4, generation, epoch, snapshot, database_id, key, history, retired_keys, ...}
                                      or, after a destroy: {version: 3, destroyed: true, generation, seq, ...}
 snapshots/<epoch_id>.db              DB file at the start of the epoch (zstd)
 snapshots/<epoch_id>.delta           or: its changed 64 KiB segments (zstd)
@@ -224,7 +221,9 @@ Cost: one PUT plus one HEAD per commit.
    `Corrupt`. Turso's own recovery would silently treat that as a torn tail.
 4. Fold the restored log into the DB file with a local turso checkpoint,
    upload it as the snapshot of a fresh epoch `(seq+1, our generation)`, and
-   point the manifest at it (`If-Match` on the takeover). Every open writes
+   point the manifest at it (`If-Match` on the takeover; a lost answer is
+   read back, see "Lost answers on the epoch advance"). The new epoch starts
+   at the store's Last-Modified of the seal the takeover wrote. Every open writes
    only to an epoch of its own. A killed earlier incarnation's or a stale
    writer's late PUTs can only land in keys nobody reads anymore, and those
    commits are never acknowledged (see "Why a stale writer..."). This was
@@ -239,8 +238,9 @@ turso's Database and its files are closed) leaves `.<name>.s3-warm` when
 everything committed is in S3 (upload queue empty, not poisoned, no recorded
 loss, no snapshot pending, the epoch is the manifest's, the lease never
 lapsed): `{version: 2, database_id, generation, epoch, log_len, log_end_crc,
-db_size, db_crc32c, db_sha256, log_sha256, encrypted, cipher}`. A sidecar of
-another version (version 1 had no SHA-256) is never reused. It syncs the database file and the
+db_size, db_crc32c, db_sha256, log_sha256, key_fingerprint}` (version 3). A
+sidecar of another version (version 1 had no SHA-256, version 2 no key
+fingerprint) is never reused. It syncs the database file and the
 log, verifies the log's chain, writes a temp file, syncs, renames and syncs
 the directory. The lease is released before; an open or destroy of the
 database in the same VM waits until the whole Drop has finished (the storage
@@ -254,7 +254,8 @@ and the content checks fail too).
 An open takes the sidecar (reads and deletes it, syncs the directory) before
 anything touches the local files. After its takeover, it reuses the copy only
 if the manifest it took over has the sidecar's `database_id`, generation and
-epoch; the encryption choice matches; the database file's size and CRC32C are
+epoch; the key the open resolved has the sidecar's fingerprint (and the
+manifest's); the database file's size and CRC32C are
 the sidecar's and the manifest's snapshot's, and its SHA-256 the sidecar's
 (CRC32C catches damage, not a change made to keep it); the local log's length,
 chain end and SHA-256 are the sidecar's; and, for a non-empty log, the epoch's
@@ -348,6 +349,127 @@ manifest a stale writer's create-only bootstrap manifest can still land and
 bring an older database back (`NegDestroyDeletes`). The tombstone and
 `lease.json` stay for good: the lease keeps generations growing, so no later
 database reuses a key a late write of the destroyed one could recreate.
+
+## Keys and key rotation
+
+Each epoch is encrypted with exactly one key: its snapshot (every link of
+its chain) and every frame of its log. The manifest (version 4) records
+that key with the epoch, for the current epoch (`key`) and for every
+retained one (`history[i].key`): `{id, cipher, fingerprint}`, or `null` for
+an unencrypted database. The fingerprint is the first 16 bytes of
+HMAC-SHA256(key, "sediment/key-fingerprint/v1"), in hex. Keys themselves
+never go to S3. Manifests of versions 1 and 2 (0.1.0-beta.6 and older) are
+refused with a message saying so; the tombstone format (version 3) is
+unchanged. The protocol is modelled in `formal/tla/KeyRotation.tla` (see
+`formal/README.md`, "Key rotation").
+
+`:encryption` is a ring of keys by id (`keys.rs`). An open learns the key
+from the manifest it read under its lease, before its takeover PUT, and
+takes the key with that id from its ring; the ring's key must have the
+recorded fingerprint. Otherwise it fails before writing anything but the
+lease, naming the id ("unknown key id r1 (ring: r2, r3)", "key r1 in the
+ring is not the key that encrypted this database (fingerprint X, recorded
+Y)"). A ring with `key_for` instead returns `KeyNeeded(id)` there; Elixir
+asks `key_for` for the key, adds it and opens again (at most 3 times), so
+the decision is always taken under a lease, from a manifest read under it.
+The storage keeps the resolved key: the log's encryption context, the
+local checkpoints, the warm sidecar check, turso's open of the file, the
+sharing check (`check_same_encryption`: another open's ring must hold that
+key, by id and fingerprint) and exports all take it from there. A new
+database (bootstrap, import) is created under the ring's active key.
+
+A restore (`restore_to`, a replica's stage) resolves the key of the epoch it
+restores, from that epoch's record ("needs key r1, which is not in the
+ring"). A replica picks up a rekey at its next refresh: the new epoch's
+record names the new key.
+
+The warm sidecar (version 3) records the key's fingerprint; a working copy
+is reused only under the same key.
+
+### Rekey (`rekey.rs`)
+
+`Sediment.S3.rekey/3` is a writer open (`prepare_fresh` with `Op::Rekey`)
+followed by a clean close:
+
+1. Like a destroy, it refuses when the database is open in this VM, and any
+   unexpired lease, this owner's too, unless `force`.
+2. After its takeover, restore and checkpoint under the old key (log folded,
+   WAL empty), it re-encrypts the file page by page: each page is decrypted
+   with the old key's context and encrypted with the new one into a file
+   beside it. The new file is opened under the new key and must pass
+   `PRAGMA integrity_check` (then checkpointed, so anything turso's open
+   wrote is in it), and every page's plaintext must hash like the old
+   file's. A cipher change is refused: both keys use the same reserved
+   bytes per page.
+3. The file replaces the local copy and is uploaded as a full snapshot (a
+   delta never spans two keys), and the epoch-advance manifest names the
+   new key. That PUT is `If-Match` on the takeover: a writer that took over
+   since gets the rekey fenced with nothing switched, and its commits stay.
+4. The clean close leaves the copy warm under the new key.
+
+Nothing the database uses changes before step 3's manifest PUT: a crash
+before it leaves the old epoch current and working, and the new-key
+snapshot is an unreferenced object of this writer's generation, collected
+by the next writer's GC. A re-run starts over (or returns `:current` when
+the PUT had landed).
+
+The advance pins the epoch it ends and every retained epoch
+(`history[i].pinned`), and adds the old key to `retired_keys` (id,
+fingerprint, time). A rekey to a retired key (its id or its fingerprint) is
+refused unless `allow_reuse`, and then only once no history record under it
+remains, so every key has at most one pinned run, and a key id is current
+for one contiguous run. A reused key leaves `retired_keys`.
+
+### Lost answers on the epoch advance
+
+Every open's epoch-advance PUT (`publish_manifest`) never reports a failure
+while its PUT can still land. After an error or a 412 it reads the
+manifest back: our body there means it landed (adopted); the version we
+hold (our takeover) means the PUT may still be in flight, so the same body
+is sent again on that version; another writer's manifest means ours can't
+land anymore (fenced; if that manifest still names our epoch, ours landed
+first and the message says so). Still the version held, or unreadable,
+after 4 attempts: `Indeterminate` (`{:error, {:indeterminate, ...}}`), and
+`key_census/1` tells which key is current. The model's `OutcomeFinal`
+checks that no advance an open reported as failed ever becomes the
+manifest (`NegKrFailUnlanded`).
+
+### Retention and release
+
+`retain_epochs` bounds the unpinned history: the newest `retain_epochs`
+records under the current key. Pinned records are never trimmed, whatever
+`retain_epochs` is (0 included: a rekey then keeps exactly the epoch it
+ended). So the history holds at most `retain_epochs` records under the
+current key plus one pinned run (at most `retain_epochs + 1` records) per
+retired key not yet released.
+
+`Sediment.S3.release_key/4` is a writer open (`Op::Release`, same lease
+rules) whose new manifest drops every history record under the key; the
+GC then deletes their objects. It refuses the current key. With no record
+under the key it writes nothing. `Sediment.S3.key_census/1` reads the
+manifest: the current key and the retained epochs by key.
+
+### Epoch boundaries come from the store's clock
+
+An epoch covers `[started_at_ms, ended_at_ms)`; `ended_at_ms` of a history
+record is its successor's `started_at_ms`, set once by the advance and
+carried unchanged through retention and release. Both are the
+Last-Modified time, read with a HEAD, of the seal that closed the epoch:
+every frame of the old epoch that the new one restored landed before that
+seal (the takeover lists the log, then seals it at the end it listed; a
+checkpoint drains its uploads, then seals), and every frame of the new
+epoch lands after the manifest advance, which comes after the seal. A
+database's first epoch starts at its snapshot's Last-Modified. Boundaries
+are clamped so that epochs never start before their predecessor. No
+writer's clock is used for coverage.
+
+A time target restores the retained epoch whose range covers `T` (the
+current epoch has no end), plus its frames whose Last-Modified is at most
+`T`. A `T` that no retained epoch covers (before the oldest one, or in the
+range of a released key) is refused, naming the retained ranges; it is
+never answered with another epoch's state. S3's Last-Modified has a
+resolution of one second, so PITR is exact to that: a `T` within the
+second of a boundary restores the newer epoch.
 
 ## Single writer (lease)
 
@@ -508,12 +630,15 @@ SeaweedFS:
   on. A replica keeps the snapshot it last restored (`.<name>.s3-cache-<hash>`),
   so a refresh downloads only the newer deltas and the log.
 - Point-in-time restore (`retain_epochs`, `Sediment.S3.restore/3`):
-  GC keeps the epochs the manifest lists in `history` (newest
-  first, bounded by `retain_epochs`); only those canonical epochs are
-  restorable, never a stale writer's orphaned ones. A time target picks the
-  newest retained epoch with `started_at_ms <= T` and replays the
-  contiguous run of its segments whose S3 `last_modified <= T`. The result
-  is folded into a standalone local file; the S3 prefix isn't rolled back.
+  GC keeps the epochs the manifest lists in `history` (newest first,
+  bounded by `retain_epochs` plus the pinned ones, see "Retention and
+  release"); only those canonical epochs are restorable, never a stale
+  writer's orphaned ones. A time target picks the retained epoch whose
+  `[started_at_ms, ended_at_ms)` covers T (see "Epoch boundaries come from
+  the store's clock") and replays the contiguous run of its segments whose
+  S3 `last_modified <= T`, with the key the epoch's record names. The
+  result is folded into a standalone local file; the S3 prefix isn't
+  rolled back.
 
 ## Upstream
 

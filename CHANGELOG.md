@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+### Breaking
+
+* The S3 manifest is version 4: it records the key of every epoch. Sediment
+  refuses manifests of versions 1 and 2, written by 0.1.0-beta.6 and older,
+  with a message saying so (read the data with the older version and
+  export it, or destroy the prefix). There is no production data anywhere,
+  so no migration is provided. The tombstone a destroy leaves is unchanged.
+* `:encryption` is a key ring. `[cipher: c, key: k]` still works, as a ring
+  of one key whose id is `"default"`; a database created with it records
+  that id. New forms: `[keys: [{"r2", k2}, {"r1", k1}], cipher: c]` (the
+  first key is active, an entry may give its own `cipher:`) and
+  `[key_for: fun | {m, f, a}, active: "r2"]`. Ids match
+  `[a-z0-9][a-z0-9_-]{0,31}`; a ring can't hold an id or a key twice.
+* An open with a wrong key is refused by the key's fingerprint before the
+  takeover (`"key default in the ring is not the key that encrypted this
+  database ..."`), instead of failing to decrypt after the download.
+* The warm-reopen sidecar is version 3 (it records the key's fingerprint):
+  the first open after the upgrade restores in full.
+* `Sediment.Native` changed for key rings (`s3_refresh/2`, `s3_restore/4`,
+  `s3_import/5`, `export_sqlite/5` take a ring).
+
+### S3 durability
+
+* Key rotation inside one prefix. Each epoch is encrypted with one key,
+  which the manifest records with it (id, cipher, and a fingerprint: the
+  first 16 bytes of HMAC-SHA256(key, "sediment/key-fingerprint/v1")). An
+  open resolves the key from its ring under the writer lease, before
+  writing anything, and refuses an unknown id or another key under the id
+  by name. Errors never contain key material.
+* `Sediment.S3.rekey/3` re-encrypts a database page by page under another
+  key of the ring and publishes it as a new epoch (a full snapshot), with
+  `If-Match` on its takeover: a writer that took over meanwhile gets it
+  fenced with nothing switched, and a crash before the publication leaves
+  the old key current. It keeps the epochs it ended (pinned, whatever
+  `retain_epochs` is) and retires the old key: a rekey back to it needs
+  `allow_reuse: true` and its epochs released first.
+* `Sediment.S3.release_key/4` drops the retained epochs under a key and
+  deletes their objects; it refuses the current key.
+  `Sediment.S3.key_census/1` reads which keys a database still depends on.
+* Point-in-time restore uses the key of the epoch it restores, and only an
+  epoch whose time range covers the moment asked for: a moment in the time
+  of released epochs is refused, never answered with an older state. Epoch
+  boundaries come from the store's clock (the Last-Modified of the seal that
+  closed the previous epoch), not a writer's.
+* An open whose epoch-advance manifest PUT got an error reads the manifest
+  back: it adopts its own write if it landed, and sends it again while the
+  manifest is still the one it took over, so a write reported as failed
+  never lands later. When that can't be told, the error says the outcome is
+  unknown (`{:error, {:indeterminate, message}}` from `rekey/3`).
+* Replicas and `Sediment.S3.refresh/2` follow a rekey at the next refresh
+  when their ring holds the new key; `refresh/2` takes `encryption:` for a
+  ring with `key_for`.
+
 ### Fixed
 
 * `Sediment.Engine.open(path, mode: :readonly)` of an MVCC database with
