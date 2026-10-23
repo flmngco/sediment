@@ -398,8 +398,9 @@ names: its snapshot and every log frame. The parts:
 - release_key: an open whose advance drops the records under a key, refused while that key
   is current; retention keeps the pinned records and the newest `Retain` unpinned ones;
 - the epoch advance PUT's errors: a GET follows; our manifest is adopted, a foreign one is
-  Fenced, the one we still hold makes the open resend the same body (A4'), a failed GET is
-  indeterminate;
+  Fenced and the report names the foreign manifest's key (A9), the one we still hold makes
+  the open resend the same body (A4'), a failed GET is indeterminate. A crash before a
+  clear answer leaves the outcome unclear too, and only a later open resolves it (A8);
 - point-in-time restore at every past T: the record whose `[started_at, ended_at)` covers
   T, with its key, and the frames of its log that landed by T, or a refusal.
 
@@ -418,7 +419,9 @@ Properties:
 
 - `AckedDurable`: every acknowledged commit is in a restore of the current manifest, with
   the key it names, across rekeys, including a rekey that lost its lease mid-copy
-  (`RekeyFenced` witnesses that case in `KrTakeover`).
+  (`RekeyFenced` witnesses that case in `KrTakeover` and `KrTakeoverFaults`; the latter
+  also reaches adopt, resend, a Fenced rekey whose switch landed, and a restore at T of the
+  old key's epoch with two writers).
 - `KeyConsistent`: every epoch the manifest names (current and retained) restores with the
   key its record names: the snapshot and every frame are encrypted with it.
 - `PitrExact`: a restore at T returns the database as of T (the ghost `hist[T]`: what a
@@ -429,10 +432,19 @@ Properties:
 
 Added, with the reason:
 
-- `OutcomeFinal`: no epoch advance of an open that reported failure (Fenced or failed)
-  ever becomes the manifest. A rekey reported failed must not switch the key later: an
-  operator would take the census at its word and drop the target key. This is the property
-  amendment A4 asks for; it found A4's open case (below).
+- `OutcomeFinal`: what an open reports about its epoch advance stays true. An advance
+  reported failed never becomes current; one reported Fenced while the foreign manifest
+  named another epoch never does either (our PUT can no longer land), so the key a Fenced
+  report names changes only by a later operation. A Fenced report may name the new key:
+  ours landed with its answer lost and another writer took it over (`FencedSwitched`).
+  The property is keyed on the epoch id, unique per open, not on the manifest version: a
+  takeover of our landed epoch is a new version of the same epoch. This is the property
+  amendments A4 and A9 ask for; it found A4's open case (below).
+- `IndetCensus` (A8): an unclear outcome (indeterminate, or a crash before a clear answer)
+  is resolved only by a later open's publication, a re-run: its takeover moved the
+  manifest version, so the unclear advance can never land after it. Once resolved, that
+  advance never becomes current. A `key_census` read alone resolves nothing
+  (`CensusResolves`).
 - `RetiredStaysRetired` (A3): a key rotated away from is never current again, unless a
   rekey reused it with `allow_reuse`.
 - `SourceKept` (A1): every retired key not released since has a pinned record, whatever
@@ -444,34 +456,40 @@ Added, with the reason:
 
 | Config | Hosts | Patches | Expect | States |
 |---|---|---|---|---|
-| `KrSole` | 1 (late writes, 1 fault, 1 kill), 3 opens, 2 commits, keys k1 k2, retain 0 | none | pass | 944,750 |
-| `KrSoleRetain` | 1, 5 opens, 2 commits, retain 1, no faults | none | pass | 852,105 |
-| `KrSoleKeys` | 1, 5 opens, 1 commit, keys k1 k2 k3, 2 rekeys, 1 release, retain 0, no faults | none | pass | 1,012,946 |
-| `KrReuse` | 1, 5 opens, 3 rekeys, 1 release, `AllowReuse`, no faults | none | pass | 413,561 |
-| `KrTakeover` | 2 (late writes, 1 fault), 2 opens and 1 commit each, rings {k1, k2} and {k1}, rekey to k2, release of k1 | none | pass (19 min) | 14,836,553 |
-| `NegKrNoIfMatchSwitch` | 2, no faults | `NoIfMatchSwitch` (a rekey publishes unconditionally) | `AckedDurable` violated | 69,034 |
-| `NegKrKeyBeforeLease` | 2, no faults | `KeyBeforeLease` (an opener writes under the key id it read before its takeover) | `KeyConsistent` violated | 41,024 |
-| `NegKrNoCoverageCheck` | 1, 4 opens, retain 0, no faults | `NoCoverageCheck` (PITR picks the newest epoch started by T) | `PitrExact` violated | 7,415 |
-| `NegKrReleaseCurrent` | 1, 2 opens, no faults | `ReleaseCurrent` (a release of the current key drops it) | `KeyConsistent` violated (and `CensusSound`) | 466 |
-| `NegKrTrimPinned` | 1, 2 opens, retain 0, no faults | `TrimPinned` (retention by key, before A1) | `SourceKept` violated | 408 |
-| `NegKrNoRetiredCheck` | 1, 3 opens, 2 rekeys, no faults | `NoRetiredCheck` (a rekey may target a retired key) | `RetiredStaysRetired` violated | 2,601 |
-| `NegKrReuseWithPins` | as `NegKrNoRetiredCheck`, `AllowReuse` | `ReuseWithPins` (allow_reuse ignores pinned records) | `HistoryBound` violated | 2,465 |
-| `NegKrNoAdopt` | 1, 2 opens, 1 fault | `NoAdopt` (an error on the epoch advance fails the open, before A4) | `OutcomeFinal` violated | 930 |
-| `NegKrFailUnlanded` | 1, 2 opens, 1 fault, late writes | `FailUnlanded` (A4 as first written: a GET showing the manifest held reports failure) | `OutcomeFinal` violated | 2,881 |
-| `NegKrWriterClock` | 1, 2 opens, retain 1, writers' clocks ahead by 1 | `WriterClock` (started_at from the writer's clock, before A5) | `PitrExact` violated | 586 |
-| `NegKrWriterClockBehind` | as `NegKrWriterClock`, clocks behind by 1 | `WriterClock` | `PitrExact` violated | 507 |
+| `KrSole` | 1 (late writes, 1 fault, 1 kill), 3 opens, 2 commits, keys k1 k2, retain 0 | none | pass | 970,403 |
+| `KrSoleRetain` | 1, 5 opens, 2 commits, retain 1, no faults | none | pass | 852,135 |
+| `KrSoleKeys` | 1, 5 opens, 1 commit, keys k1 k2 k3, 2 rekeys, 1 release, retain 0, no faults | none | pass | 1,013,060 |
+| `KrReuse` | 1, 5 opens, 3 rekeys, 1 release, `AllowReuse`, no faults | none | pass | 413,645 |
+| `KrTakeover` | 2 (late writes, 1 fault), 2 opens and 1 commit each, rings {k1, k2} and {k1}, rekey to k2, release of k1 | none | pass (20 to 30 min) | 14,790,009 |
+| `KrTakeoverFaults` | 2 (late writes, 1 fault), 2 opens and 1 commit each, rekey to k2, no release | none | pass (15 min) | 5,045,505 |
+| `NegKrNoIfMatchSwitch` | 2, no faults | `NoIfMatchSwitch` (a rekey publishes unconditionally) | `AckedDurable` violated | 74,978 |
+| `NegKrKeyBeforeLease` | 2, no faults | `KeyBeforeLease` (an opener writes under the key id it read before its takeover) | `KeyConsistent` violated | 41,232 |
+| `NegKrNoCoverageCheck` | 1, 4 opens, retain 0, no faults | `NoCoverageCheck` (PITR picks the newest epoch started by T) | `PitrExact` violated | 7,052 |
+| `NegKrReleaseCurrent` | 1, 2 opens, no faults | `ReleaseCurrent` (a release of the current key drops it) | `KeyConsistent` violated (and `CensusSound`) | 397 |
+| `NegKrTrimPinned` | 1, 2 opens, retain 0, no faults | `TrimPinned` (retention by key, before A1) | `SourceKept` violated | 421 |
+| `NegKrNoRetiredCheck` | 1, 3 opens, 2 rekeys, no faults | `NoRetiredCheck` (a rekey may target a retired key) | `RetiredStaysRetired` violated | 2,957 |
+| `NegKrReuseWithPins` | as `NegKrNoRetiredCheck`, `AllowReuse` | `ReuseWithPins` (allow_reuse ignores pinned records) | `HistoryBound` violated | 2,974 |
+| `NegKrNoAdopt` | 1, 2 opens, 1 fault | `NoAdopt` (an error on the epoch advance fails the open, before A4) | `OutcomeFinal` violated | 950 |
+| `NegKrFailUnlanded` | 1, 2 opens, 1 fault, late writes | `FailUnlanded` (A4 as first written: a GET showing the manifest held reports failure) | `OutcomeFinal` violated | 2,686 |
+| `NegKrWriterClock` | 1, 2 opens, retain 1, writers' clocks ahead by 1 | `WriterClock` (started_at from the writer's clock, before A5) | `PitrExact` violated | 559 |
+| `NegKrWriterClockBehind` | as `NegKrWriterClock`, clocks behind by 1 | `WriterClock` | `PitrExact` violated | 435 |
+| `NegKrFencedNoKey` | 2, 1 fault | `FencedNoKey` (Fenced means nothing switched, before A9) | `OutcomeFinal` violated | 45,156 |
+| `NegKrCensusResolves` | 1, 2 faults, late writes | `CensusResolves` (a census read at an indeterminate report resolves it, before A8) | `IndetCensus` violated | 4,290 |
 
 Positive configs list, under `_POSSIBLE`, a commit acknowledged under a rotated key
 (`AckAfterRekey`), an old key's epoch retained (`OldKeyRetained`), a restore at T of an
 epoch under an old key (`PitrOldKey`), a T no record covers although an older one started
 before it (`PitrGap`, the case `NoCoverageCheck` gets wrong), a release (`Released`), a
 late landing, an adopted manifest after an error (`Adopted`) and a resend (`Resent`), a
-rekey fenced after its takeover was overtaken (`RekeyFenced`), an open refused for a key
+rekey fenced after its takeover was overtaken (`RekeyFenced`), a Fenced rekey whose switch
+had landed (`FencedSwitched`), an unclear outcome resolved by a later open
+(`IndetResolved`), an open refused for a key
 its ring lacked (`KeyNeeded`), and a reuse and a refused reuse (`Reused`, `ReuseRefused`),
 as each config can reach them.
 
 Each negative control is the smallest setting that reaches its violation (no faults
-unless it needs one). `NoIfMatchSwitch` (a rekey publishes unconditionally) is checked
+unless it needs one). Its count is the states explored until TLC found the violation, which
+varies a little between runs (3 workers). `NoIfMatchSwitch` (a rekey publishes unconditionally) is checked
 against `AckedDurable` alone: with every invariant on, `KeyConsistent` fails first, one step
 earlier. The overtaken rekey's unconditional switch brings back the pinned source epoch,
 and the writer that overtook it, collecting garbage for the manifest it published, deletes
@@ -486,6 +504,15 @@ by key, the design before A1): with `retain_epochs: 0`, the rekey drops its sour
 `NoRetiredCheck` and `ReuseWithPins` take away A3's refusal and A7's condition.
 `NoAdopt` (the design before A4: any error on the advance fails the open) reports failure
 for a manifest that landed with its answer lost.
+
+Two more came from a review of the model (bead td-9qug, amendment 3). Both are about what
+an open reports after a lost answer; the protocol is unchanged. `FencedNoKey`: a rekey's
+advance lands with its answer lost, another host takes over (a new manifest version, still
+our epoch under k2), and our read-back sees a foreign manifest: Fenced, although the key was
+switched. An earlier `OutcomeFinal`, keyed on the manifest version, missed this; keyed on
+the epoch id it fails unless the Fenced report names the key it saw. `CensusResolves`: a
+rekey's advance goes late, the read-back GET fails (indeterminate), a census then shows k1,
+and the in-flight PUT lands: the database is under k2. Only a re-run resolves it.
 
 Found by the model (decision bead td-9qug.15, now amendment A4'): A4 said what to do when
 the GET after an error shows our manifest, a foreign one, or nothing, but not when it shows
