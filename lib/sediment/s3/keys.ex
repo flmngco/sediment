@@ -28,11 +28,13 @@ defmodule Sediment.S3.Keys do
 
   @doc false
   @spec normalize(keyword() | map() | false | nil) :: ring() | false | nil
-  def normalize(nil), do: nil
-  def normalize(false), do: false
-  def normalize(%{} = opts), do: opts |> Map.to_list() |> normalize()
+  def normalize(encryption), do: scrubbed(fn -> do_normalize(encryption) end)
 
-  def normalize(opts) when is_list(opts) do
+  defp do_normalize(nil), do: nil
+  defp do_normalize(false), do: false
+  defp do_normalize(%{} = opts), do: opts |> Map.to_list() |> do_normalize()
+
+  defp do_normalize(opts) when is_list(opts) do
     cipher = to_string(Keyword.get(opts, :cipher, @default_cipher))
 
     cond do
@@ -59,7 +61,7 @@ defmodule Sediment.S3.Keys do
     end
   end
 
-  def normalize(_other) do
+  defp do_normalize(_other) do
     raise ArgumentError,
           "encryption: expected a keyword list (see Sediment.S3, \"Encryption\") or false"
   end
@@ -98,12 +100,12 @@ defmodule Sediment.S3.Keys do
   def run(ring, fun), do: run(ring, fun, @attempts)
 
   defp run(ring, fun, attempts) do
-    case fun.(native(ring)) do
+    case scrubbed(fn -> fun.(native(ring)) end) do
       {:error, {:key_needed, id}} when attempts > 0 and is_map(ring) ->
         run(resolve(ring, id), fun, attempts - 1)
 
       {:error, {:key_needed, _id}} when is_map(ring) ->
-        fun.(native(%{ring | key_for: nil}))
+        scrubbed(fn -> fun.(native(%{ring | key_for: nil})) end)
 
       other ->
         other
@@ -130,4 +132,33 @@ defmodule Sediment.S3.Keys do
 
   defp call(fun, id) when is_function(fun, 1), do: fun.(id)
   defp call({m, f, a}, id), do: apply(m, f, [id | a])
+
+  @doc false
+  # Runs `fun`. An exception raised in it is raised again with every stack
+  # frame's arguments replaced by their count: a NIF that can't decode an
+  # argument raises badarg with all its arguments (key rings, S3
+  # credentials) in the top frame, which consoles, crash reports and error
+  # trackers would show. Exceptions that carry their arguments are replaced
+  # by an ArgumentError naming only their type.
+  @spec scrubbed((-> result)) :: result when result: term()
+  def scrubbed(fun) do
+    fun.()
+  rescue
+    exception -> reraise scrub(exception), Enum.map(__STACKTRACE__, &scrub_frame/1)
+  end
+
+  defp scrub(%ArgumentError{} = exception), do: exception
+  defp scrub(%ErlangError{original: original} = exception) when is_atom(original), do: exception
+
+  defp scrub(exception) do
+    %ArgumentError{
+      message:
+        "#{inspect(exception.__struct__)} (details withheld: the arguments may hold keys or credentials)"
+    }
+  end
+
+  defp scrub_frame({module, fun, args, location}) when is_list(args),
+    do: {module, fun, length(args), location}
+
+  defp scrub_frame(frame), do: frame
 end

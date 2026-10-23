@@ -476,7 +476,7 @@ fn prepare_under_lease(
             };
             let version = remote
                 .put(MANIFEST_KEY, manifest.encode(), Put::Update(object_version))
-                .map_err(fenced_on_conflict)?;
+                .map_err(|err| overtaken_at_takeover(&remote, err))?;
             let reused = warm.and_then(|local| {
                 restore::restore_and_seal(
                     &remote,
@@ -961,6 +961,28 @@ pub fn check_same_encryption(existing: Option<&Key>, cfg: &S3Config) -> Result<(
         (None, Some(_)) => refuse(UNENCRYPTED_WITH_KEY),
         (None, None) if cfg.unencrypted => Ok(()),
         (None, None) => refuse(UNENCRYPTED_NEEDS_OPT_OUT),
+    }
+}
+
+/// The takeover PUT lost to another writer: fenced before anything was
+/// switched, naming the key the manifest has now.
+fn overtaken_at_takeover(remote: &remote::Remote, err: S3Error) -> S3Error {
+    let S3Error::Conflict(message) = err else {
+        return err;
+    };
+    let key = remote
+        .get(MANIFEST_KEY)
+        .ok()
+        .flatten()
+        .and_then(|object| Manifest::decode(&object.bytes).ok())
+        .and_then(|current| current.key);
+    S3Error::Overtaken {
+        message: format!(
+            "manifest changed concurrently: {message}; another writer has the database (its \
+             manifest names key {}), and this open switched nothing",
+            key.as_ref().map_or("none", |key| key.id.as_str())
+        ),
+        key,
     }
 }
 

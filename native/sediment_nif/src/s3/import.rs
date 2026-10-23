@@ -277,7 +277,7 @@ fn check_source(source: &Path) -> Result<u64> {
 }
 
 #[cfg(unix)]
-fn check_free_space(path: &Path, needed: u64) -> Result<()> {
+pub(crate) fn check_free_space(path: &Path, needed: u64) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let dir = path.parent().unwrap_or(Path::new("."));
     let dir = if dir.as_os_str().is_empty() {
@@ -306,7 +306,7 @@ fn check_free_space(path: &Path, needed: u64) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn check_free_space(_path: &Path, _needed: u64) -> Result<()> {
+pub(crate) fn check_free_space(_path: &Path, _needed: u64) -> Result<()> {
     Ok(())
 }
 

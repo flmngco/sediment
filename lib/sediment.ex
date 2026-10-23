@@ -243,7 +243,11 @@ defmodule Sediment do
       ring
       |> export_ring(from_s3)
       |> Sediment.S3.Keys.native()
-      |> then(&Sediment.Native.export_sqlite(source, dest, from_s3, &1, opts[:drop_fts] == true))
+      |> then(fn ring ->
+        Sediment.S3.Keys.scrubbed(fn ->
+          Sediment.Native.export_sqlite(source, dest, from_s3, ring, opts[:drop_fts] == true)
+        end)
+      end)
     end)
   end
 

@@ -642,3 +642,20 @@ fn a_rekey_publishes_a_full_snapshot_and_later_deltas_chain_on_it_only() {
     let db = open_encrypted(&both, &dir.db("b.db")).unwrap();
     assert_eq!(db.int("SELECT count(*) FROM t"), 5);
 }
+
+#[test]
+fn a_rekey_fenced_at_its_takeover_names_the_current_key() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    seeded(&store, &dir, &["a"]);
+    let remote = Remote::new(store.clone(), PREFIX);
+    let err = crate::s3::overtaken_at_takeover(&remote, S3Error::Conflict("manifest.json".into()));
+    match &err {
+        S3Error::Overtaken { key, .. } => {
+            assert_eq!(key.as_ref().unwrap(), &key_as("r1", "11").record())
+        }
+        other => panic!("{other:?}"),
+    }
+    let message = err_text(Err::<(), _>(err));
+    assert!(message.contains("switched nothing"), "{message}");
+}

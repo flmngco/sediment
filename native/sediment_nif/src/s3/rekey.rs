@@ -128,8 +128,20 @@ pub(crate) fn reencrypt(path: &Path, from: &Key, to: &Key) -> Result<()> {
     if from.cipher() != to.cipher() {
         return Err(S3Error::Config("rekey: a rekey keeps the cipher".into()));
     }
+    // Folded: the file alone is the database. Never drop a log or WAL
+    // with something in it.
+    for leftover in [restore::wal_path(path), restore::log_path(path)] {
+        if std::fs::metadata(&leftover).is_ok_and(|meta| meta.len() > 0) {
+            return Err(failed(format!(
+                "{} wasn't folded into the database",
+                leftover.display()
+            )));
+        }
+    }
     let copy = Copy(sibling(path));
     copy.remove();
+    // The copy beside it (the database's size again), as an import checks.
+    super::import::check_free_space(&copy.0, std::fs::metadata(path)?.len())?;
     let page_size = page_size(path)?;
     let (from_ctx, to_ctx) = (from.page_context(page_size)?, to.page_context(page_size)?);
     let source = pages(

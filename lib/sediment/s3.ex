@@ -358,7 +358,7 @@ defmodule Sediment.S3 do
   """
   @spec exists?(keyword() | map()) :: boolean()
   def exists?(s3_opts) do
-    case Native.s3_exists(s3_opts) do
+    case Keys.scrubbed(fn -> Native.s3_exists(s3_opts) end) do
       {:ok, exists} -> exists
       {:error, message} -> raise Sediment.Error, message: message
     end
@@ -405,7 +405,8 @@ defmodule Sediment.S3 do
   @spec destroy(keyword() | map(), keyword()) :: {:ok, map()} | {:error, term()}
   def destroy(s3_opts, opts \\ []) do
     Telemetry.span([:s3, :destroy], %{}, fn ->
-      Native.s3_destroy(s3_opts, Keyword.get(opts, :force, false))
+      force = boolean!(opts, :force, "destroy/2")
+      Keys.scrubbed(fn -> Native.s3_destroy(s3_opts, force) end)
     end)
   end
 
@@ -556,13 +557,25 @@ defmodule Sediment.S3 do
   the rekey (or a `key_for` that returns it): an open whose ring lacks it
   is refused.
 
+  **Cost.** The database is unavailable to writers for the whole rekey:
+  the download (none when `path` holds a warm copy), the fold, the
+  re-encryption pass, `integrity_check`, the verification pass and the
+  upload of a full snapshot, all proportional to its size. Opens meanwhile
+  get `"s3 lease held ..."` and retry; the rekey renews its lease
+  throughout. It needs about twice the database's size free next to `path`
+  (the copy beside it; it refuses to start without), and about 32 bytes of
+  memory per page plus what `integrity_check` takes.
+
   ## Options
 
     * `:encryption` - the key ring (required): it must hold the current key
       and the new one (or resolve them with `key_for`).
     * `:to` - the id of the key to move to (default: the ring's active key).
       Both keys must use the same cipher.
-    * `:force` - take the lease even while a writer holds it (it is fenced).
+    * `:force` - take the lease even while a writer holds it. That writer
+      is fenced: it acknowledges no further commit, and with `durability:
+      :async` the commits it acknowledged but had not uploaded yet are lost,
+      as with `destroy/2`. Use it for a writer that can't be stopped.
     * `:allow_reuse` - allow a retired key (see above).
 
   Returns `{:ok, %{from: id, to: id, epoch: epoch}}`, `{:ok, :current}` when
@@ -577,8 +590,8 @@ defmodule Sediment.S3 do
   def rekey(path, s3_opts, opts \\ []) do
     path = to_string(path)
     to = opts[:to] && to_string(opts[:to])
-    force = Keyword.get(opts, :force, false)
-    allow_reuse = Keyword.get(opts, :allow_reuse, false)
+    force = boolean!(opts, :force, "rekey/3")
+    allow_reuse = boolean!(opts, :allow_reuse, "rekey/3")
 
     Telemetry.span([:s3, :rekey], %{path: path}, fn ->
       opts[:encryption]
@@ -612,13 +625,22 @@ defmodule Sediment.S3 do
           {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
   def release_key(path, s3_opts, key_id, opts \\ []) do
     path = to_string(path)
-    force = Keyword.get(opts, :force, false)
+    force = boolean!(opts, :force, "release_key/4")
 
     Telemetry.span([:s3, :release_key], %{path: path}, fn ->
       opts[:encryption]
       |> required_ring("release_key/4")
       |> Keys.run(&Native.s3_release_key(path, s3_opts, &1, to_string(key_id), force))
     end)
+  end
+
+  # Checked here: a value the NIF can't decode raises badarg with every
+  # argument (the key ring, S3 credentials) in the stack trace.
+  defp boolean!(opts, name, call) do
+    case Keyword.get(opts, name, false) do
+      value when is_boolean(value) -> value
+      _ -> raise ArgumentError, "Sediment.S3.#{call}: #{inspect(name)} must be true or false"
+    end
   end
 
   defp required_ring(encryption, call) do
@@ -651,7 +673,7 @@ defmodule Sediment.S3 do
           {:ok, %{current: String.t() | nil, retained: %{String.t() => [String.t()]}}}
           | {:ok, :no_database}
           | {:error, term()}
-  def key_census(s3_opts), do: Native.s3_key_census(s3_opts)
+  def key_census(s3_opts), do: Keys.scrubbed(fn -> Native.s3_key_census(s3_opts) end)
 
   @doc false
   # `encryption: false` (the explicit opt-out of encryption) travels with
