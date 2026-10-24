@@ -377,10 +377,31 @@ Model-found bugs so far, both fixed in the code, with a regression test each:
 
 ## Key rotation
 
-`tla/KeyRotation.tla` models key rotation inside one prefix (bead td-9qug, its design note
-with amendments 1 and 2), at S3Fence's request grain, for the
+`tla/KeyRotation.tla` models key rotation inside one prefix, at S3Fence's request grain, for the
 parts that matter to keys. Each epoch is encrypted with one key, which its manifest record
-names: its snapshot and every log frame. The parts:
+names: its snapshot and every log frame.
+
+The labels A1 to A9 name the design rules of key rotation, as the model and the code
+refer to them:
+
+- **A1**: a rekey always keeps its source. The epoch it ends, and every history record kept
+  then, is pinned; retention (`retain_epochs`) never trims a pinned record.
+- **A2**: re-encryption goes page by page, not by a logical copy.
+- **A3**: a retired key never becomes current again by accident: a rekey back to it needs
+  `allow_reuse`.
+- **A4**: a manifest PUT whose answer is lost is never reported as failed when it landed:
+  the open reads the manifest back and adopts its own write. **A4'** refines it: when the
+  read-back still shows the manifest the open took over, the PUT may still land, so the
+  open sends the same body again.
+- **A5**: epoch boundaries come from the store's clock, not a writer's. **A5'**: the
+  boundary is the Last-Modified of the seal that closed the previous epoch.
+- **A6**: an import keeps the source's real rowids.
+- **A7**: a key may become current again only after its pinned history is released.
+- **A8**: only a successful result is an outcome; an unclear one is resolved only by a
+  re-run, so both keys stay in the rings until one succeeds.
+- **A9**: a Fenced report names the key of the foreign manifest it saw.
+
+The parts:
 
 - the lease (any clock: a host may always take over) and the manifest (`If-Match`,
   create-only, every write may succeed, be refused, lose its answer, not land, or land late);
@@ -439,7 +460,7 @@ Added, with the reason:
   ours landed with its answer lost and another writer took it over (`FencedSwitched`).
   The property is keyed on the epoch id, unique per open, not on the manifest version: a
   takeover of our landed epoch is a new version of the same epoch. This is the property
-  amendments A4 and A9 ask for; it found A4's open case (below).
+  rules A4 and A9 ask for; it found A4's open case (below).
 - `IndetCensus` (A8): an unclear outcome (indeterminate, or a crash before a clear answer)
   is resolved only by a later open's publication, a re-run: its takeover moved the
   manifest version, so the unclear advance can never land after it. Once resolved, that
@@ -505,7 +526,7 @@ by key, the design before A1): with `retain_epochs: 0`, the rekey drops its sour
 `NoAdopt` (the design before A4: any error on the advance fails the open) reports failure
 for a manifest that landed with its answer lost.
 
-Two more came from a review of the model (bead td-9qug, amendment 3). Both are about what
+Two more came from a review of the model (rules A8 and A9). Both are about what
 an open reports after a lost answer; the protocol is unchanged. `FencedNoKey`: a rekey's
 advance lands with its answer lost, another host takes over (a new manifest version, still
 our epoch under k2), and our read-back sees a foreign manifest: Fenced, although the key was
@@ -514,7 +535,7 @@ the epoch id it fails unless the Fenced report names the key it saw. `CensusReso
 rekey's advance goes late, the read-back GET fails (indeterminate), a census then shows k1,
 and the in-flight PUT lands: the database is under k2. Only a re-run resolves it.
 
-Found by the model (decision bead td-9qug.15, now amendment A4'): A4 said what to do when
+Found by the model (now rule A4'): A4 said what to do when
 the GET after an error shows our manifest, a foreign one, or nothing, but not when it shows
 the manifest the open still holds (its takeover). That is a PUT that timed out on the client
 and is still in flight, `If-Match` on exactly that version, so it can land after the GET.

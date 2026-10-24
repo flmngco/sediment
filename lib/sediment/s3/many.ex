@@ -145,9 +145,10 @@ defmodule Sediment.S3.Many do
   defp absent_or_failed({:error, "s3 config: no database at " <> _}), do: :absent
   defp absent_or_failed(_result), do: :failed
 
-  # A8: after a non-ok result the operation may have happened or may still
-  # happen; only a re-run resolves it. Those are retried; a refusal (the
-  # database open, the lease held, a retired key, a missing key) isn't.
+  # Only {:ok, _} is an outcome: after a non-ok result the operation may
+  # have happened or may still happen; only a re-run resolves it. Those are
+  # retried; a refusal (the database open, the lease held, a retired key, a
+  # missing key) isn't.
   defp retry?({:error, {:fenced, _}}), do: true
   defp retry?({:error, {:indeterminate, _}}), do: true
   defp retry?({:error, "s3 store: " <> _}), do: true

@@ -1,6 +1,6 @@
 ---------------------------- MODULE KeyRotation ----------------------------
 (***************************************************************************)
-(* Key rotation inside one S3 prefix (bead td-9qug),                       *)
+(* Key rotation inside one S3 prefix (rules A1-A9: see formal/README.md),  *)
 (* at the grain of object-store requests, in S3Fence's style.              *)
 (*                                                                         *)
 (* Every epoch is encrypted with one key, which its manifest record names: *)
@@ -23,7 +23,7 @@
 (* flight and land later if its precondition still holds then.            *)
 (*                                                                         *)
 (* Time is the store's clock (now). Epoch boundaries come from it, as in  *)
-(* the code (amendment A5'): the Last-Modified of the seal that closed the *)
+(* the code (rule A5'): the Last-Modified of the seal that closed the      *)
 (* predecessor, the first snapshot's for epoch 0, the clock of the frames' *)
 (* last_modified. The writers' clocks (now + Skew) are read only by the    *)
 (* control "WriterClock". Sync durability only, and no checkpoints: every  *)
@@ -111,7 +111,7 @@ Body(x) == [x EXCEPT !.t = 0]
 \* writer encrypts with. tm: the manifest its takeover wrote. bt: the boundary, the
 \* Last-Modified of the seal that closed the restored epoch. sent: its epoch advance
 \* (for the GET after an error). res: how its last open ended, and told: the key that
-\* report names (a Fenced report names the foreign manifest's key, amendment A9).
+\* report names (a Fenced report names the foreign manifest's key, rule A9).
 \* seen: the unclear outcomes reported before its takeover, which its publication
 \* resolves.
 R0 == [pc |-> "off", gen |-> 0, op |-> "open", tgt |-> NoKey, ring |-> {}, pre |-> NoKey,
@@ -187,7 +187,7 @@ Charge(out) == faults' = IF out \in {"lost", "fail", "late"} THEN faults + 1 ELS
 \* starting at t: m's epoch joins the history, ended at t. A rekey's advance pins every
 \* record (the epoch it ends and everything retained then); otherwise retention keeps
 \* the pinned records and the newest Retain unpinned ones ("TrimPinned": the design
-\* before amendment A1, retention trimming every record of the current key and the
+\* before rule A1, retention trimming every record of the current key and the
 \* key a rekey replaces).
 Advance(m, rekey, nk, t) ==
     LET all == <<[Cur(m) EXCEPT !.en = t]>> \o m.ret
@@ -236,7 +236,7 @@ ReuseOK(n) ==
     \/ Patch("NoRetiredCheck")
     \/ AllowReuse /\ (Patch("ReuseWithPins") \/ ~\E x \in Range(man.ret) : x.pin /\ x.key = R[n].tgt)
 
-\* The writer's clock, used for nothing but "WriterClock" (the design before amendment
+\* The writer's clock, used for nothing but "WriterClock" (the design before rule
 \* A5: started_at from the writer's clock); otherwise the store's time t.
 WriterOr(n, t) == IF Patch("WriterClock") THEN now + Skew ELSE t
 
@@ -386,7 +386,7 @@ Resolve(n) ==
     /\ indet' = indet \ R[n].seen
     /\ UNCHANGED disowned
 \* An unclear outcome. "CensusResolves": the caller takes a key_census read at the report
-\* for the outcome (the guidance before amendment A8), i.e. the advance as not landed
+\* for the outcome (the guidance before rule A8), i.e. the advance as not landed
 \* when the census shows another epoch.
 Unclear(e) ==
     /\ indet' = indet \cup {e}
@@ -404,7 +404,7 @@ Disown(n, why, rec) ==
     /\ IF why = "indeterminate" THEN Unclear(rec.e) ELSE UNCHANGED <<indet, settled>>
 
 \* PUT the epoch advance rec (If-Match on what we hold). On an error or a 412, GET it
-\* ("NoAdopt": the design before amendment A4, the open fails).
+\* ("NoAdopt": the design before rule A4, the open fails).
 PutAdvance(n, rec) ==
     LET any == R[n].op = "rekey" /\ Patch("NoIfMatchSwitch") IN
     \E out \in Outcomes(any \/ man.ver = R[n].mver) :
@@ -435,7 +435,7 @@ Resend(n) ==
 
 \* The GET after an error: our epoch advance is there (adopt it), or the manifest we hold
 \* (the PUT hasn't landed, and may still: resend it; "FailUnlanded": report failure, which
-\* amendment A4 leaves open), or a foreign one (Fenced: ours can no longer land), or the
+\* rule A4 leaves open), or a foreign one (Fenced: ours can no longer land), or the
 \* GET fails (the outcome is unknown: indeterminate).
 Verify(n) ==
     /\ R[n].pc = "verify"
@@ -620,25 +620,25 @@ CensusSound == Live(man) => \A e \in Retained(man) : DataKeys(e) \subseteq Censu
 \* What an open reports about its epoch advance stays true: one reported failed never
 \* becomes current, and one reported Fenced while the foreign manifest named another
 \* epoch never does either (our PUT can no longer land), so the key a Fenced report names
-\* changes only by a later operation (amendments A4, A9). Keyed on the epoch id, unique
+\* changes only by a later operation (rules A4, A9). Keyed on the epoch id, unique
 \* per open: a takeover of our landed epoch is a new version of the same epoch.
 OutcomeFinal == Live(man) => man.e \notin disowned
 
 \* An unclear outcome (indeterminate, or a crash before a clear answer) is resolved only
-\* by a later open's publication (a re-run, amendment A8): after it, the unclear advance
+\* by a later open's publication (a re-run, rule A8): after it, the unclear advance
 \* never becomes current. A census read alone resolves nothing ("CensusResolves").
 IndetCensus == Live(man) => man.e \notin settled
 
 \* A key rotated away from is never current again, unless a rekey reused it with
-\* allow_reuse (amendment A3).
+\* allow_reuse (rule A3).
 RetiredStaysRetired == Live(man) => man.key \notin man.retired
 
 \* A rekey keeps its source: every retired key not released since has a pinned record
-\* (amendment A1: whatever Retain is).
+\* (rule A1: whatever Retain is).
 SourceKept ==
     Live(man) => \A k \in man.retired \ man.released : \E x \in Range(man.ret) : x.pin /\ x.key = k
 
-\* The history is bounded (amendments A1, A7): at most Retain unpinned records, no
+\* The history is bounded (rules A1, A7): at most Retain unpinned records, no
 \* pinned record under the current key, and one pinned run, of at most Retain + 1
 \* records, per key.
 HistoryBound ==

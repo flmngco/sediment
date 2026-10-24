@@ -265,7 +265,7 @@ defmodule Sediment.ConnectionTest do
       :ok = Connection.disconnect(:normal, state)
     end
 
-    # Codex's reproduction (with the {:error, state} result then): with the
+    # A review's reproduction (with the {:error, state} result then): with the
     # state redacted, the cache mapped "SELECT '<redacted>'" to the statement
     # of the 64-hex literal.
     test "after a refused begin and a rollback, each cached statement answers its own SQL" do

@@ -394,8 +394,8 @@ mod tests {
         message
     }
 
-    /// Every way a mistyped ring has put a key in a message (Opus and Codex
-    /// reviews): the message never holds the key, or any 16 hex digits of it.
+    /// Every way a mistyped ring has put a key in a message, found in review:
+    /// the message never holds the key, or any 16 hex digits of it.
     #[test]
     fn a_mistyped_ring_never_shows_a_key() {
         let k128 = &A[..32];
