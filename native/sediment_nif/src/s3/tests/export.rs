@@ -235,7 +235,7 @@ fn files(dir: &Path) -> Vec<String> {
     names
 }
 
-fn opts(key: Option<turso_core::EncryptionOpts>) -> ExportOptions {
+fn opts(key: Option<crate::s3::KeyRing>) -> ExportOptions {
     ExportOptions {
         encryption: key,
         drop_fts: false,
@@ -278,7 +278,7 @@ fn an_encrypted_s3_database_exports_to_a_working_sqlite_file() {
 
     // The source: a fingerprint of the S3 database (restored separately).
     crate::s3::restore_to(&cfg, &dir.db("restored.db"), crate::s3::Target::Latest).unwrap();
-    let source = turso_fingerprint(&dir.db("restored.db"), cfg.encryption.as_ref());
+    let source = turso_fingerprint(&dir.db("restored.db"), Some(&super::opts("ab")));
     check_in_sqlite(&dest, &source);
     // The prefix only read; no temporary files left.
     assert_eq!(remote.get(MANIFEST_KEY).unwrap().unwrap().bytes, manifest);

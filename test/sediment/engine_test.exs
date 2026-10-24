@@ -299,7 +299,7 @@ defmodule Sediment.EngineTest do
 
       {:ok, statement} = Engine.prepare(conn, "insert into test (stuff) values (?1)")
 
-      msg = "#DateTime<2021-08-25 13:23:25+00:00 UTC Europe/Berlin> is not in UTC"
+      msg = "a DateTime in \"Europe/Berlin\" is not in UTC"
 
       assert_raise ArgumentError, msg, fn ->
         {:ok, dt} = DateTime.from_naive(~N[2021-08-25 13:23:25], "Etc/UTC")
@@ -387,7 +387,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_text/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -423,7 +423,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_blob/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -454,7 +454,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_integer/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -503,7 +503,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_float/3" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -570,7 +570,7 @@ defmodule Sediment.EngineTest do
 
   describe ".bind_null/2" do
     setup do
-      {:ok, conn} = Engine.open(":memory:", [:readonly])
+      {:ok, conn} = Engine.open(":memory:")
       {:ok, stmt} = Engine.prepare(conn, "select ?")
       {:ok, conn: conn, stmt: stmt}
     end
@@ -688,7 +688,7 @@ defmodule Sediment.EngineTest do
       {:ok, statement} = Engine.prepare(conn, "insert into test (stuff) values (?1)")
 
       assert_raise ArgumentError,
-                   "unsupported type: %ArgumentError{message: \"argument error\"}",
+                   "unsupported type: %ArgumentError{...}",
                    fn -> Engine.bind(statement, [%ArgumentError{}]) end
     end
 

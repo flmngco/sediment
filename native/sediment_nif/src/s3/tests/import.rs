@@ -212,7 +212,7 @@ fn an_encrypted_target_needs_its_key_and_the_source_may_be_encrypted_too() {
     let mut cfg = config(&store, "importer");
     cfg.encryption = Some(encryption("ab"));
     import(&cfg, &plain_source, &opts(Verify::Restore)).unwrap();
-    assert_eq!(manifest(&store).encrypted, Some(true));
+    assert_eq!(manifest(&store).key, Some(super::key("ab").record()));
     let db = open_encrypted(&cfg, &dir.db("restored.db")).unwrap();
     assert_eq!(db.int("SELECT count(*) FROM t"), 501);
     db.exec("INSERT INTO t (v) VALUES ('after')").unwrap();
@@ -229,7 +229,7 @@ fn an_encrypted_target_needs_its_key_and_the_source_may_be_encrypted_too() {
     // a plaintext database
     let encrypted_source = dir.db("enc.db");
     {
-        let key = encryption("cd");
+        let key = super::opts("cd");
         let (_db, conn) = crate::s3::open_local(&encrypted_source, Some(&key)).unwrap();
         conn.execute("CREATE TABLE e(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
@@ -246,13 +246,13 @@ fn an_encrypted_target_needs_its_key_and_the_source_may_be_encrypted_too() {
             "for an encrypted database give its key",
         );
         let mut bad = checksum();
-        bad.source_encryption = Some(encryption("ab"));
+        bad.source_encryption = Some(super::opts("ab"));
         assert_config_err(
             import(&cfg, &encrypted_source, &bad),
             "the given source key",
         );
         let mut good = checksum();
-        good.source_encryption = Some(encryption("cd"));
+        good.source_encryption = Some(super::opts("cd"));
         import(&cfg, &encrypted_source, &good).unwrap();
         let db = open_encrypted(&cfg, &dir.db("from-enc.db")).unwrap();
         db.exec("INSERT INTO e (v) VALUES ('c')").unwrap();
@@ -261,6 +261,181 @@ fn an_encrypted_target_needs_its_key_and_the_source_may_be_encrypted_too() {
         std::fs::remove_file(dir.db("from-enc.db")).unwrap();
         let _ = std::fs::remove_file(dir.db("from-enc.db-log"));
     }
+}
+
+/// An AUTOINCREMENT table, `inserted` rows of which
+/// the top `deleted` are gone again, in a WAL or MVCC file (encrypted with
+/// `key`).
+fn sequence_source(
+    path: &Path,
+    mvcc: bool,
+    key: Option<&turso_core::EncryptionOpts>,
+    inserted: i64,
+    deleted: i64,
+) {
+    if mvcc {
+        crate::s3::with_local_connection(path, key, |conn| {
+            conn.execute("PRAGMA journal_mode = 'mvcc'")
+        })
+        .unwrap();
+    }
+    let (_db, conn) = crate::s3::open_local(path, key).unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
+        .unwrap();
+    for i in 1..=inserted {
+        conn.execute(format!("INSERT INTO t (v) VALUES ('r{i}')"))
+            .unwrap();
+    }
+    conn.execute(format!("DELETE FROM t WHERE id > {}", inserted - deleted))
+        .unwrap();
+    conn.close().unwrap();
+}
+
+#[test]
+fn a_sequence_standing_at_one_carries_over() {
+    // turso_core 0.8.2 (sediment 0.1.0-beta.5) left sqlite_sequence empty
+    // for a sequence at exactly 1: the next insert got id 1 again and
+    // replaced the row that had it.
+    let dir = TempDir::new();
+    for (inserted, deleted) in [(1, 0), (1, 1), (2, 0), (2, 2), (3, 1)] {
+        for (mvcc, key) in [(false, None), (true, None), (true, Some(super::opts("cd")))] {
+            let name = format!("{inserted}-{deleted}-{mvcc}-{}", key.is_some());
+            let path = dir.db(&format!("src-{name}.db"));
+            sequence_source(&path, mvcc, key.as_ref(), inserted, deleted);
+            let store = FaultyStore::new();
+            let mut cfg = config(&store, "importer");
+            cfg.encryption = Some(encryption("ab"));
+            let mut options = checksum();
+            options.source_encryption = key.clone();
+            let imported = import(&cfg, &path, &options).unwrap();
+            assert!(imported.sequences_not_advanced.is_empty(), "{name}");
+            let db = open_encrypted(&cfg, &dir.db(&format!("dst-{name}.db"))).unwrap();
+            assert_eq!(
+                db.int("SELECT seq FROM sqlite_sequence WHERE name = 't'"),
+                inserted,
+                "{name}"
+            );
+            db.exec("INSERT INTO t (v) VALUES ('new')").unwrap();
+            let kept: Vec<String> = db
+                .rows("SELECT id, v FROM t ORDER BY id")
+                .iter()
+                .map(|row| format!("{}:{}", row[0], row[1]))
+                .collect();
+            let mut want: Vec<String> = (1..=inserted - deleted)
+                .map(|i| format!("{i}:r{i}"))
+                .collect();
+            want.push(format!("{}:new", inserted + 1));
+            assert_eq!(kept, want, "{name}");
+        }
+    }
+}
+
+#[test]
+fn a_copy_whose_sequences_differ_from_the_source_is_refused() {
+    let dir = TempDir::new();
+    let path = dir.db("one.db");
+    sequence_source(&path, true, None, 1, 0);
+    let store = FaultyStore::new();
+    let before = files(&dir.0);
+    // As turso_core 0.8.2 left a sequence standing at 1.
+    let result = damaged_import(&store, &path, "DELETE FROM sqlite_sequence");
+    assert_config_err(result, "t (sqlite_sequence none in the copy, 1 wanted)");
+    assert_eq!(files(&dir.0), before);
+    assert!(store.put_log().is_empty(), "{:?}", store.put_log());
+    import(&config(&store, "importer"), &path, &checksum()).unwrap();
+}
+
+/// An import whose copy `damage` changes before it is checked.
+fn damaged_import(
+    store: &Arc<FaultyStore>,
+    path: &Path,
+    damage: &'static str,
+) -> Result<Imported, S3Error> {
+    crate::s3::import::DAMAGE_COPY.with(|d| d.set(Some(damage)));
+    let result = import(&config(store, "importer"), path, &checksum());
+    crate::s3::import::DAMAGE_COPY.with(|d| d.set(None));
+    result
+}
+
+/// Tables whose rowid no column aliases, or that columns named rowid hide.
+fn rowid_source(dir: &TempDir) -> PathBuf {
+    let path = dir.db("rowids.db");
+    let plain = open_plain(&path);
+    for sql in [
+        // An inline INTEGER PRIMARY KEY DESC is not a rowid alias.
+        "CREATE TABLE d(a INTEGER PRIMARY KEY DESC, v TEXT)",
+        "INSERT INTO d (rowid, a, v) VALUES (100, 7, 'x'), (5, 9, 'y')",
+        // In a table constraint it is.
+        "CREATE TABLE c(a INTEGER, v TEXT, PRIMARY KEY (a DESC))",
+        "INSERT INTO c (a, v) VALUES (40, 'z')",
+        "CREATE TABLE s(rowid TEXT, _rowid_ TEXT, v)",
+        "INSERT INTO s (oid, rowid, _rowid_, v) VALUES (42, 'r', 'u', 'w')",
+        "CREATE TABLE p(k TEXT PRIMARY KEY, v)",
+        "INSERT INTO p (rowid, k, v) VALUES (77, 'key', 1.5)",
+    ] {
+        plain.conn.execute(sql).unwrap();
+    }
+    path
+}
+
+#[test]
+fn rowids_no_column_aliases_are_copied() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let path = rowid_source(&dir);
+    import(&config(&store, "importer"), &path, &checksum()).unwrap();
+    let db = open_db(&config(&store, "app"), &dir.db("restored.db")).unwrap();
+    let rows = |sql: &str| -> Vec<String> {
+        db.rows(sql)
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            })
+            .collect()
+    };
+    assert_eq!(
+        rows("SELECT rowid, a, v FROM d ORDER BY rowid"),
+        ["5:9:y", "100:7:x"]
+    );
+    assert_eq!(rows("SELECT rowid, a, v FROM c"), ["40:40:z"]);
+    assert_eq!(rows("SELECT oid, rowid, _rowid_, v FROM s"), ["42:r:u:w"]);
+    assert_eq!(rows("SELECT rowid, k, v FROM p"), ["77:key:1.5"]);
+}
+
+#[test]
+fn a_copy_whose_rows_differ_from_the_source_is_refused() {
+    let dir = TempDir::new();
+    let path = rowid_source(&dir);
+    for damage in [
+        "UPDATE d SET rowid = 1 WHERE a = 7",
+        "UPDATE p SET v = 1.25",
+        "UPDATE s SET oid = 43",
+    ] {
+        let store = FaultyStore::new();
+        assert_config_err(
+            damaged_import(&store, &path, damage),
+            "differ from the source's",
+        );
+        assert!(store.put_log().is_empty(), "{:?}", store.put_log());
+    }
+    let shadowed = dir.db("shadowed.db");
+    let plain = open_plain(&shadowed);
+    plain
+        .conn
+        .execute("CREATE TABLE x(rowid TEXT, _rowid_ TEXT, oid TEXT, v)")
+        .unwrap();
+    drop(plain);
+    assert_config_err(
+        import(
+            &config(&FaultyStore::new(), "importer"),
+            &shadowed,
+            &checksum(),
+        ),
+        "x has columns named rowid, _rowid_ and oid",
+    );
 }
 
 #[test]

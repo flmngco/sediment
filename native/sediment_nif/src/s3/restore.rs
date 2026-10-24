@@ -92,6 +92,11 @@ pub struct Point {
     pub cutoff_ms: Option<u64>,
 }
 
+/// The retained epoch a restore of `target` uses. A time is restored from
+/// the epoch whose `[started_at_ms, ended_at_ms)` covers it (the current
+/// epoch has no end), never from another: an epoch that ended before the
+/// time holds an older history, also when the epochs in between were
+/// released.
 pub fn choose(manifest: &Manifest, target: Target) -> Result<Point> {
     let pick = |ok: &dyn Fn(&EpochRecord) -> bool| {
         manifest
@@ -102,13 +107,29 @@ pub fn choose(manifest: &Manifest, target: Target) -> Result<Point> {
     let (record, cutoff_ms) = match target {
         Target::Latest => (Some(manifest.current()), None),
         Target::Epoch(seq) => (pick(&|r| r.epoch.seq == seq), None),
-        Target::Time(at) => (pick(&|r| r.started_at_ms <= at), Some(at)),
+        Target::Time(at) => (pick(&|r| r.covers(at)), Some(at)),
     };
-    let record = record.ok_or_else(|| {
-        S3Error::Config(format!(
+    let record = record.ok_or_else(|| match target {
+        Target::Time(at) => S3Error::Config(format!(
+            "time {at} (unix ms) is not covered by a retained epoch (retained: [{}]); raise \
+             retain_epochs",
+            manifest
+                .retained()
+                .map(|r| format!(
+                    "epoch {} under key {}: {}..{}",
+                    r.epoch.seq,
+                    super::shown(r.key_id()),
+                    r.started_at_ms,
+                    r.ended_at_ms
+                        .map_or("now".to_string(), |end| end.to_string())
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => S3Error::Config(format!(
             "{target:?} is not retained (retained epochs: {:?}); raise retain_epochs",
             manifest.retained().map(|r| r.epoch.seq).collect::<Vec<_>>()
-        ))
+        )),
     })?;
     Ok(Point { record, cutoff_ms })
 }

@@ -13,6 +13,10 @@ defmodule Sediment.Connection do
       `Exqlite.Connection`, so that code written against exqlite works here.
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed, only: [connect: 1, handle_begin: 2, handle_close: 3]
+
   use DBConnection
   alias Sediment.Engine
   alias Sediment.Error
@@ -33,6 +37,9 @@ defmodule Sediment.Connection do
     :before_disconnect,
     pending_begin: false,
     s3_generation: 0,
+    # The :encryption option, hidden (Sediment.S3.Keys.hide/1): a replica's
+    # refresh resolves keys through its key_for, if it has one.
+    encryption: nil,
     generation_key: nil,
     stmt_cache: %{}
   ]
@@ -75,7 +82,7 @@ defmodule Sediment.Connection do
           | {:journal_size_limit, integer()}
           | {:soft_heap_limit, integer()}
           | {:hard_heap_limit, integer()}
-          | {:encryption, [cipher: String.t(), key: String.t()] | false}
+          | {:encryption, Sediment.S3.encryption()}
           | {:experimental, [atom()]}
           | {:s3, keyword() | map()}
           | {:custom_pragmas, [{keyword(), integer() | boolean() | String.t()}]}
@@ -136,7 +143,8 @@ defmodule Sediment.Connection do
     * `:chunk_size` - The chunk size for bulk fetching. Defaults to `50`.
     * `:encryption` - `[cipher: "aegis256", key: "<hex key>"]` to open an
       encrypted database (turso extension). With `:s3` it is required: a
-      key, or `false` to store the database unencrypted.
+      key or a key ring (see "Encryption" in `Sediment.S3`), or `false` to
+      store the database unencrypted.
     * `:mvcc_checkpoint_threshold` - MVCC log bytes between automatic
       checkpoints; defaults to 256 KiB for non-S3 MVCC databases. See
       `Sediment.Engine.open/2`.
@@ -176,6 +184,17 @@ defmodule Sediment.Connection do
   """
   @spec connect([connection_opt()]) :: {:ok, t()} | {:error, Exception.t()}
   def connect(options) do
+    # Its options hold keys and S3 credentials: see Sediment.S3.Keys.scrubbed/1
+    # (`:key` is refused below, as an unsupported option).
+    Sediment.S3.Keys.scrubbed(fn ->
+      case Sediment.S3.Keys.options(options, "Sediment.Connection.connect/1", [:key]) do
+        :ok -> connect_checked(options)
+        {:error, message} -> {:error, %Error{message: message}}
+      end
+    end)
+  end
+
+  defp connect_checked(options) do
     database = Keyword.get(options, :database)
 
     options =
@@ -258,6 +277,12 @@ defmodule Sediment.Connection do
 
   @impl true
   def handle_prepare(%Query{} = query, options, state) do
+    if text?(query.statement),
+      do: prepare_text(query, options, state),
+      else: {:error, not_text_error(), state}
+  end
+
+  defp prepare_text(query, options, state) do
     metadata = %{query: query.statement, database: state.path}
 
     :telemetry.span([:sediment, :prepare], metadata, fn ->
@@ -275,7 +300,13 @@ defmodule Sediment.Connection do
     {:ok, query, Result.new(command: :execute, rows: [[result]], num_rows: 1), state}
   end
 
-  def handle_execute(%Query{} = query, _params, _options, %{transaction_status: :error} = state) do
+  def handle_execute(%Query{} = query, params, options, state) do
+    if text?(query.statement),
+      do: execute_text(query, params, options, state),
+      else: {:error, not_text_error(), state}
+  end
+
+  defp execute_text(%Query{} = query, _params, _options, %{transaction_status: :error} = state) do
     # The transaction was already rolled back natively; only a ROLLBACK
     # issued as a plain query is accepted, to acknowledge it.
     if rollback_statement?(query.statement) do
@@ -286,7 +317,7 @@ defmodule Sediment.Connection do
     end
   end
 
-  def handle_execute(%Query{} = query, params, options, state) do
+  defp execute_text(%Query{} = query, params, options, state) do
     metadata = %{query: query.statement, params: params, database: state.path}
 
     :telemetry.span([:sediment, :query], metadata, fn ->
@@ -440,7 +471,7 @@ defmodule Sediment.Connection do
   defp s3_operation(:snapshot, state), do: {S3.snapshot(state.db), state}
 
   defp s3_operation(:refresh, %{transaction_status: :idle} = state) do
-    case S3.refresh(state.db) do
+    case S3.refresh(state.db, encryption: state.encryption) do
       {:ok, _info} = ok ->
         {ok, %{state | s3_generation: S3.bump_generation(state.path), stmt_cache: %{}}}
 
@@ -466,7 +497,7 @@ defmodule Sediment.Connection do
   defp maybe_refresh(state), do: {:ok, state}
 
   defp refresh_to(generation, state) do
-    case S3.refresh(state.db) do
+    case S3.refresh(state.db, encryption: state.encryption) do
       {:ok, _} ->
         {:ok, %{state | s3_generation: generation, stmt_cache: %{}}}
 
@@ -536,6 +567,23 @@ defmodule Sediment.Connection do
         trimmed
     end
   end
+
+  # A statement that isn't text (options or a key ring given in its place)
+  # is refused before a telemetry span names it or anything raises on it,
+  # with the value in the exception's stack trace.
+  defp text?(statement) when is_binary(statement), do: true
+
+  defp text?(statement) when is_list(statement) do
+    _length = IO.iodata_length(statement)
+    true
+  rescue
+    ArgumentError -> false
+  end
+
+  defp text?(_statement), do: false
+
+  defp not_text_error,
+    do: %Error{message: "the statement must be a string or iodata"}
 
   defp rollback_statement?(statement) do
     statement
@@ -630,11 +678,36 @@ defmodule Sediment.Connection do
         handle_transaction(:begin, "SAVEPOINT sediment_savepoint", state)
       end
     else
-      raise ArgumentError, "unsupported transaction mode inside a transaction: #{inspect(mode)}"
+      raise ArgumentError,
+            "unsupported transaction mode inside a transaction: #{Sediment.S3.Keys.shown_value(mode)}"
     end
   end
 
-  def handle_begin(_options, %{transaction_status: :error} = state), do: {:error, state}
+  # A transaction the database rolled back (a write-write conflict, ON
+  # CONFLICT ROLLBACK) and nobody ended:
+  #
+  #   * a savepoint on it (in practice under Ecto's SQL sandbox, whose test
+  #     transaction is the outer one) is refused like any statement there,
+  #     as an error, the connection kept (a status result, {:error, state},
+  #     would make DBConnection disconnect, and the sandbox doesn't take it);
+  #   * a new transaction (a BEGIN run as a query and checked in without its
+  #     ROLLBACK leaves the connection so) ends it first: the database has,
+  #     so only the status is reset (a ROLLBACK if it hasn't, or a
+  #     disconnect if that fails).
+  def handle_begin(options, %{transaction_status: :error} = state) do
+    if Keyword.get(options, :mode) == :savepoint do
+      {:error, aborted_error("SAVEPOINT sediment_savepoint"), state}
+    else
+      healed = %{state | transaction_status: :idle, pending_begin: false}
+
+      with {:ok, status} when status != :idle <- Engine.transaction_status(state.db),
+           {:error, reason} <- Engine.execute(state.db, "ROLLBACK") do
+        {:disconnect, %Error{message: to_string(reason), statement: "ROLLBACK"}, state}
+      else
+        _ended -> handle_begin(options, healed)
+      end
+    end
+  end
 
   @impl true
   def handle_commit(_options, %{transaction_status: :error} = state), do: {:error, state}
@@ -736,21 +809,27 @@ defmodule Sediment.Connection do
   This callback is called in the client process.
   """
   @impl true
-  def handle_close(query, _opts, state) do
-    unless cached?(state, query.ref), do: Engine.release(state.db, query.ref)
+  def handle_close(%Query{ref: ref}, _opts, %__MODULE__{db: db} = state) do
+    unless cached?(state, ref), do: Engine.release(db, ref)
     {:ok, nil, state}
   end
 
   @impl true
-  def handle_declare(
-        %Query{statement: statement},
-        _params,
-        _opts,
-        %{transaction_status: :error} = state
-      ),
-      do: {:error, aborted_error(statement), state}
-
   def handle_declare(%Query{} = query, params, opts, state) do
+    if text?(query.statement),
+      do: declare_text(query, params, opts, state),
+      else: {:error, not_text_error(), state}
+  end
+
+  defp declare_text(
+         %Query{statement: statement},
+         _params,
+         _opts,
+         %{transaction_status: :error} = state
+       ),
+       do: {:error, aborted_error(statement), state}
+
+  defp declare_text(%Query{} = query, params, opts, state) do
     # Cursors are emulated with a prepared statement that is stepped through,
     # so the query ref is the cursor.
     result =
@@ -952,6 +1031,7 @@ defmodule Sediment.Connection do
         status: :idle,
         chunk_size: Keyword.get(options, :chunk_size),
         s3_generation: S3.generation(database),
+        encryption: Sediment.S3.Keys.hide(options[:encryption]),
         generation_key: S3.generation_key(database),
         before_disconnect: Keyword.get(options, :before_disconnect, nil)
       }
@@ -1148,11 +1228,20 @@ defmodule Sediment.Connection do
     params = URI.decode_query(query || "")
 
     case {path, params["mode"]} do
-      {_, "memory"} -> {:ok, ":memory:", nil}
-      {path, _} when path in [nil, ""] -> {:error, "No path in #{inspect(uri)}"}
-      {path, "ro"} -> {:ok, path, :readonly}
-      {path, "rw"} -> {:ok, path, :readwrite}
-      {path, _} -> {:ok, path, nil}
+      {_, "memory"} ->
+        {:ok, ":memory:", nil}
+
+      {path, _} when path in [nil, ""] ->
+        {:error, "No path in #{Sediment.S3.Keys.shown_value(uri)}"}
+
+      {path, "ro"} ->
+        {:ok, path, :readonly}
+
+      {path, "rw"} ->
+        {:ok, path, :readwrite}
+
+      {path, _} ->
+        {:ok, path, nil}
     end
   end
 

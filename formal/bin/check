@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Runs every S3Fence configuration and compares the outcome with its expectation:
-# "pass", or the name of the invariant that must be violated.
+# Runs every configuration and compares the outcome with its expectation: "pass", or
+# the name of the invariant that must be violated. A third column names the spec
+# (S3Fence by default). An argument runs only the configs whose name matches it:
+#   formal/bin/check          # all
+#   formal/bin/check '^Kr|Kr' # the KeyRotation ones
 set -uo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$here/tla"
+only="${1:-}"
 status=0
-while read -r cfg expect; do
+while read -r cfg expect spec; do
   [ -z "$cfg" ] && continue
-  out="$("$here/bin/tlc" S3Fence.tla -config "$cfg.cfg" 2>&1)"
+  [ -n "$only" ] && ! grep -qE "$only" <<<"$cfg" && continue
+  out="$("$here/bin/tlc" "${spec:-S3Fence}.tla" -config "$cfg.cfg" 2>&1)"
   if grep -qE "(Invariant|Action property) [A-Za-z]* is violated" <<<"$out"; then
     got="$(grep -oE "(Invariant|Action property) [A-Za-z]* is violated" <<<"$out" | head -1 | awk '{print $(NF-2)}')"
   elif grep -qE "Temporal property [A-Za-z]* was violated" <<<"$out"; then
@@ -87,6 +92,25 @@ NegReadRecheckGeneration ShownDurable
 NegReadRecheckSeal ShownDurable
 NegNoTakeoverSeal ShownDurable
 NegReadTransitional ShownDurable
+KrSole pass KeyRotation
+KrSoleRetain pass KeyRotation
+KrSoleKeys pass KeyRotation
+KrReuse pass KeyRotation
+KrTakeover pass KeyRotation
+KrTakeoverFaults pass KeyRotation
+NegKrNoIfMatchSwitch AckedDurable KeyRotation
+NegKrKeyBeforeLease KeyConsistent KeyRotation
+NegKrNoCoverageCheck PitrExact KeyRotation
+NegKrReleaseCurrent KeyConsistent KeyRotation
+NegKrTrimPinned SourceKept KeyRotation
+NegKrNoRetiredCheck RetiredStaysRetired KeyRotation
+NegKrReuseWithPins HistoryBound KeyRotation
+NegKrNoAdopt OutcomeFinal KeyRotation
+NegKrFailUnlanded OutcomeFinal KeyRotation
+NegKrWriterClock PitrExact KeyRotation
+NegKrWriterClockBehind PitrExact KeyRotation
+NegKrFencedNoKey OutcomeFinal KeyRotation
+NegKrCensusResolves IndetCensus KeyRotation
 LIST
 
 exit $status

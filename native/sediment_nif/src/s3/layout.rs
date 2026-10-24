@@ -6,15 +6,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::error::{Result, S3Error};
+use super::keys::KeyRecord;
 
 pub const MANIFEST_KEY: &str = "manifest.json";
 pub const LEASE_KEY: &str = "lease.json";
 pub const LOG_DIR: &str = "log/";
 pub const SNAPSHOT_DIR: &str = "snapshots/";
-pub const MANIFEST_VERSION: u32 = 1;
-/// Version of manifests whose snapshot is a delta chain (`snapshot_base`):
-/// older drivers refuse them instead of reading a delta as a database file.
-pub const MANIFEST_VERSION_CHAIN: u32 = 2;
+/// 4: the key of every epoch (`key`), and when retained epochs ended.
+/// Versions 1 and 2 (0.1.0-beta.6 and older) are refused.
+pub const MANIFEST_VERSION: u32 = 4;
 /// Version of the manifest a destroy leaves: no database. Older drivers
 /// refuse it rather than read it as one.
 pub const MANIFEST_VERSION_DESTROYED: u32 = 3;
@@ -134,13 +134,14 @@ pub struct Manifest {
     /// Retained earlier epochs, newest first (point-in-time restore).
     #[serde(default)]
     pub history: Vec<EpochRecord>,
-    /// Whether the database is encrypted (opening it needs `:encryption`).
-    /// `None`: not recorded, in manifests from before this was always written
-    /// (unencrypted ones left it out), so either. A writer records it only
-    /// once its open showed it: a restore and checkpoint under the key (or
-    /// without one) that succeeded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted: Option<bool>,
+    /// The key the current epoch (its snapshot and every frame of its log)
+    /// is encrypted with, `None` for an unencrypted database. An open
+    /// resolves it from its ring before writing anything.
+    pub key: Option<KeyRecord>,
+    /// Every key a rekey moved the database away from, released or not: a
+    /// rekey back to one is refused unless explicitly allowed.
+    #[serde(default)]
+    pub retired_keys: Vec<RetiredKey>,
     /// Random, chosen when the database is created and kept by every later
     /// manifest: which database this is, whatever its epochs. `None` in
     /// manifests written by older versions (or a takeover by one).
@@ -190,6 +191,35 @@ pub struct EpochRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snapshot_base: Vec<SnapshotLink>,
     pub started_at_ms: u64,
+    /// When the next epoch started: the epoch holds the database's history
+    /// over `[started_at_ms, ended_at_ms)`. `None` for the current epoch.
+    pub ended_at_ms: Option<u64>,
+    /// The key the epoch is encrypted with.
+    pub key: Option<KeyRecord>,
+    /// Kept by a rekey (the epoch it ended and everything retained then):
+    /// retention never trims it, only `release_key` of its key drops it.
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// A key a rekey moved away from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredKey {
+    pub id: String,
+    pub fingerprint: String,
+    pub retired_at_ms: u64,
+}
+
+impl EpochRecord {
+    /// Whether the epoch holds the database's state at `at` (unix ms).
+    pub fn covers(&self, at: u64) -> bool {
+        self.started_at_ms <= at && self.ended_at_ms.is_none_or(|end| at < end)
+    }
+
+    /// Its key's id, for messages.
+    pub fn key_id(&self) -> &str {
+        self.key.as_ref().map_or("none", |key| key.id.as_str())
+    }
 }
 
 impl Manifest {
@@ -213,11 +243,21 @@ impl Manifest {
             snapshot_stored_size: self.snapshot_stored_size,
             snapshot_base: self.snapshot_base.clone(),
             started_at_ms: self.started_at_ms,
+            ended_at_ms: None,
+            key: self.key.clone(),
+            pinned: false,
         }
     }
 
-    /// The manifest for a new epoch starting now with the snapshot
-    /// `published`, keeping `retain` earlier epochs in the history.
+    /// The manifest for a new epoch with the snapshot `published`,
+    /// encrypted with `key`, starting at `boundary_ms`: the store's time of
+    /// the seal that closed the current epoch (clamped so that epochs never
+    /// start before their predecessor).
+    ///
+    /// The history keeps the `retain` newest earlier epochs that aren't
+    /// pinned. A rekey (`key` differs from the current one) pins the epoch it
+    /// ends and every epoch retained, and retires the old key.
+    #[allow(clippy::too_many_arguments)]
     pub fn advance(
         &self,
         epoch: Epoch,
@@ -225,23 +265,45 @@ impl Manifest {
         generation: u64,
         writer: &str,
         retain: usize,
+        key: Option<KeyRecord>,
+        boundary_ms: u64,
     ) -> Manifest {
-        let mut history = vec![self.current()];
+        let started = boundary_ms.max(self.started_at_ms);
+        let rekey = key != self.key;
+        let mut ended = self.current();
+        ended.ended_at_ms = Some(started);
+        let mut history = vec![ended];
         history.extend(self.history.iter().cloned());
-        history.truncate(retain);
-        let now = now_ms();
+        let mut retired_keys = self.retired_keys.clone();
+        if rekey {
+            for record in &mut history {
+                record.pinned = true;
+            }
+            // A reused key (`allow_reuse`) is current again, no more retired.
+            // Only that key, by id and fingerprint: another key retired under
+            // its id, or its material retired under another id, stays retired.
+            if let Some(new) = &key {
+                retired_keys.retain(|r| !(r.id == new.id && r.fingerprint == new.fingerprint));
+            }
+            if let Some(old) = &self.key {
+                retired_keys.retain(|r| !(r.id == old.id && r.fingerprint == old.fingerprint));
+                retired_keys.push(RetiredKey {
+                    id: old.id.clone(),
+                    fingerprint: old.fingerprint.clone(),
+                    retired_at_ms: started,
+                });
+            }
+        }
+        let mut unpinned = 0;
+        history.retain(|record| {
+            record.pinned || {
+                unpinned += 1;
+                unpinned <= retain
+            }
+        });
         let snapshot = &published.snapshot;
         Manifest {
-            // Version 2 while any epoch a restore may use is a chain: an
-            // older driver would take a version 1 manifest over and drop the
-            // chains from the history it rewrites.
-            version: if published.base.is_empty()
-                && history.iter().all(|record| record.snapshot_base.is_empty())
-            {
-                MANIFEST_VERSION
-            } else {
-                MANIFEST_VERSION_CHAIN
-            },
+            version: MANIFEST_VERSION,
             generation,
             epoch,
             snapshot: published.key.clone(),
@@ -251,10 +313,11 @@ impl Manifest {
             snapshot_stored_size: snapshot.stored_size,
             snapshot_base: published.base.clone(),
             writer: writer.to_string(),
-            updated_at_ms: now,
-            started_at_ms: now,
+            updated_at_ms: now_ms(),
+            started_at_ms: started,
             history,
-            encrypted: self.encrypted,
+            key,
+            retired_keys,
             database_id: self.database_id.clone(),
         }
     }
@@ -265,14 +328,25 @@ impl Manifest {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let manifest: Manifest = serde_json::from_slice(bytes)?;
-        if manifest.version != MANIFEST_VERSION && manifest.version != MANIFEST_VERSION_CHAIN {
+        #[derive(Deserialize)]
+        struct Version {
+            version: u32,
+        }
+        let version = serde_json::from_slice::<Version>(bytes)?.version;
+        if version < MANIFEST_VERSION {
             return Err(S3Error::Corrupt(format!(
-                "unsupported manifest version {}",
-                manifest.version
+                "manifest version {version} was written by sediment 0.1.0-beta.6 or older, \
+                 whose format this version doesn't read (version {MANIFEST_VERSION}: key \
+                 rotation). Read the data with that version (export it), or clear the prefix \
+                 with Sediment.S3.destroy/2"
             )));
         }
-        Ok(manifest)
+        if version != MANIFEST_VERSION {
+            return Err(S3Error::Corrupt(format!(
+                "unsupported manifest version {version}: written by a newer sediment"
+            )));
+        }
+        Ok(serde_json::from_slice(bytes)?)
     }
 
     pub fn encode(&self) -> bytes::Bytes {
@@ -333,6 +407,7 @@ impl Tombstone {
 
 /// What `manifest.json` holds.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ManifestState {
     Database(Manifest),
     Destroyed(Tombstone),

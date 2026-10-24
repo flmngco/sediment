@@ -61,7 +61,7 @@ So the name is our own. **Sediment** describes how the S3 layer works: committed
 ```elixir
 defp deps do
   [
-    {:sediment, "~> 0.1"}
+    {:sediment, "~> 0.2.0-beta.1"}
   ]
 end
 ```
@@ -69,7 +69,7 @@ end
 With Ecto, depend on the adapter instead; it brings `sediment` with it:
 
 ```elixir
-{:ecto_sediment, "~> 0.1"}
+{:ecto_sediment, "~> 0.2.0-beta.1"}
 ```
 
 Elixir 1.18 or later; the package is tested on Elixir 1.18 with OTP 27 and
@@ -213,8 +213,9 @@ examples.
   conditional writes; also read-only replicas, point-in-time restore and
   encryption at rest. See the [S3 durability guide](guides/s3.md); the
   protocol is model-checked with TLA+ ([formal model](formal/README.md)).
-  S3 databases are encrypted by default (`:encryption` with a key, or
-  `encryption: false` to opt out explicitly).
+  S3 databases are encrypted by default (`:encryption` with a key or a key
+  ring, or `encryption: false` to opt out explicitly), and their keys rotate
+  in place (`Sediment.S3.rekey/3`, see "Rotating keys" in the guide).
   Opening with `s3:` restores the S3 copy over the local file; an empty
   prefix refuses to start over an existing local database, which
   `Sediment.S3.import/3` uploads instead.
@@ -323,7 +324,11 @@ instead of faking it.
 * **Read-only connections.** Turso shares one database instance per file in
   the VM. A read-only open of a file that is already open read-write is
   enforced per connection (`query_only`); writes fail with
-  `"attempt to write a readonly database"` as in SQLite.
+  `"attempt to write a readonly database"` as in SQLite. turso_core 0.8.3
+  rewrites the `AUTOINCREMENT` sequences of an MVCC database when it opens
+  one, which a read-only open refuses; such a file is opened read-write
+  (never created) with `query_only`, so a `:readonly` open of it needs
+  write access to the file and its log. User data isn't changed.
 * **`close/1` finalizes the connection's prepared statements**, so it
   releases the database, its file locks and an S3 lease right away even if
   statement references are still alive (for example cached by Ecto in client

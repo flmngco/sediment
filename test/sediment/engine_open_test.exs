@@ -72,7 +72,7 @@ defmodule Sediment.EngineOpenTest do
 
       assert {:error, "File is not a database"} = Engine.open(path)
 
-      assert {:error, "Unknown cipher name: nope"} =
+      assert {:error, "encryption: ring entry 1: key default: unknown cipher (supported: " <> _} =
                Engine.open(Temp.path!(), encryption: [cipher: "nope", key: @key])
     end
   end
@@ -140,6 +140,36 @@ defmodule Sediment.EngineOpenTest do
                Engine.execute(ro, "insert into t values (1)")
 
       :ok = Engine.execute(rw, "insert into t values (1)")
+    end
+
+    # turso_core 0.8.3's MVCC open writes the AUTOINCREMENT sequences: the
+    # read-only open of such a file failed with this very error.
+    test "opens an MVCC file with AUTOINCREMENT rows, and the connection stays read-only" do
+      for enc <- [nil, [cipher: "aegis256", key: String.duplicate("ab", 32)]] do
+        path = Temp.path!()
+        {:ok, rw} = Engine.open(path, journal_mode: :mvcc, encryption: enc)
+
+        :ok =
+          Engine.execute(rw, "create table t (id integer primary key autoincrement, v text)")
+
+        :ok = Engine.execute(rw, "insert into t (v) values ('a'), ('b')")
+        _ = query(rw, "PRAGMA wal_checkpoint(TRUNCATE)")
+        :ok = Engine.close(rw)
+
+        {:ok, ro} = Engine.open(path, mode: :readonly, encryption: enc)
+        assert [[1, "a"], [2, "b"]] = query(ro, "select id, v from t order by id")
+        assert [["t", 2]] = query(ro, "select name, seq from sqlite_sequence")
+
+        assert {:error, "attempt to write a readonly database"} =
+                 Engine.execute(ro, "insert into t (v) values ('c')")
+
+        :ok = Engine.close(ro)
+
+        {:ok, rw} = Engine.open(path, encryption: enc)
+        :ok = Engine.execute(rw, "insert into t (v) values ('c')")
+        assert [[3]] = query(rw, "select max(id) from t")
+        :ok = Engine.close(rw)
+      end
     end
   end
 

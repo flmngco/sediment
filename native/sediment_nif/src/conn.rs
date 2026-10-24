@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use rustler::{Atom, Encoder, Env, LocalPid, Monitor, NifResult, ResourceArc, Term};
@@ -514,8 +514,9 @@ pub fn ok_tuple<'a, T: Encoder>(env: Env<'a>, value: T) -> Term<'a> {
     (atoms::ok(), value).encode(env)
 }
 
-pub fn error_tuple<'a, T: Encoder>(env: Env<'a>, reason: T) -> Term<'a> {
-    (atoms::error(), reason).encode(env)
+/// `{:error, reason}`, its text through the net ([`crate::redact`]).
+pub fn error_tuple<'a, T: crate::redact::Reason>(env: Env<'a>, reason: T) -> Term<'a> {
+    (atoms::error(), reason.encode_reason(env)).encode(env)
 }
 
 pub fn closed(env: Env<'_>) -> Term<'_> {
@@ -616,12 +617,85 @@ fn script_result<'a>(env: Env<'a>, res: &ConnRes, outcome: Result<ScriptWait, St
     }
 }
 
-type OpenLocks = HashMap<PathBuf, Weak<Mutex<()>>>;
+/// What holds a file's lock: an open (while it opens, an S3 restore
+/// included), or a maintenance operation (`rekey`, `release_key`, a restore
+/// or an import of the file), named as its busy error says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    Open,
+    Maintenance(&'static str),
+}
+
+/// The per-file lock serializing opens and maintenance. An open never waits
+/// on it inside its dirty NIF (see `try_hold`): a maintenance operation holds
+/// it for minutes, and opens waiting there would take every dirty I/O
+/// scheduler, stopping the whole VM's queries and file I/O.
+pub(crate) struct PathLock {
+    holder: Mutex<Option<Holder>>,
+    released: Condvar,
+}
+
+/// Holds a file's lock until dropped.
+pub(crate) struct PathGuard {
+    lock: Arc<PathLock>,
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        *lock(&self.lock.holder) = None;
+        self.lock.released.notify_all();
+    }
+}
+
+impl Holder {
+    /// The error an open gets while this holds the file (`Open`: the caller
+    /// waits and retries outside the NIF).
+    pub(crate) fn busy(self) -> String {
+        match self {
+            Holder::Open => "busy: another open of this file is running".to_string(),
+            Holder::Maintenance(what) => format!("busy: {what} is running; retry once it ends"),
+        }
+    }
+}
+
+/// Takes the file's lock if it is free: `Err(holder)` names who has it.
+/// `Ok(None)` for an in-memory database.
+pub(crate) fn try_hold(path: &str, holder: Holder) -> Result<Option<PathGuard>, Holder> {
+    let Some(path_lock) = path_lock(path) else {
+        return Ok(None);
+    };
+    let mut current = lock(&path_lock.holder);
+    if let Some(other) = *current {
+        return Err(other);
+    }
+    *current = Some(holder);
+    drop(current);
+    Ok(Some(PathGuard { lock: path_lock }))
+}
+
+/// Takes the file's lock, waiting while another holds it: for maintenance,
+/// which runs on its own dirty scheduler for its whole run anyway, and only
+/// waits out an open.
+pub(crate) fn hold(path: &str, holder: Holder) -> Option<PathGuard> {
+    let path_lock = path_lock(path)?;
+    let mut current = lock(&path_lock.holder);
+    while current.is_some() {
+        current = path_lock
+            .released
+            .wait(current)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    *current = Some(holder);
+    drop(current);
+    Some(PathGuard { lock: path_lock })
+}
+
+type OpenLocks = HashMap<PathBuf, Weak<PathLock>>;
 
 static OPEN_LOCKS: OnceLock<Mutex<OpenLocks>> = OnceLock::new();
 
-/// The per-file lock serializing opens, or `None` for in-memory databases.
-fn path_lock(path: &str) -> Option<Arc<Mutex<()>>> {
+/// The per-file lock, or `None` for in-memory databases.
+fn path_lock(path: &str) -> Option<Arc<PathLock>> {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed.starts_with(":memory:") || trimmed.starts_with("file::memory:")
     {
@@ -649,7 +723,10 @@ fn path_lock(path: &str) -> Option<Arc<Mutex<()>>> {
     if let Some(existing) = locks.get(&key).and_then(Weak::upgrade) {
         return Some(existing);
     }
-    let fresh = Arc::new(Mutex::new(()));
+    let fresh = Arc::new(PathLock {
+        holder: Mutex::new(None),
+        released: Condvar::new(),
+    });
     locks.insert(key, Arc::downgrade(&fresh));
     Some(fresh)
 }
@@ -716,8 +793,14 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
     // Opens of one file are serialized (per file, never VM-wide: an S3 open
     // may wait on the network for minutes), so concurrent opens don't race
     // turso's switch into MVCC mode, or an S3 restore replacing the file.
-    let open_lock = path_lock(&config.path);
-    let _opening = open_lock.as_deref().map(lock);
+    // Never by waiting here: an open the file's lock refuses returns at once,
+    // `{:error, :opening}` while another open has it (Engine.open/2 waits and
+    // retries in its own process), a busy error while maintenance has it.
+    let _opening = match try_hold(&config.path, Holder::Open) {
+        Ok(guard) => guard,
+        Err(Holder::Open) => return Ok((atoms::error(), atoms::opening()).encode(env)),
+        Err(holder) => return Ok(error_tuple(env, holder.busy())),
+    };
 
     // Opening parses the schema (and may restore from S3): on the turso
     // stack, with panics reported as errors like any other turso call.
@@ -726,7 +809,10 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
     });
     let opened = match opened {
         Ok(Ok(opened)) => opened,
-        Ok(Err(reason)) => return Ok(error_tuple(env, reason)),
+        Ok(Err(crate::open::OpenError::Message(reason))) => return Ok(error_tuple(env, reason)),
+        Ok(Err(crate::open::OpenError::KeyNeeded(id))) => {
+            return Ok((atoms::error(), (atoms::key_needed(), id)).encode(env))
+        }
         Err(panic) => {
             let reason = stmt::panic_reason(&*panic);
             return Ok(error_tuple(env, format!("internal turso error: {reason}")));

@@ -1,5 +1,202 @@
 # Changelog
 
+## 0.2.0-beta.1 (Unreleased)
+
+0.2 breaks 0.1: the S3 manifest is version 4 (it records each epoch's key),
+`:encryption` is a key ring, and the options of functions taking keys must
+be keyword lists (see below). Data written by 0.1 is not migrated: an S3
+prefix written by 0.1 is refused (read its data with 0.1 and export it, or
+destroy the prefix).
+
+### Breaking
+
+* The S3 manifest is version 4: it records the key of every epoch. Sediment
+  refuses manifests of versions 1 and 2, written by 0.1.0-beta.6 and older,
+  with a message saying so (read the data with the older version and
+  export it, or destroy the prefix). There is no production data anywhere,
+  so no migration is provided. The tombstone a destroy leaves is unchanged.
+* `:encryption` is a key ring. `[cipher: c, key: k]` still works, as a ring
+  of one key whose id is `"default"`; a database created with it records
+  that id. New forms: `[keys: [{"r2", k2}, {"r1", k1}], cipher: c]` (the
+  first key is active, an entry may give its own `cipher:`) and
+  `[key_for: fun | {m, f, a}, active: "r2"]`. Ids match
+  `[a-z0-9][a-z0-9_-]{0,31}` and are not 32 hex digits (an AES-128 key
+  would pass as one); a ring can't hold an id or a key twice.
+* An open with a wrong key is refused by the key's fingerprint before the
+  takeover (`"key default in the ring is not the key that encrypted this
+  database ..."`), instead of failing to decrypt after the download.
+* The warm-reopen sidecar is version 3 (it records the key's fingerprint):
+  the first open after the upgrade restores in full.
+* `Sediment.Native` changed for key rings (`s3_refresh/2`, `s3_restore/4`,
+  `s3_import/5`, `export_sqlite/5` take a ring).
+* The options of every function taking keys or S3 options
+  (`Sediment.Engine.open/2`, `Sediment.start_link/1`, `child_spec/1`,
+  `export_sqlite/3`, `transaction/3`, `Sediment.Connection.connect/1`,
+  `Sediment.S3`'s `refresh/2`, `restore/3`, `import/3`, `rekey/3`,
+  `release_key/4`, `destroy/2`) must be a keyword list, without a key
+  ring's options (`key:`, `keys:`, `key_for:`, `cipher:`, `active:`) at the
+  top level. A map, which some of them accepted, or a ring given as the
+  options, is refused with a fixed message; a bare ring given to
+  `Sediment.Engine.open/2` used to open an unencrypted database.
+
+### S3 durability
+
+* Key rotation inside one prefix. Each epoch is encrypted with one key,
+  which the manifest records with it (id, cipher, and a fingerprint: the
+  first 16 bytes of HMAC-SHA256(key, "sediment/key-fingerprint/v1")). An
+  open resolves the key from its ring under the writer lease, before
+  writing anything, and refuses an unknown id or another key under the id
+  by name. Errors never contain key material.
+* `Sediment.S3.rekey/3` re-encrypts a database page by page under another
+  key of the ring and publishes it as a new epoch (always a full snapshot),
+  with `If-Match` on its takeover: a writer that took over meanwhile gets it
+  fenced (`{:error, {:fenced, %{current_key: ...}}}`), keeping every
+  commit, and a crash before the publication leaves the old key current.
+  Only `{:ok, _}` is an outcome: after any error, run the rekey again, and
+  keep both keys in the rings until it succeeds. It keeps the epochs it ended (pinned, whatever
+  `retain_epochs` is) and retires the old key: a rekey back to it, by id or
+  by key under any id, needs `allow_reuse: true` and its epochs released
+  first. Like `destroy/2`, it refuses while the database is open in this
+  VM; it also refuses while its local file is (without `:s3`, or with
+  another prefix). Stop the pool first: opens of the path wait until the
+  rekey ends.
+* `Sediment.S3.release_key/4` drops the retained epochs under a key and
+  deletes their objects; it refuses the current key.
+  `Sediment.S3.key_census/1` reads which keys a database still depends on.
+* Point-in-time restore uses the key of the epoch it restores, and only an
+  epoch whose time range covers the moment asked for: a moment in the time
+  of released epochs is refused, never answered with an older state. Epoch
+  boundaries come from the store's clock (the Last-Modified of the seal that
+  closed the previous epoch), not a writer's.
+* An open whose epoch-advance manifest PUT got an error reads the manifest
+  back: it adopts its own write if it landed, and sends it again while the
+  manifest is still the one it took over, so a write reported as failed
+  never lands later. When that can't be told, the error says the outcome is
+  unknown (`{:error, {:indeterminate, message}}` from `rekey/3`).
+* Replicas and `Sediment.S3.refresh/2` follow a rekey at the next refresh
+  when their ring holds the new key; `refresh/2` takes `encryption:` for a
+  ring with `key_for`.
+* Rotation over many databases: `Sediment.S3.rekey_many/2`,
+  `release_key_many/3` and `key_census_many/2` run the operation over a list
+  of `{path, s3_opts}` or `%{id:, path:, s3:}` targets, a few at a time
+  (`max_concurrency`, 1 by default; 2 for the census), never stopping at a
+  failure, and report every target by id (`rekeyed`, `current`, `absent`,
+  `failed`, `skipped`; the census by key, with `removable?/3`, false while
+  any target is absent or unreadable: a wrong bucket or prefix reads as
+  absent; `current: new_id` also needs every target under the new key). A
+  result that may still change (fenced, indeterminate, a store error) is
+  retried (`attempts`, `backoff`; a retried failure reports every
+  attempt's reason); a refusal isn't. `around:` wraps each target's
+  operation (close a tenant's pool before, reopen it after), `check:`
+  refuses a target, `on_result:` reports progress, `stop_on:` stops
+  starting targets; `encryption:` is a ring or a function of the target. A
+  re-run finds the done ones `current`. The callbacks get each target with
+  its `:encryption` hidden (still usable to reopen it), and their reasons
+  and re-raised exceptions pass the key net. An `around:` failing after the
+  operation fails the target with `{:around_failed, reason, result}`. Each
+  target runs in a monitored, unlinked process trapping exits: a linked
+  process exiting fails the target with `{:linked_exit, result}` once its
+  operation ends; one killed fails it with `{:crashed, why}` and stops
+  further starts, as its native operation may still be running.
+
+### Fixed
+
+* A mistyped `:encryption` never shows a key: an entry given as
+  `{key, id}`, a key given as `active:`, `to:`, a release's key id or
+  `cipher:`, an entry of the wrong shape, a `key_for` that raises. Errors
+  name ring entries by position; they never show a refused id or cipher,
+  nor a value of the wrong type; an id that could be a key is shown as
+  `<an id that looks like a key>`; a `key_for` that fails is reported by
+  the id and the exception's type only, without stack frame arguments.
+* Arguments of any shape never show a key either. Every public function
+  of `Sediment`, `Sediment.Engine`, `Sediment.S3`, `Sediment.Basic`,
+  `Sediment.Pragma`, `Sediment.CDC` and `Sediment.Connection.connect/1`
+  runs inside one boundary, from its argument handling to its NIF calls:
+  * an exception raised there loses its stack frames' arguments, and one
+    that isn't Sediment's own (a `FunctionClauseError` on a map of options,
+    a `KeyError`, a `MatchError`) is replaced by an `ArgumentError` naming
+    its type only; Sediment's errors and DBConnection's keep their type, and
+    the `ArgumentError`s and `RuntimeError`s of Sediment's and Ecto's
+    modules their message (an Ecto repo's configuration error says why);
+  * a net: every error Sediment returns or raises, and every exit reason
+    passing through, has each run of 32 or more hex digits replaced by
+    `<redacted>` (keys are hex), in Elixir and in the native code, so a key
+    echoed by any message never shows. Fingerprints in messages and in a
+    fenced result are shown by their first 16 hex digits. Only text is
+    rewritten: a connection state, query or result in an error tuple is
+    returned as it is (of `{:error | :disconnect, exception, state}` only
+    the exception), and a `Sediment.Error` keeps its `:statement` as given,
+    its message and `inspect` showing it redacted. Values of the caller's
+    holding such a run (a prefix or path with a dashless UUID) show
+    redacted in messages too;
+  * messages show a value a caller gave only as an atom, string or number
+    that couldn't be a key, otherwise by its type (`"unsupported type:
+    %ArgumentError{...}"`, `"argument error: a value of type map"`);
+  * an S3 option that doesn't parse is named, never shown (it was echoed:
+    `encryption: "<key>"` inside `:s3`), and so is an unknown option, mode
+    or journal mode that could be a key.
+  * a statement that isn't text (options or a ring given in its place) is
+    refused with an error before a telemetry span names it, and
+    `Sediment.S3.flush/2` checks its timeout before its span starts:
+    telemetry handlers never see such a value (a span's exception event
+    carries the stack trace with its arguments);
+  * the options DBConnection reads are type-checked with fixed messages:
+    `Sediment.transaction/3`'s (`:timeout`, `:pool`, `:queue`, `:log`, ...)
+    and a pool's (`:pool_size`, `:pool`, `:queue_target`, `:backoff_type`,
+    ..., at `Sediment.start_link/1` and `child_spec/1`; a bad one failed in
+    the pool's process, with the value in its crash report).
+  `Sediment.transaction/3` runs DBConnection's setup and completion inside
+  the boundary and its function outside it: the function's results,
+  rollback reasons, exceptions, exits and throws reach the caller as they
+  are.
+* A transaction begun on a transaction the database rolled back (a
+  write-write conflict, `ON CONFLICT ROLLBACK`) and nobody ended:
+  * a savepoint (Ecto's SQL sandbox, in a test whose transaction the
+    database had rolled back) is refused with `{:error, %Sediment.Error{},
+    state}` ("the transaction was rolled back by the database ..."), the
+    connection kept, where the sandbox crashed on the `{:error, state}`
+    status;
+  * a new transaction (on a pooled connection checked in after a `BEGIN`
+    run as a query was aborted) ends it and begins, where DBConnection
+    disconnected.
+* With a `key_for` ring, every open and every rekey of a warm copy
+  (a clean close's) downloaded the whole database: the first round, which
+  asks `key_for` for the key, deleted the warm sidecar before it stopped.
+  The sidecar is now read first and deleted only once the open goes ahead,
+  so a `key_for` round, a rekey to the current key (`{:ok, :current}`) or
+  a release with nothing to drop keep the copy warm.
+* A pool (`Sediment.start_link/1`, `Sediment.child_spec/1`) and a
+  connection's state keep the `:encryption` option (and a `:key`, which
+  connections refuse) hidden: crash and
+  termination reports, `:sys.get_status/1` and `inspect` show
+  `#Sediment.S3.Keys.Hidden<redacted>`, never a key.
+* `Sediment.S3.restore/3`, `import/3`, `refresh/2`,
+  `Sediment.export_sqlite/3` and `Sediment.Engine.deserialize/3` ran turso on the dirty
+  scheduler's small stack: a schema with a deep expression (a `CHECK` of
+  90 chained additions) could overflow it and kill the VM. They now run
+  on turso's own stack, like opens and statements, and a turso panic is
+  returned as an error. `rekey/3` and `release_key/4` do the same.
+* `Sediment.Engine.open(path, mode: :readonly)` of an MVCC database with
+  rows in an `AUTOINCREMENT` table (a restored S3 copy, say) failed with
+  "attempt to write a readonly database": turso_core 0.8.3 rewrites each
+  such table's sequence when it opens the file. Such a file is now opened
+  read-write (never created) with `query_only`; the open needs write access
+  to the file and its log, and user data isn't changed.
+* `Sediment.S3.import/3` gave the rows of a table with an inline
+  `INTEGER PRIMARY KEY DESC` column new rowids: that column doesn't alias
+  the rowid, and the copy treated it as if it did. Every table's rowids are
+  now copied, and the import compares each table of the new database with
+  the source's (every row with its rowid) and refuses the import, naming
+  the tables, if one differs. A table with columns named `rowid`,
+  `_rowid_` and `oid` is refused.
+* `Sediment.S3.import/3` checks the new database's `AUTOINCREMENT`
+  sequences against the source's `sqlite_sequence` after the copy, and
+  refuses the import, naming the tables, if one is missing or behind.
+  sediment 0.1.0-beta.5 (turso_core 0.8.2) imported a sequence standing at
+  exactly 1 as never used, so the next insert reused id 1 and replaced the
+  row that had it; 0.1.0-beta.6 imports it correctly, and the check refuses
+  any future engine regression of that kind.
+
 ## 0.1.0-beta.6 (2026-10-21)
 
 ### Engine

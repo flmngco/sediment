@@ -7,6 +7,7 @@ mod import;
 mod incremental;
 mod reopen;
 mod replica;
+mod rotation;
 mod seaweed;
 mod warm;
 
@@ -1370,7 +1371,9 @@ fn restoring_before_the_database_existed_is_an_error() {
     let db = open_db(&cfg, &dir.db("a.db")).unwrap();
     db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
     match super::restore_to(&cfg, &dir.db("old.db"), Target::Time(before)) {
-        Err(S3Error::Config(msg)) => assert!(msg.contains("not retained"), "{msg}"),
+        Err(S3Error::Config(msg)) => {
+            assert!(msg.contains("is not covered by a retained epoch"), "{msg}")
+        }
         other => panic!("unexpected {other:?}"),
     }
     assert!(!dir.db("old.db").exists());
@@ -1616,16 +1619,39 @@ fn a_commit_waiting_on_s3_gives_up_when_cancelled() {
     db.exec("INSERT INTO t VALUES (2)").unwrap();
 }
 
-fn encryption(key_byte: &str) -> turso_core::EncryptionOpts {
-    turso_core::EncryptionOpts {
-        cipher: "aegis256".into(),
-        hexkey: key_byte.repeat(32),
-    }
+/// A key ring of one key, id "default", whose bytes are all `key_byte`.
+fn encryption(key_byte: &str) -> super::KeyRing {
+    super::KeyRing::single(key(key_byte))
+}
+
+/// The aegis256 key whose bytes are all `key_byte`, id "default".
+fn key(key_byte: &str) -> super::Key {
+    key_as("default", key_byte)
+}
+
+fn key_as(id: &str, key_byte: &str) -> super::Key {
+    super::Key::new(id, "aegis256", &key_byte.repeat(32)).unwrap()
+}
+
+/// A ring of `(id, key byte)`, the first one active.
+fn ring(keys: &[(&str, &str)]) -> super::KeyRing {
+    super::KeyRing::new(
+        keys.iter().map(|(id, byte)| key_as(id, byte)).collect(),
+        None,
+        false,
+    )
+    .unwrap()
+}
+
+/// What turso opens the file with for the key `key_byte`.
+fn opts(key_byte: &str) -> turso_core::EncryptionOpts {
+    key(key_byte).opts()
 }
 
 fn open_encrypted(cfg: &S3Config, path: &Path) -> Result<Db, S3Error> {
     let storage = prepare(cfg, path)?;
-    Ok(open_with_encryption(storage, path, cfg.encryption.as_ref()))
+    let key = storage.encryption().map(super::Key::opts);
+    Ok(open_with_encryption(storage, path, key.as_ref()))
 }
 
 #[test]
@@ -1675,7 +1701,10 @@ fn encrypted_databases_are_encrypted_at_rest_and_need_the_key() {
     let mut wrong = cfg.clone();
     wrong.encryption = Some(encryption("cd"));
     match open_encrypted(&wrong, &dir.db("c.db")) {
-        Err(S3Error::Config(msg)) => assert!(msg.contains("wrong key"), "{msg}"),
+        Err(S3Error::Config(msg)) => assert!(
+            msg.contains("key default in the ring is not the key that encrypted this database"),
+            "{msg}"
+        ),
         Err(other) => panic!("unexpected error {other}"),
         Ok(_) => panic!("a wrong key must not open"),
     }
@@ -1683,8 +1712,7 @@ fn encrypted_databases_are_encrypted_at_rest_and_need_the_key() {
     none.encryption = None;
     assert!(open_encrypted(&none, &dir.db("d.db")).is_err());
 
-    // The failed opens began taking the database over; a restore waits for
-    // a writer to finish that, which a successful open does.
+    // The wrong keys were refused before the takeover.
     open_encrypted(&cfg, &dir.db("e.db")).unwrap().crash();
     // Point-in-time restore needs the key too.
     super::restore_to(&cfg, &dir.db("copy.db"), Target::Latest).unwrap();
@@ -1762,7 +1790,7 @@ fn a_key_on_an_unencrypted_prefix_is_refused_and_writes_nothing() {
     db.exec("CREATE TABLE t(x)").unwrap();
     db.exec("INSERT INTO t VALUES (1)").unwrap();
     drop(db);
-    assert_eq!(manifest(&store).encrypted, Some(false));
+    assert_eq!(manifest(&store).key, None);
     let remote = Remote::new(store.clone(), PREFIX);
     let before = remote.get(MANIFEST_KEY).unwrap().unwrap().bytes;
 
@@ -1781,58 +1809,6 @@ fn a_key_on_an_unencrypted_prefix_is_refused_and_writes_nothing() {
     assert_eq!(db.int("SELECT count(*) FROM t"), 1);
 }
 
-/// Strips `encrypted` from the manifest, as manifests from before it was
-/// always written are.
-fn forget_encryption(store: &Arc<FaultyStore>) {
-    let remote = Remote::new(store.clone(), PREFIX);
-    let mut m = manifest(store);
-    m.encrypted = None;
-    remote
-        .put(MANIFEST_KEY, m.encode(), Put::Overwrite)
-        .unwrap();
-}
-
-#[test]
-fn an_unrecorded_encryption_is_recorded_only_by_an_open_that_reads_the_database() {
-    // Unencrypted, not recorded: a key fails without marking it encrypted.
-    let store = FaultyStore::new();
-    let dir = TempDir::new();
-    let plain = config(&store, "a");
-    let db = open_db(&plain, &dir.db("a.db")).unwrap();
-    db.exec("CREATE TABLE t(x)").unwrap();
-    db.exec("INSERT INTO t VALUES (1)").unwrap();
-    drop(db);
-    forget_encryption(&store);
-    let mut keyed = plain.clone();
-    keyed.unencrypted = false;
-    keyed.encryption = Some(encryption("ab"));
-    assert!(open_encrypted(&keyed, &dir.db("b.db")).is_err());
-    assert_eq!(manifest(&store).encrypted, None);
-    let db = open_db(&plain, &dir.db("c.db")).unwrap();
-    assert_eq!(db.int("SELECT count(*) FROM t"), 1);
-    drop(db);
-    assert_eq!(manifest(&store).encrypted, Some(false));
-
-    // Encrypted, not recorded: no key fails without marking it unencrypted;
-    // the key opens it and records it.
-    let store = FaultyStore::new();
-    let mut keyed = config(&store, "a");
-    keyed.unencrypted = false;
-    keyed.encryption = Some(encryption("ab"));
-    let db = open_encrypted(&keyed, &dir.db("d.db")).unwrap();
-    db.exec("CREATE TABLE t(x)").unwrap();
-    db.exec("INSERT INTO t VALUES (1)").unwrap();
-    drop(db);
-    forget_encryption(&store);
-    let plain = config(&store, "a");
-    assert!(open_db(&plain, &dir.db("e.db")).is_err());
-    assert_eq!(manifest(&store).encrypted, None);
-    let db = open_encrypted(&keyed, &dir.db("f.db")).unwrap();
-    assert_eq!(db.int("SELECT count(*) FROM t"), 1);
-    drop(db);
-    assert_eq!(manifest(&store).encrypted, Some(true));
-}
-
 #[test]
 fn a_second_open_of_a_database_open_here_needs_the_same_encryption() {
     use crate::s3::check_same_encryption;
@@ -1846,11 +1822,11 @@ fn a_second_open_of_a_database_open_here_needs_the_same_encryption() {
     upper.encryption = Some(encryption("AB"));
     let mut wrong = unset.clone();
     wrong.encryption = Some(encryption("cd"));
-    let ab = encryption("ab");
+    let ab = key("ab");
     assert!(check_same_encryption(Some(&ab), &keyed).is_ok());
     assert!(check_same_encryption(Some(&ab), &upper).is_ok());
     for (cfg, needle) in [
-        (&wrong, "another :encryption key"),
+        (&wrong, "is not the key that encrypted this database"),
         (&unset, "is encrypted"),
         (&plain, "is encrypted"),
     ] {

@@ -7,6 +7,10 @@ defmodule Sediment.Engine do
   See the README section "Differences from exqlite".
   """
 
+  # Every public function runs in the key-scrubbing boundary
+  # (Sediment.S3.Keys.Sealed).
+  use Sediment.S3.Keys.Sealed
+
   alias Sediment.Native
 
   @type db() :: reference()
@@ -18,7 +22,7 @@ defmodule Sediment.Engine do
   @type open_opt ::
           {:mode, :readwrite | :readonly | :create | [open_mode()]}
           | {:journal_mode, journal_mode() | String.t()}
-          | {:encryption, [cipher: String.t(), key: String.t()] | false}
+          | {:encryption, Sediment.S3.encryption()}
           | {:experimental, [atom()]}
           | {:s3, keyword() | map()}
           | {:mvcc_checkpoint_threshold, non_neg_integer() | nil}
@@ -34,6 +38,9 @@ defmodule Sediment.Engine do
       Defaults to `[:readwrite, :create]` (opens for reading and writing and
       creates the file if it does not exist). `:readwrite` alone does not
       create the file. `:nomutex` is accepted for compatibility and ignored.
+      `:readonly` opens an MVCC database with `AUTOINCREMENT` rows
+      read-write with `query_only`: turso_core 0.8.3 writes their sequences
+      when it opens one (see the README).
 
     * `:journal_mode` - journal mode applied right after opening, for
       example `:wal` or `:mvcc`. MVCC is required for `BEGIN CONCURRENT`
@@ -43,8 +50,9 @@ defmodule Sediment.Engine do
 
     * `:encryption` - `[cipher: "aegis256", key: "<hex key>"]` opens an
       encrypted database (turso extension). With `:s3` it is required:
-      a key, or `false` to store the database unencrypted (see
-      `Sediment.S3`).
+      a key (or a key ring, see "Encryption" in `Sediment.S3`), or `false`
+      to store the database unencrypted. A database without `:s3` opens
+      with the ring's active key.
 
     * `:experimental` - list of experimental turso features to enable, such
       as `:attach`, `:views`, `:vacuum`, `:generated_columns`,
@@ -62,11 +70,39 @@ defmodule Sediment.Engine do
   """
   @spec open(String.t(), [open_opt()]) :: {:ok, db()} | {:error, reason()}
   def open(path, opts \\ []) do
-    mode = opts[:mode] || [:readwrite, :create]
+    # Its options hold keys and S3 credentials: see Sediment.S3.Keys.scrubbed/1.
+    Sediment.S3.Keys.scrubbed(fn -> do_open(path, opts) end)
+  end
 
-    with {:ok, conn} <- Native.open(path, native_open_opts(mode, opts)) do
+  defp do_open(path, opts) do
+    opts = Sediment.S3.Keys.options!(opts, "Sediment.Engine.open/2")
+    mode = opts[:mode] || [:readwrite, :create]
+    ring = Sediment.S3.Keys.normalize(opts[:encryption])
+
+    open = fn ring ->
+      after_opens(fn -> Native.open(path, native_open_opts(mode, opts, ring)) end)
+    end
+
+    with {:ok, conn} <- Sediment.S3.Keys.run(ring, open) do
       if opts[:s3], do: flush_s3_at_exit()
       set_mvcc_checkpoint_threshold(conn, opts)
+    end
+  end
+
+  # Opens of a file are serialized, but never by waiting inside the NIF (it
+  # would hold a dirty I/O scheduler, and an S3 open restores for as long as
+  # the download takes): while another open of the file runs, the NIF
+  # returns {:error, :opening} and this process waits and tries again. While
+  # a rekey, key release, restore or import holds the file, the open fails
+  # at once with a "busy: ..." error (a pool's backoff retries it).
+  defp after_opens(open, wait \\ 1) do
+    case open.() do
+      {:error, :opening} ->
+        Process.sleep(wait)
+        after_opens(open, min(wait * 2, 50))
+
+      result ->
+        result
     end
   end
 
@@ -112,14 +148,14 @@ defmodule Sediment.Engine do
     end
   end
 
-  defp native_open_opts(mode, opts) do
+  defp native_open_opts(mode, opts, ring) do
     modes = modes_from_mode(mode)
 
     %{
       readonly: :readonly in modes,
       create: :create in modes,
       journal_mode: journal_mode(opts[:journal_mode]),
-      encryption: encryption(opts[:encryption]),
+      encryption: ring,
       experimental: Enum.map(opts[:experimental] || [], &to_string/1),
       s3: Sediment.S3.with_encryption_choice(opts[:s3], opts[:encryption])
     }
@@ -127,10 +163,6 @@ defmodule Sediment.Engine do
 
   defp journal_mode(nil), do: nil
   defp journal_mode(mode), do: mode |> to_string() |> String.downcase()
-
-  defp encryption(nil), do: nil
-  defp encryption(false), do: nil
-  defp encryption(opts), do: %{cipher: to_string(opts[:cipher]), key: to_string(opts[:key])}
 
   defp modes_from_mode(:nomutex) do
     raise ArgumentError,
@@ -144,7 +176,7 @@ defmodule Sediment.Engine do
 
   defp modes_from_mode(mode) do
     raise ArgumentError,
-          "expected mode to be `:readwrite`, `:readonly` or list of modes, but received #{inspect(mode)}"
+          "expected mode to be `:readwrite`, `:readonly` or list of modes, but received #{shown_mode(mode)}"
   end
 
   defp validate_modes(modes) do
@@ -154,11 +186,14 @@ defmodule Sediment.Engine do
 
       mode ->
         raise ArgumentError,
-              "expected mode to be `:readwrite`, `:readonly`, `:nomutex` or `:create`, but received #{inspect(mode)}"
+              "expected mode to be `:readwrite`, `:readonly`, `:nomutex` or `:create`, but received #{shown_mode(mode)}"
     end)
 
     modes
   end
+
+  # A mode as messages show it: never a key given in the wrong place.
+  defp shown_mode(mode), do: Sediment.S3.Keys.shown_value(mode)
 
   @doc """
   Closes the database and releases any underlying resources.
@@ -355,7 +390,7 @@ defmodule Sediment.Engine do
 
       if args_count != params_count do
         raise ArgumentError,
-              "expected #{params_count} named arguments, got #{args_count}: #{inspect(Map.keys(args))}"
+              "expected #{params_count} named arguments, got #{args_count}: #{Enum.map_join(Map.keys(args), ", ", &Sediment.S3.Keys.shown_value/1)}"
       end
 
       :ok = Native.bind_all(stmt, [])
@@ -396,7 +431,7 @@ defmodule Sediment.Engine do
     idx = Native.bind_parameter_index(stmt, to_string(name))
 
     if idx == 0 do
-      raise ArgumentError, "unknown named parameter: #{inspect(name)}"
+      raise ArgumentError, "unknown named parameter: #{Sediment.S3.Keys.shown_value(name)}"
     end
 
     stmt |> Native.bind_value_at(idx, normalize(param)) |> raise_on_bind_error()
@@ -452,7 +487,7 @@ defmodule Sediment.Engine do
       a when is_atom(a) -> Atom.to_string(a)
       {:blob, b} when is_binary(b) -> {:blob, b}
       {:blob, b} when is_list(b) -> {:blob, IO.iodata_to_binary(b)}
-      _other -> raise ArgumentError, "unsupported type: #{inspect(param)}"
+      _other -> raise ArgumentError, "unsupported type: #{Sediment.S3.Keys.shown_value(param)}"
     end
   end
 
@@ -651,7 +686,9 @@ defmodule Sediment.Engine do
   """
   @spec bind_text(statement, non_neg_integer, String.t()) :: :ok
   def bind_text(stmt, index, text) when is_binary(text), do: bind_at(stmt, index, text)
-  def bind_text(_stmt, _index, text), do: raise(ArgumentError, "argument error: #{inspect(text)}")
+
+  def bind_text(_stmt, _index, text),
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(text)}")
 
   @doc """
   Binds a blob value to a prepared statement.
@@ -664,7 +701,9 @@ defmodule Sediment.Engine do
   """
   @spec bind_blob(statement, non_neg_integer, binary) :: :ok
   def bind_blob(stmt, index, blob) when is_binary(blob), do: bind_at(stmt, index, {:blob, blob})
-  def bind_blob(_stmt, _index, blob), do: raise(ArgumentError, "argument error: #{inspect(blob)}")
+
+  def bind_blob(_stmt, _index, blob),
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(blob)}")
 
   @doc """
   Binds an integer value to a prepared statement.
@@ -680,7 +719,7 @@ defmodule Sediment.Engine do
     do: bind_at(stmt, index, integer)
 
   def bind_integer(_stmt, _index, integer),
-    do: raise(ArgumentError, "argument error: #{inspect(integer)}")
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(integer)}")
 
   @doc """
   Binds a float value to a prepared statement.
@@ -695,7 +734,7 @@ defmodule Sediment.Engine do
   def bind_float(stmt, index, float) when is_float(float), do: bind_at(stmt, index, float)
 
   def bind_float(_stmt, _index, float),
-    do: raise(ArgumentError, "argument error: #{inspect(float)}")
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(float)}")
 
   @doc """
   Binds a null value to a prepared statement.
@@ -717,7 +756,8 @@ defmodule Sediment.Engine do
     end
   end
 
-  defp bind_at(stmt, _index, _value), do: raise(ArgumentError, "argument error: #{inspect(stmt)}")
+  defp bind_at(stmt, _index, _value),
+    do: raise(ArgumentError, "argument error: #{Sediment.S3.Keys.shown_value(stmt)}")
 
   defp convert(%Date{} = val), do: Date.to_iso8601(val)
   defp convert(%Time{} = val), do: Time.to_iso8601(val)
@@ -725,7 +765,8 @@ defmodule Sediment.Engine do
   defp convert(%DateTime{time_zone: "Etc/UTC"} = val), do: NaiveDateTime.to_iso8601(val)
 
   defp convert(%DateTime{} = datetime) do
-    raise ArgumentError, "#{inspect(datetime)} is not in UTC"
+    raise ArgumentError,
+          "a DateTime in #{Sediment.S3.Keys.shown_value(datetime.time_zone)} is not in UTC"
   end
 
   defp convert(val) do
@@ -745,7 +786,8 @@ defmodule Sediment.Engine do
 
       {:error, reason} ->
         raise ArgumentError,
-              "Failed conversion by TypeExtension #{extension}: #{inspect(val)}. Reason: #{inspect(reason)}."
+              "Failed conversion by TypeExtension #{extension}: #{Sediment.S3.Keys.shown_value(val)}. " <>
+                "Reason: #{Sediment.S3.Keys.shown_value(reason)}."
     end
   end
 

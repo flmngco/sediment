@@ -25,4 +25,10 @@ rustler::atoms! {
     key,
     experimental,
     s3,
+    keys,
+    active,
+    resolvable,
+    key_needed,
+    indeterminate,
+    opening,
 }

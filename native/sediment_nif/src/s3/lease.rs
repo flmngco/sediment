@@ -38,10 +38,10 @@ impl Lease {
         Self::acquire_unless_held(remote, owner, ttl, move |current| current.owner != ours)
     }
 
-    /// Takes the lease for a destroy: unlike an open, it refuses any
-    /// unexpired lease, this owner's too (that may be a writer of this
-    /// database still running), unless `force`.
-    pub fn acquire_to_destroy(
+    /// Takes the lease for a destroy, a rekey or a key release: unlike an
+    /// open, it refuses any unexpired lease, this owner's too (that may be a
+    /// writer of this database still running), unless `force`.
+    pub fn acquire_exclusive(
         remote: Remote,
         owner: String,
         ttl: Duration,
@@ -262,6 +262,13 @@ impl Lease {
     #[cfg(test)]
     pub(crate) fn stop_renewer_for_test(&self) {
         self.stop_renewer();
+    }
+
+    /// A crash, for tests (see `super::hook`): the renewer stops and the
+    /// lease stays taken until it expires; dropping it releases nothing.
+    pub(crate) fn abandon(&self) {
+        self.stop_renewer();
+        self.state.lock().unwrap().released = true;
     }
 
     fn stop_renewer(&self) {

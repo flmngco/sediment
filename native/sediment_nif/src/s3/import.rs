@@ -18,9 +18,9 @@ use turso_core::{Connection, EncryptionOpts, Value};
 use super::layout::{ManifestState, MANIFEST_KEY};
 use super::lease::Lease;
 use super::{
-    check_no_old_objects, create_database, default_owner, live_storage, open_local, probe, purge,
-    refuse_newer, require_encryption_choice, restore, snapshot::Digests, with_local_connection,
-    Result, S3Config, S3Error,
+    check_no_old_objects, create_database, default_owner, keys::Key, live_storage,
+    new_database_key, open_local, probe, purge, refuse_newer, require_encryption_choice, restore,
+    snapshot::Digests, with_local_connection, Result, S3Config, S3Error,
 };
 
 /// What [`import`] checks once the database is in S3.
@@ -97,6 +97,13 @@ fn autoincrement_checkpoint_rows() -> u64 {
     AUTOINCREMENT_CHECKPOINT_ROWS
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: a statement run on the copy before it is checked, standing
+    /// for an engine bug.
+    pub static DAMAGE_COPY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
 fn autoincrement_batch_rows() -> u64 {
     #[cfg(test)]
     if let Some(rows) = AUTOINCREMENT_BATCH_OVERRIDE.with(|o| o.get()) {
@@ -125,6 +132,8 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     }
     let remote = cfg.remote()?;
     require_encryption_choice(cfg, &remote)?;
+    // Before anything is copied: a key_for ring may lack it.
+    let key = new_database_key(cfg)?;
     // turso keeps a symlinked database's log next to the file it points to.
     let source = &std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     // The source's log is copied with it: it must be the source's own.
@@ -140,7 +149,7 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     let copied = copy_database(
         &work,
         opts.source_encryption.as_ref(),
-        cfg.encryption.as_ref(),
+        key.as_ref().map(Key::opts).as_ref(),
     )?;
     let converted = Digests::of_file(&work.db)?;
     if converted.size > MAX_SNAPSHOT_BYTES {
@@ -171,7 +180,7 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
     let over = over
         .as_ref()
         .map(|(tombstone, version)| (tombstone, version.clone()));
-    let manifest = match create_database(&remote, cfg, generation, owner, &work.db, over) {
+    let manifest = match create_database(&remote, key.as_ref(), generation, owner, &work.db, over) {
         Ok((manifest, _, _)) => manifest,
         Err(S3Error::Conflict(_)) => return Err(already_holds(cfg)),
         // The answer to the manifest PUT may be what got lost: the manifest
@@ -195,6 +204,7 @@ fn import_from(cfg: &S3Config, source: &Path, opts: &ImportOptions) -> Result<Im
         )));
     }
     if opts.verify == Verify::Restore {
+        let remote = remote.clone().for_key(key.as_ref())?;
         restore::restore(&remote, &manifest, &work.restored, cfg.download_concurrency)?;
         let restored = Digests::of_file(&work.restored)?;
         if (restored.size, restored.crc32c) != (converted.size, converted.crc32c) {
@@ -267,7 +277,7 @@ fn check_source(source: &Path) -> Result<u64> {
 }
 
 #[cfg(unix)]
-fn check_free_space(path: &Path, needed: u64) -> Result<()> {
+pub(crate) fn check_free_space(path: &Path, needed: u64) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let dir = path.parent().unwrap_or(Path::new("."));
     let dir = if dir.as_os_str().is_empty() {
@@ -296,7 +306,7 @@ fn check_free_space(path: &Path, needed: u64) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn check_free_space(_path: &Path, _needed: u64) -> Result<()> {
+pub(crate) fn check_free_space(_path: &Path, _needed: u64) -> Result<()> {
     Ok(())
 }
 
@@ -344,7 +354,9 @@ struct Object {
 /// MVCC doesn't support, and copies it into a new MVCC database at
 /// `work.db`: tables, their rows (rowids kept), AUTOINCREMENT sequences,
 /// then indexes, views and triggers (so no trigger fires and no index slows
-/// the copy). Checks row counts and integrity at the end.
+/// the copy). Checks at the end, on the new database reopened: integrity,
+/// every table's rows with their rowids against the source's, and every
+/// carried sequence; any difference refuses the import.
 fn copy_database(
     work: &Work,
     source_key: Option<&EncryptionOpts>,
@@ -419,6 +431,9 @@ fn copy_database(
         rows: 0,
         sequences_not_advanced: Vec::new(),
     };
+    // AUTOINCREMENT tables whose sequence the copy must carry: (table, its
+    // INTEGER PRIMARY KEY, the source's sequence).
+    let mut carried: Vec<(String, String, i64)> = Vec::new();
     let tables: Vec<&Object> = objects.iter().filter(|o| o.kind == "table").collect();
     for table in &tables {
         dst.execute(&table.sql).map_err(copy_err)?;
@@ -427,8 +442,13 @@ fn copy_database(
         let columns =
             rows(&src, &format!("PRAGMA table_info({})", ident(&table.name))).map_err(refuse)?;
         let names: Vec<String> = columns.iter().map(|c| text(&c[1])).collect();
-        // A single INTEGER PRIMARY KEY column is the rowid; otherwise the
-        // rowid is copied explicitly.
+        // The rowid is always copied explicitly: whether a column aliases it
+        // depends on more than its type (an inline INTEGER PRIMARY KEY DESC
+        // doesn't), and naming both an alias and the rowid with the same
+        // value stores it once.
+        let rowid = rowid_name(&table.name, &names)?;
+        // The AUTOINCREMENT column, for the sequence (AUTOINCREMENT is only
+        // allowed on a rowid alias).
         let pks: Vec<&Vec<Value>> = columns
             .iter()
             .filter(|c| int(&c[5]).unwrap_or(0) > 0)
@@ -437,12 +457,8 @@ fn copy_database(
             [pk] if text(&pk[2]).eq_ignore_ascii_case("INTEGER") => Some(text(&pk[1])),
             _ => None,
         };
-        let mut select_cols: Vec<String> = names.iter().map(|n| ident(n)).collect();
-        if alias.is_none() {
-            select_cols.insert(0, "rowid".into());
-        }
-        let list = select_cols.join(", ");
-        let marks = vec!["?"; select_cols.len()].join(", ");
+        let list = column_list(rowid, &names);
+        let marks = vec!["?"; names.len() + 1].join(", ");
         let (batch, checkpoint) = if table.sql.to_ascii_uppercase().contains("AUTOINCREMENT") {
             (autoincrement_batch_rows(), autoincrement_checkpoint_rows())
         } else {
@@ -473,7 +489,9 @@ fn copy_database(
             )));
         }
         if let (Some(&seq), Some(alias)) = (sequences.get(&table.name), &alias) {
-            if !advance_sequence(&dst, &table.name, alias, &columns, seq).map_err(copy_err)? {
+            if advance_sequence(&dst, &table.name, alias, &columns, seq).map_err(copy_err)? {
+                carried.push((table.name.clone(), alias.clone(), seq));
+            } else {
                 copied.sequences_not_advanced.push(table.name.clone());
             }
         }
@@ -486,6 +504,16 @@ fn copy_database(
     if user_version != 0 {
         dst.execute(format!("PRAGMA user_version = {user_version}"))
             .map_err(copy_err)?;
+    }
+    // Each table's (rowid, row) digest, compared with the new database's
+    // below: equal counts and integrity don't show a row with another rowid.
+    let mut digests = Vec::new();
+    for table in &tables {
+        digests.push(table_digest(&src, &table.name).map_err(refuse)?);
+    }
+    #[cfg(test)]
+    if let Some(sql) = DAMAGE_COPY.with(|d| d.get()) {
+        dst.execute(sql).map_err(copy_err)?;
     }
     dst.close().map_err(copy_err)?;
     src.close().map_err(refuse)?;
@@ -510,7 +538,169 @@ fn copy_database(
             check.join("; ")
         )));
     }
+    let mut differ = Vec::new();
+    let mut wrong = Vec::new();
+    with_local_connection(&work.db, target_key, |conn| {
+        for (table, digest) in tables.iter().zip(&digests) {
+            if table_digest(conn, &table.name)? != *digest {
+                differ.push(table.name.clone());
+            }
+        }
+        wrong = wrong_sequences(conn, &carried)?;
+        Ok(())
+    })?;
+    if !differ.is_empty() {
+        return Err(refuse(format!(
+            "the rows of {} in the new database (with their rowids) differ from the \
+             source's (nothing was imported)",
+            differ.join(", ")
+        )));
+    }
+    if !wrong.is_empty() {
+        return Err(refuse(format!(
+            "the new database's AUTOINCREMENT sequences don't match the source's, so ids \
+             could be handed out again (a turso_core bug; nothing was imported): {}",
+            wrong.join("; ")
+        )));
+    }
     Ok(copied)
+}
+
+/// A name for the rowid of a table with these columns: `rowid`, `_rowid_`
+/// or `oid`, the first a column doesn't shadow.
+fn rowid_name(table: &str, columns: &[String]) -> Result<&'static str> {
+    ["rowid", "_rowid_", "oid"]
+        .into_iter()
+        .find(|name| !columns.iter().any(|c| c.eq_ignore_ascii_case(name)))
+        .ok_or_else(|| {
+            refuse(format!(
+                "{table} has columns named rowid, _rowid_ and oid, so its rowids can't be \
+                 read to copy them"
+            ))
+        })
+}
+
+/// The rowid (by the name `rowid_name` chose), then every column.
+fn column_list(rowid: &str, columns: &[String]) -> String {
+    std::iter::once(rowid.to_string())
+        .chain(columns.iter().map(|c| ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// SHA-256 over a table's rows in rowid order, each its rowid then its
+/// columns' values (type and exact bytes), and the row count.
+fn table_digest(conn: &Arc<Connection>, table: &str) -> turso_core::Result<(u64, Vec<u8>)> {
+    let columns = rows(conn, &format!("PRAGMA table_info({})", ident(table)))?;
+    let names: Vec<String> = columns.iter().map(|c| text(&c[1])).collect();
+    let rowid = rowid_name(table, &names)
+        .map_err(|err| turso_core::LimboError::InternalError(err.to_string()))?;
+    let mut stmt = conn.prepare(format!(
+        "SELECT {} FROM {} ORDER BY {rowid}",
+        column_list(rowid, &names),
+        ident(table)
+    ))?;
+    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    let mut count = 0u64;
+    stmt.run_with_row_callback(|row| {
+        for value in row.get_values() {
+            match value {
+                Value::Null => hash.update(&[0]),
+                Value::Numeric(turso_core::Numeric::Integer(i)) => {
+                    hash.update(&[1]);
+                    hash.update(&i.to_le_bytes());
+                }
+                Value::Numeric(turso_core::Numeric::Float(f)) => {
+                    hash.update(&[2]);
+                    hash.update(&f64::from(*f).to_bits().to_le_bytes());
+                }
+                Value::Text(t) => {
+                    hash.update(&[3]);
+                    hash.update(&(t.as_str().len() as u64).to_le_bytes());
+                    hash.update(t.as_str().as_bytes());
+                }
+                Value::Blob(b) => {
+                    hash.update(&[4]);
+                    hash.update(&(b.len() as u64).to_le_bytes());
+                    hash.update(b);
+                }
+            }
+        }
+        count += 1;
+        Ok(())
+    })?;
+    Ok((count, hash.finish().as_ref().to_vec()))
+}
+
+/// The `carried` tables whose sequence the new database (freshly opened)
+/// doesn't hold: its `sqlite_sequence` must stand at the source's value (or
+/// at the largest id, if the source's stood below it), and turso's own
+/// sequence, which hands out the ids in MVCC, must be past it.
+fn wrong_sequences(
+    conn: &Arc<Connection>,
+    carried: &[(String, String, i64)],
+) -> turso_core::Result<Vec<String>> {
+    let mut wrong = Vec::new();
+    for (table, alias, seq) in carried {
+        let name = table.replace('\'', "''");
+        let largest = rows(
+            conn,
+            &format!("SELECT max({}) FROM {}", ident(alias), ident(table)),
+        )?
+        .first()
+        .and_then(|row| int(&row[0]))
+        .unwrap_or(0);
+        let want = largest.max(*seq);
+        let copy: Vec<i64> = rows(
+            conn,
+            &format!("SELECT seq FROM sqlite_sequence WHERE name = '{name}'"),
+        )?
+        .iter()
+        .filter_map(|row| int(&row[0]))
+        .collect();
+        if copy != [want] {
+            let copy = match copy.as_slice() {
+                [] => "none".to_string(),
+                values => values
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            wrong.push(format!(
+                "{table} (sqlite_sequence {copy} in the copy, {want} wanted)"
+            ));
+            continue;
+        }
+        let backing = format!("__turso_internal_seq___turso_internal_autoincrement_{table}");
+        let exists = !rows(
+            conn,
+            &format!(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '{}'",
+                backing.replace('\'', "''")
+            ),
+        )?
+        .is_empty();
+        if !exists {
+            continue;
+        }
+        let next = rows(
+            conn,
+            &format!(
+                "SELECT value, is_called FROM {} ORDER BY value DESC LIMIT 1",
+                ident(&backing)
+            ),
+        )?
+        .first()
+        .and_then(|row| Some(int(&row[0])? + i64::from(int(&row[1]).unwrap_or(0) != 0)))
+        .unwrap_or(1);
+        if next <= want {
+            wrong.push(format!(
+                "{table} (the next id would be {next}, ids up to {want} were used)"
+            ));
+        }
+    }
+    Ok(wrong)
 }
 
 /// Opens the source copy: with `key` when it is encrypted, plaintext

@@ -162,8 +162,9 @@ pub struct S3DurableStorage {
     /// Set when Drop has finished (lease released, sidecar written): until
     /// then a new open of the file waits (see `super::wait_while_closing`).
     gone: Arc<AtomicBool>,
-    /// The key it was opened with: another open must give the same.
-    encryption: Option<turso_core::EncryptionOpts>,
+    /// The key the database is under (resolved by the open from its ring):
+    /// another open's ring must hold the same.
+    encryption: Option<super::keys::Key>,
     retain_epochs: usize,
     group_commit: bool,
     incremental_snapshots: bool,
@@ -193,6 +194,7 @@ impl std::fmt::Debug for S3DurableStorage {
 }
 
 impl S3DurableStorage {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: Storage,
         remote: Remote,
@@ -201,6 +203,7 @@ impl S3DurableStorage {
         db_path: PathBuf,
         (manifest, manifest_version): (Manifest, UpdateVersion),
         snapshot_digests: Option<(String, Digests)>,
+        key: Option<super::keys::Key>,
     ) -> Self {
         let poison_slot = PoisonSlot::default();
         let view = StateView {
@@ -224,7 +227,7 @@ impl S3DurableStorage {
             place: cfg.place(),
             attached: std::sync::atomic::AtomicUsize::new(0),
             gone: Arc::default(),
-            encryption: cfg.encryption.clone(),
+            encryption: key,
             retain_epochs: cfg.retain_epochs,
             group_commit: cfg.group_commit,
             incremental_snapshots: cfg.incremental_snapshots,
@@ -331,8 +334,8 @@ impl S3DurableStorage {
         &self.settings
     }
 
-    /// The encryption it was opened with.
-    pub fn encryption(&self) -> Option<&turso_core::EncryptionOpts> {
+    /// The key the database is under.
+    pub fn encryption(&self) -> Option<&super::keys::Key> {
         self.encryption.as_ref()
     }
 
@@ -908,12 +911,21 @@ impl S3DurableStorage {
         if self.incremental_snapshots {
             state.snapshot_digests = Some((published.key.clone(), published.digests.clone()));
         }
+        // The new epoch starts at the store's time of the seal that closed
+        // the manifest's epoch (see `Manifest::advance`).
+        // Never the writer's clock: a pending snapshot always has a seal.
+        let (sealed, end) = state
+            .seal
+            .ok_or_else(|| S3Error::Corrupt("a snapshot to publish without a seal".into()))?;
+        let boundary = self.remote.boundary(&sealed.segment_key(end))?;
         let manifest = state.manifest.advance(
             state.epoch,
             &published,
             generation,
             self.lease.owner(),
             self.retain_epochs,
+            state.manifest.key.clone(),
+            boundary,
         );
         state.unconfirmed_manifests.push(manifest.clone());
         match self.remote.put(
@@ -1348,7 +1360,7 @@ impl S3DurableStorage {
         }
         let generation = self.lease.generation();
         let log_offset = self.inner.logical_log_offset();
-        let encryption = self.encryption.clone();
+        let key = self.encryption.clone();
         let log_encryption = self.remote.log_encryption();
         let Ok(state) = self.state.get_mut() else {
             return;
@@ -1361,7 +1373,7 @@ impl S3DurableStorage {
             manifest: &state.manifest,
             generation,
             log_offset,
-            encryption: encryption.as_ref(),
+            key: key.as_ref(),
             log_encryption,
         };
         if let Err(err) = super::warm::write(&closing) {

@@ -388,7 +388,7 @@ defmodule Sediment.S3Test do
     refused = fn ->
       for opts <- [[], [encryption: false], [encryption: wrong]] do
         assert {:error, message} = Engine.open(path.("r.db"), [s3: replica] ++ opts)
-        assert message =~ "is encrypted" or message =~ "another :encryption key", message
+        assert message =~ "is encrypted" or message =~ "not the key that encrypted", message
       end
     end
 
@@ -535,6 +535,112 @@ defmodule Sediment.S3Test do
     {:ok, db} = Engine.open(Path.join(dir, "restored.db"), s3: s3)
     assert count(db, "b") == 12
     :ok = Engine.close(db)
+  end
+
+  defp rows(db, sql) do
+    {:ok, stmt} = Engine.prepare(db, sql)
+    {:ok, rows} = Engine.fetch_all(db, stmt)
+    :ok = Engine.release(db, stmt)
+    rows
+  end
+
+  # sediment 0.1.0-beta.5 (turso_core 0.8.2) imported every sequence standing
+  # at exactly 1 as never used: sqlite_sequence came out empty and the next
+  # insert got id 1 again, replacing the row that had it. A rekey by copy
+  # hit it: restore under the old key, import under the new one.
+  test "import/3 carries AUTOINCREMENT sequences, one at exactly 1 included", %{
+    s3: s3,
+    prefix: prefix,
+    dir: dir
+  } do
+    old = [cipher: "aegis256", key: S3.generate_key()]
+    new = [cipher: "aegis256", key: S3.generate_key()]
+    schema = "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)"
+
+    for {inserted, deleted} <- [{1, 0}, {1, 1}, {2, 0}, {2, 2}, {3, 1}],
+        source <- [:wal, :mvcc, :restored] do
+      tag = "#{inserted}-#{deleted}-#{source}"
+      live = Path.join(dir, "live-#{tag}.db")
+      live_s3 = s3 |> Keyword.delete(:encryption) |> Keyword.put(:prefix, "#{prefix}/live-#{tag}")
+
+      {:ok, db} =
+        case source do
+          :wal -> Engine.open(live, journal_mode: :wal)
+          :mvcc -> Engine.open(live, journal_mode: :mvcc)
+          :restored -> Engine.open(live, s3: live_s3, encryption: old)
+        end
+
+      :ok = Engine.execute(db, schema)
+      for i <- 1..inserted, do: :ok = Engine.execute(db, "INSERT INTO t (v) VALUES ('r#{i}')")
+      :ok = Engine.execute(db, "DELETE FROM t WHERE id > #{inserted - deleted}")
+      :ok = Engine.close(db)
+
+      {path, source_key} =
+        case source do
+          :restored ->
+            copy = Path.join(dir, "copy-#{tag}.db")
+            {:ok, _} = S3.restore(copy, live_s3, encryption: old)
+            {copy, old}
+
+          _ ->
+            {live, nil}
+        end
+
+      target = s3 |> Keyword.delete(:encryption) |> Keyword.put(:prefix, "#{prefix}/new-#{tag}")
+
+      assert {:ok, %{sequences_not_advanced: []}} =
+               S3.import(path, target, encryption: new, source_encryption: source_key),
+             tag
+
+      {:ok, db} = Engine.open(Path.join(dir, "new-#{tag}.db"), s3: target, encryption: new)
+      assert rows(db, "SELECT name, seq FROM sqlite_sequence") == [["t", inserted]], tag
+      :ok = Engine.execute(db, "INSERT INTO t (v) VALUES ('next')")
+      kept = for i <- 1..(inserted - deleted)//1, do: [i, "r#{i}"]
+      assert rows(db, "SELECT id, v FROM t ORDER BY id") == kept ++ [[inserted + 1, "next"]], tag
+      :ok = Engine.close(db)
+    end
+  end
+
+  # An inline INTEGER PRIMARY KEY DESC doesn't alias the rowid: 0.1.0-beta.6
+  # and earlier imported its rows with new rowids.
+  test "import/3 keeps rowids no column aliases", %{s3: s3, dir: dir} do
+    source = Path.join(dir, "rowids.db")
+    {:ok, db} = Engine.open(source)
+    :ok = Engine.execute(db, "CREATE TABLE d (a INTEGER PRIMARY KEY DESC, v TEXT)")
+    :ok = Engine.execute(db, "INSERT INTO d (rowid, a, v) VALUES (100, 7, 'x')")
+    :ok = Engine.close(db)
+
+    assert {:ok, %{rows: 1}} = S3.import(source, s3)
+    {:ok, db} = Engine.open(Path.join(dir, "new.db"), s3: s3)
+    assert rows(db, "SELECT rowid, a, v FROM d") == [[100, 7, "x"]]
+    :ok = Engine.close(db)
+  end
+
+  # turso_core 0.8.3's MVCC open writes the AUTOINCREMENT sequences, so the
+  # read-only open of a restored copy failed: "attempt to write a readonly
+  # database".
+  test "a restored copy with AUTOINCREMENT rows opens read-only", %{s3: s3, dir: dir} do
+    for enc <- [false, [cipher: "aegis256", key: S3.generate_key()]] do
+      s3 =
+        s3
+        |> Keyword.delete(:encryption)
+        |> Keyword.put(:prefix, s3[:prefix] <> "-#{enc != false}")
+
+      {:ok, db} = Engine.open(Path.join(dir, "live-#{enc != false}.db"), s3: s3, encryption: enc)
+      :ok = Engine.execute(db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+      :ok = Engine.execute(db, "INSERT INTO t (v) VALUES ('a'), ('b')")
+      :ok = Engine.close(db)
+
+      copy = Path.join(dir, "copy-#{enc != false}.db")
+      {:ok, _} = S3.restore(copy, s3, encryption: enc)
+      {:ok, ro} = Engine.open(copy, mode: :readonly, encryption: enc)
+      assert rows(ro, "SELECT id, v FROM t ORDER BY id") == [[1, "a"], [2, "b"]]
+
+      assert {:error, "attempt to write a readonly database"} =
+               Engine.execute(ro, "INSERT INTO t (v) VALUES ('c')")
+
+      :ok = Engine.close(ro)
+    end
   end
 
   test "restore refuses to replace an existing file, a running writer's database included",
@@ -1195,6 +1301,12 @@ defmodule Sediment.S3Test do
       assert restored_ids(s3, dir) == [1]
     end
 
+    # The refused storage acknowledges no commit, and every commit
+    # acknowledged is durable. Which connection the next insert gets is
+    # timing: the other one, still on the poisoned storage (refused), or
+    # one already reconnected, which took the database over afresh once the
+    # poisoned storage was gone (an open never attaches to a poisoned one):
+    # its commit is acknowledged and durable.
     test "through DBConnection", %{s3: s3, dir: dir} do
       {:ok, conn} =
         DBConnection.start_link(Sediment.Connection,
@@ -1205,11 +1317,25 @@ defmodule Sediment.S3Test do
 
       {:ok, _} = Sediment.query(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
       {:ok, _} = Sediment.query(conn, "INSERT INTO t VALUES (1)", [])
+      {:ok, %{generation: generation}} = S3.info(conn)
       assert {:error, _} = Sediment.query(conn, "PRAGMA journal_mode = wal", [])
-      assert {:error, _} = Sediment.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      {insert, info} =
+        DBConnection.run(conn, fn c ->
+          {Sediment.query(c, "INSERT INTO t VALUES (2)", []), S3.info(c)}
+        end)
+
       GenServer.stop(conn)
 
-      assert restored_ids(s3, dir) == [1]
+      case insert do
+        {:error, _} ->
+          assert restored_ids(s3, dir) == [1]
+
+        {:ok, _} ->
+          assert {:ok, %{generation: later, poisoned: nil}} = info
+          assert later > generation
+          assert restored_ids(s3, dir) == [1, 2]
+      end
     end
   end
 
@@ -1997,7 +2123,8 @@ defmodule Sediment.S3Test do
       :ok = Engine.close(db)
 
       assert {:error, msg} = Engine.open(Path.join(dir, "b.db"), s3: s3, encryption: @wrong)
-      assert msg =~ "wrong key"
+      assert msg =~ "key default in the ring is not the key that encrypted this database"
+      refute msg =~ String.slice(@wrong[:key], 0, 16)
       assert {:error, _} = Engine.open(Path.join(dir, "c.db"), s3: s3)
 
       {:ok, restored} = Engine.open(Path.join(dir, "d.db"), s3: s3, encryption: @enc)

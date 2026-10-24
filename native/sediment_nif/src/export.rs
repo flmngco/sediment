@@ -30,8 +30,9 @@ pub enum Source {
 }
 
 pub struct ExportOptions {
-    /// The source's key, if it is encrypted.
-    pub encryption: Option<EncryptionOpts>,
+    /// The source's key ring, if it is encrypted: an S3 source's key is
+    /// resolved from it, a local file is read with its active key.
+    pub encryption: Option<s3::KeyRing>,
     /// Drop Turso FTS indexes from the copy instead of refusing.
     pub drop_fts: bool,
 }
@@ -98,13 +99,16 @@ pub fn export(source: Source, dest: &Path, opts: &ExportOptions) -> Result<Expor
                 ));
             }
             work.copy_source(&files)?;
-            opts.encryption.clone()
+            match &opts.encryption {
+                Some(ring) => Some(ring.active().map_err(s3_err)?.opts()),
+                None => None,
+            }
         }
         Source::S3(cfg) => {
             let mut cfg = (**cfg).clone();
             cfg.encryption = opts.encryption.clone();
-            s3::restore_to(&cfg, &work.src, Target::Latest).map_err(s3_err)?;
-            cfg.encryption
+            let restored = s3::restore_to(&cfg, &work.src, Target::Latest).map_err(s3_err)?;
+            restored.key.as_ref().map(s3::Key::opts)
         }
     };
 
@@ -657,7 +661,7 @@ fn export_sqlite<'a>(
     source: Option<String>,
     dest: String,
     from_s3: Option<rustler::Term<'a>>,
-    encryption: Option<(String, String)>,
+    encryption: rustler::Term<'a>,
     drop_fts: bool,
 ) -> rustler::Term<'a> {
     use rustler::{Atom, Encoder};
@@ -671,16 +675,19 @@ fn export_sqlite<'a>(
         },
         _ => return crate::conn::error_tuple(env, "give a source path or from_s3, not both"),
     };
-    if let Some((_, hexkey)) = &encryption {
-        if let Err(reason) = crate::open::check_hex_key(hexkey) {
-            return crate::conn::error_tuple(env, reason);
-        }
-    }
+    let encryption = match crate::s3_nif::decode_ring(encryption) {
+        Ok(ring) => ring,
+        Err(reason) => return crate::conn::error_tuple(env, reason),
+    };
     let opts = ExportOptions {
-        encryption: encryption.map(|(cipher, hexkey)| EncryptionOpts { cipher, hexkey }),
+        encryption,
         drop_fts,
     };
-    match export(source, Path::new(&dest), &opts) {
+    let exported = match crate::stmt::on_turso_stack(|| export(source, Path::new(&dest), &opts)) {
+        Ok(exported) => exported,
+        Err(reason) => return crate::conn::error_tuple(env, reason),
+    };
+    match exported {
         Ok(exported) => {
             let pairs = [
                 ("objects", exported.objects.encode(env)),

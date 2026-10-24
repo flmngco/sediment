@@ -10,6 +10,7 @@ use turso_core::IO;
 
 use crate::conn::{closed, error_tuple, ok_tuple, ConnRes};
 use crate::s3::{self, S3Config, S3DurableStorage, S3Error, Target};
+use crate::stmt::on_turso_stack;
 
 /// Turns the `s3:` keyword list or map into a config. Values may be strings,
 /// atoms, integers or booleans.
@@ -32,7 +33,10 @@ pub fn decode_config(term: Term<'_>) -> Result<S3Config, String> {
                 scalar(key).map_err(|_| "s3 option names must be atoms or strings".to_string())?;
             // Values can be credentials: name the option, never echo the value.
             let value = scalar(value).map_err(|_| {
-                format!("s3 option {key}: expected a string, atom, integer or boolean")
+                format!(
+                    "s3 option {}: expected a string, atom, integer or boolean",
+                    s3::shown_value(&key)
+                )
             })?;
             Ok((key, value))
         })
@@ -53,21 +57,118 @@ fn scalar(term: Term<'_>) -> Result<String, ()> {
     term.atom_to_string().map_err(|_| ())
 }
 
+/// Decodes the `:encryption` key ring Elixir builds
+/// (`Sediment.S3.Keys.native/1`): `%{keys: [{id, cipher, hex}], active: id |
+/// nil, resolvable: bool}`, or nil. Errors name ids, never key material.
+pub fn decode_ring(term: Term<'_>) -> Result<Option<s3::KeyRing>, String> {
+    if term.atom_to_string().ok().as_deref() == Some("nil") {
+        return Ok(None);
+    }
+    let field = |key: Atom| term.map_get(key).ok();
+    let entries: Vec<(String, String, String)> = field(crate::atoms::keys())
+        .and_then(|t| t.decode().ok())
+        .ok_or("encryption: expected a key ring (see Sediment.S3.Keys)")?;
+    let active = field(crate::atoms::active()).and_then(|t| t.decode::<String>().ok());
+    let resolvable = field(crate::atoms::resolvable())
+        .and_then(|t| t.decode::<bool>().ok())
+        .unwrap_or(false);
+    let invalid = |err: S3Error| match err {
+        S3Error::Config(message) => format!("encryption: {message}"),
+        other => other.to_string(),
+    };
+    // An entry is named by its position: its id isn't checked yet.
+    let keys = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (id, cipher, hex))| {
+            s3::Key::new(id, cipher, hex).map_err(|err| match err {
+                S3Error::Config(message) => {
+                    S3Error::Config(format!("ring entry {}: {message}", i + 1))
+                }
+                other => other,
+            })
+        })
+        .collect::<s3::Result<Vec<_>>>()
+        .map_err(invalid)?;
+    s3::KeyRing::new(keys, active, resolvable)
+        .map(Some)
+        .map_err(invalid)
+}
+
 /// Restores `path` from S3 (or creates it) and returns the storage to open
 /// it with, counting this open as one of its connections.
 pub fn prepare(
     term: Term<'_>,
     path: &str,
-    encryption: Option<turso_core::EncryptionOpts>,
+    encryption: Option<s3::KeyRing>,
     io: Arc<dyn IO>,
-) -> Result<s3::Attached, String> {
+) -> Result<s3::Attached, crate::open::OpenError> {
     let mut config = decode_config(term)?;
     config.encryption = encryption;
-    s3::prepare_attached(&config, Path::new(path), io).map_err(|e| describe(&e))
+    Ok(s3::prepare_attached(&config, Path::new(path), io)?)
 }
 
 fn describe(err: &S3Error) -> String {
     err.to_string()
+}
+
+/// `{:error, message}`, `{:error, {:key_needed, id}}` for a key a `key_for`
+/// ring must add, `{:error, {:indeterminate, message}}`, or `{:error,
+/// {:fenced, %{current_key:, fingerprint:, message:}}}` when another
+/// writer's manifest replaced the one an epoch advance held.
+pub fn error_term<'a>(env: Env<'a>, err: &S3Error) -> Term<'a> {
+    match err {
+        S3Error::Overtaken { key, .. } => {
+            let pairs = [
+                (
+                    "current_key",
+                    key.as_ref()
+                        .map(|k| s3::shown(&k.id).into_owned())
+                        .encode(env),
+                ),
+                (
+                    "fingerprint",
+                    key.as_ref()
+                        .map(|k| s3::short_fingerprint(&k.fingerprint))
+                        .encode(env),
+                ),
+                (
+                    "message",
+                    crate::redact::hex_runs(&err.to_string()).encode(env),
+                ),
+            ]
+            .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v));
+            match Term::map_from_pairs(env, &pairs) {
+                Ok(map) => (
+                    crate::atoms::error(),
+                    (Atom::from_str(env, "fenced").unwrap(), map),
+                )
+                    .encode(env),
+                Err(_) => error_tuple(env, describe(err)),
+            }
+        }
+        S3Error::KeyNeeded(id) => (
+            crate::atoms::error(),
+            (crate::atoms::key_needed(), id.as_str()),
+        )
+            .encode(env),
+        S3Error::Indeterminate(_) => (
+            crate::atoms::error(),
+            (
+                crate::atoms::indeterminate(),
+                crate::redact::hex_runs(&err.to_string()).into_owned(),
+            ),
+        )
+            .encode(env),
+        other => error_tuple(env, describe(other)),
+    }
+}
+
+/// Decodes the S3 options and the key ring of a `Sediment.S3` call.
+fn config_with_ring(opts: Term<'_>, ring: Term<'_>) -> Result<S3Config, String> {
+    let mut config = decode_config(opts)?;
+    config.encryption = decode_ring(ring)?;
+    Ok(config)
 }
 
 fn with_storage<'a>(
@@ -266,19 +367,12 @@ fn s3_restore<'a>(
     path: String,
     opts: Term<'a>,
     target: Term<'a>,
-    encryption: Option<(String, String)>,
+    encryption: Term<'a>,
 ) -> Term<'a> {
-    let mut config = match decode_config(opts) {
+    let config = match config_with_ring(opts, encryption) {
         Ok(config) => config,
         Err(reason) => return error_tuple(env, reason),
     };
-    if let Some((_, hexkey)) = &encryption {
-        if let Err(reason) = crate::open::check_hex_key(hexkey) {
-            return error_tuple(env, reason);
-        }
-    }
-    config.encryption =
-        encryption.map(|(cipher, hexkey)| turso_core::EncryptionOpts { cipher, hexkey });
     let target = match target.decode::<(Atom, u64)>() {
         Ok((tag, n)) => match tag.to_term(env).atom_to_string().as_deref() {
             Ok("epoch") => Target::Epoch(n),
@@ -287,7 +381,15 @@ fn s3_restore<'a>(
         },
         Err(_) => Target::Latest,
     };
-    match s3::restore_to(&config, Path::new(&path), target) {
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("a restore into this file"),
+    );
+    let restored = match on_turso_stack(|| s3::restore_to(&config, Path::new(&path), target)) {
+        Ok(restored) => restored,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match restored {
         Ok(restored) => {
             let map = Term::map_from_pairs(
                 env,
@@ -298,6 +400,14 @@ fn s3_restore<'a>(
                         restored.epoch_started_at_ms.encode(env),
                     ),
                     ("frames", restored.frames.encode(env)),
+                    (
+                        "key",
+                        restored
+                            .key
+                            .as_ref()
+                            .map(|key| key.id().to_string())
+                            .encode(env),
+                    ),
                 ]
                 .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v)),
             );
@@ -306,7 +416,7 @@ fn s3_restore<'a>(
                 Err(_) => error_tuple(env, "could not build result"),
             }
         }
-        Err(err) => error_tuple(env, describe(&err)),
+        Err(err) => error_term(env, &err),
     }
 }
 
@@ -319,20 +429,22 @@ fn s3_import<'a>(
     path: String,
     opts: Term<'a>,
     verify: Atom,
-    encryption: Option<(String, String)>,
-    source_encryption: Option<(String, String)>,
+    encryption: Term<'a>,
+    source_encryption: Term<'a>,
 ) -> Term<'a> {
-    let mut config = match decode_config(opts) {
+    let config = match config_with_ring(opts, encryption) {
         Ok(config) => config,
         Err(reason) => return error_tuple(env, reason),
     };
-    for (_, hexkey) in encryption.iter().chain(source_encryption.iter()) {
-        if let Err(reason) = crate::open::check_hex_key(hexkey) {
-            return error_tuple(env, reason);
-        }
-    }
-    let key = |(cipher, hexkey): (String, String)| turso_core::EncryptionOpts { cipher, hexkey };
-    config.encryption = encryption.map(key);
+    // The source's ring: its active key reads it.
+    let source_key = match decode_ring(source_encryption).and_then(|ring| {
+        ring.map(|r| r.active().map(s3::Key::opts))
+            .transpose()
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(key) => key,
+        Err(reason) => return error_tuple(env, reason),
+    };
     let verify = match verify.to_term(env).atom_to_string().as_deref() {
         Ok("checksum") => s3::Verify::Checksum,
         Ok("restore") => s3::Verify::Restore,
@@ -340,9 +452,17 @@ fn s3_import<'a>(
     };
     let import_opts = s3::ImportOptions {
         verify,
-        source_encryption: source_encryption.map(key),
+        source_encryption: source_key,
     };
-    match s3::import(&config, Path::new(&path), &import_opts) {
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("an import of this file"),
+    );
+    let imported = match on_turso_stack(|| s3::import(&config, Path::new(&path), &import_opts)) {
+        Ok(imported) => imported,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match imported {
         Ok(imported) => {
             let map = Term::map_from_pairs(
                 env,
@@ -364,7 +484,7 @@ fn s3_import<'a>(
                 Err(_) => error_tuple(env, "could not build result"),
             }
         }
-        Err(err) => error_tuple(env, describe(&err)),
+        Err(err) => error_term(env, &err),
     }
 }
 
@@ -404,4 +524,172 @@ fn s3_exists<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
         Ok(exists) => ok_tuple(env, exists),
         Err(err) => error_tuple(env, describe(&err)),
     }
+}
+
+/// Moves the database to another key of the ring (see `s3::rekey`). Opens of
+/// `path` are serialized with it, as with `open`.
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_rekey<'a>(
+    env: Env<'a>,
+    path: String,
+    opts: Term<'a>,
+    encryption: Term<'a>,
+    to: Option<String>,
+    force: bool,
+    allow_reuse: bool,
+) -> Term<'a> {
+    let config = match config_with_ring(opts, encryption) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("a rekey of this database"),
+    );
+    let rekeyed =
+        on_turso_stack(|| s3::rekey(&config, Path::new(&path), to.as_deref(), force, allow_reuse));
+    let rekeyed = match rekeyed {
+        Ok(rekeyed) => rekeyed,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match rekeyed {
+        Ok(s3::Rekeyed::Current) => ok_tuple(env, Atom::from_str(env, "current").unwrap()),
+        Ok(s3::Rekeyed::Done { from, to, epoch }) => {
+            let map = Term::map_from_pairs(
+                env,
+                &[("from", from), ("to", to), ("epoch", epoch)]
+                    .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v.encode(env))),
+            );
+            match map {
+                Ok(map) => ok_tuple(env, map),
+                Err(_) => error_tuple(env, "could not build result"),
+            }
+        }
+        Err(err) => error_term(env, &err),
+    }
+}
+
+/// Drops the retained epochs under a key (see `s3::release_key`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_release_key<'a>(
+    env: Env<'a>,
+    path: String,
+    opts: Term<'a>,
+    encryption: Term<'a>,
+    key: String,
+    force: bool,
+) -> Term<'a> {
+    let config = match config_with_ring(opts, encryption) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("a key release of this database"),
+    );
+    let released = match on_turso_stack(|| s3::release_key(&config, Path::new(&path), &key, force))
+    {
+        Ok(released) => released,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match released {
+        Ok(released) => {
+            let map = Term::map_from_pairs(
+                env,
+                &[
+                    (
+                        Atom::from_str(env, "key").unwrap().encode(env),
+                        s3::shown(&key).encode(env),
+                    ),
+                    (
+                        Atom::from_str(env, "epochs").unwrap().encode(env),
+                        released.epochs.encode(env),
+                    ),
+                ],
+            );
+            match map {
+                Ok(map) => ok_tuple(env, map),
+                Err(_) => error_tuple(env, "could not build result"),
+            }
+        }
+        Err(err) => error_term(env, &err),
+    }
+}
+
+/// Which keys the database depends on (see `s3::key_census`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_key_census<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match s3::key_census(&config) {
+        Ok(None) => ok_tuple(env, Atom::from_str(env, "no_database").unwrap()),
+        Ok(Some(census)) => {
+            let retained: Vec<(String, Vec<String>)> = census.retained.into_iter().collect();
+            let retained = match Term::map_from_pairs(
+                env,
+                &retained
+                    .iter()
+                    .map(|(id, epochs)| (id.encode(env), epochs.encode(env)))
+                    .collect::<Vec<_>>(),
+            ) {
+                Ok(map) => map,
+                Err(_) => return error_tuple(env, "could not build result"),
+            };
+            let map = Term::map_from_pairs(
+                env,
+                &[
+                    (
+                        Atom::from_str(env, "current").unwrap().encode(env),
+                        census.current.encode(env),
+                    ),
+                    (
+                        Atom::from_str(env, "retained").unwrap().encode(env),
+                        retained,
+                    ),
+                ],
+            );
+            match map {
+                Ok(map) => ok_tuple(env, map),
+                Err(_) => error_tuple(env, "could not build result"),
+            }
+        }
+        Err(err) => error_term(env, &err),
+    }
+}
+
+/// Test hook (see `s3::hook`): `action` is `:pause`, `:fail` or `:crash`
+/// to arm it at `stage` for the database in `opts`, `:release` to let a
+/// paused operation go on, `:state` to read where it is. Returns the state:
+/// `:armed`, `:paused`, `:done` or nil.
+#[rustler::nif]
+fn s3_test_hook<'a>(env: Env<'a>, opts: Term<'a>, stage: String, action: Atom) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    let place = config.place();
+    let action = action.to_term(env).atom_to_string().unwrap_or_default();
+    match action.as_str() {
+        "pause" => s3::hook::arm(&place, &stage, s3::hook::Action::Pause),
+        "fail" => s3::hook::arm(&place, &stage, s3::hook::Action::Fail),
+        "store_fail" => s3::hook::arm(&place, &stage, s3::hook::Action::StoreFail),
+        "crash" => s3::hook::arm(&place, &stage, s3::hook::Action::Crash),
+        "release" => s3::hook::release(&place),
+        "state" => {}
+        _ => {
+            return error_tuple(
+                env,
+                "action must be :pause, :fail, :store_fail, :crash, :release or :state",
+            )
+        }
+    }
+    let state = match s3::hook::state(&place) {
+        Some(s3::hook::State::Armed) => "armed",
+        Some(s3::hook::State::Paused) => "paused",
+        Some(s3::hook::State::Done) => "done",
+        None => "nil",
+    };
+    Atom::from_str(env, state).unwrap().encode(env)
 }
