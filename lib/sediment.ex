@@ -17,6 +17,39 @@ defmodule Sediment do
   alias Sediment.Query
   alias Sediment.Result
 
+  # The options DBConnection and its pools read, checked with fixed messages
+  # before DBConnection sees them: a value of the wrong type would otherwise
+  # fail inside DBConnection (or in a pool's process, later), with the value
+  # in the exception, its stack trace or a crash report. Others are the
+  # connection's (it checks them) or ignored.
+  @transaction_options %{
+    timeout: :timeout,
+    sync_timeout: :timeout,
+    deadline: :integer_or_nil,
+    queue: :boolean,
+    sync: :boolean,
+    pool: :pool,
+    log: :log
+  }
+
+  @pool_options %{
+    pool: :pool,
+    pool_size: :pos_integer,
+    queue_target: :non_neg_integer,
+    queue_interval: :non_neg_integer,
+    idle_interval: :non_neg_integer,
+    idle_limit: :non_neg_integer,
+    backoff_min: :non_neg_integer,
+    backoff_max: :non_neg_integer,
+    backoff_type: :backoff_type,
+    max_restarts: :non_neg_integer,
+    max_seconds: :pos_integer,
+    timeout: :timeout,
+    after_connect_timeout: :timeout,
+    shutdown: :shutdown,
+    show_sensitive_data_on_connection_error: :boolean
+  }
+
   @doc """
   Starts a pool of connections. See `Sediment.Connection.connect/1` for the options.
   """
@@ -26,6 +59,7 @@ defmodule Sediment do
     # to connect/1, which refuses it as an unsupported option).
     Sediment.S3.Keys.scrubbed(fn ->
       opts = Sediment.S3.Keys.options!(opts, "Sediment.start_link/1", [:key])
+      checked_options!(opts, @pool_options, "Sediment.start_link/1")
       DBConnection.start_link(Connection, opts |> hide_keys() |> with_s3_shutdown())
     end)
   end
@@ -174,18 +208,59 @@ defmodule Sediment do
           {:ok, result} | {:error, any}
         when result: var
   def transaction(conn, fun, opts \\ []) do
-    # Not sealed (see Sediment.S3.Keys.Sealed): `fun`'s exceptions are the
-    # caller's own. Its arguments are checked in the boundary first.
-    Sediment.S3.Keys.scrubbed(fn ->
+    # Not sealed (see Sediment.S3.Keys.Sealed): DBConnection's setup and
+    # completion run in the boundary, `fun` out of it (its exceptions,
+    # exits, throws and rollbacks are the caller's own).
+    Sediment.S3.Keys.around(fun, fn carried ->
       Sediment.S3.Keys.options!(opts, "Sediment.transaction/3")
       check_conn!(conn, "Sediment.transaction/3")
 
       unless is_function(fun, 1),
         do: raise(ArgumentError, "Sediment.transaction/3: expects a function of one argument")
-    end)
 
-    DBConnection.transaction(conn, fun, opts)
+      checked_options!(opts, @transaction_options, "Sediment.transaction/3")
+      DBConnection.transaction(conn, carried, opts)
+    end)
   end
+
+  defp checked_options!(opts, table, call) do
+    for {name, value} <- opts,
+        type = Map.get(table, name),
+        not type?(type, value),
+        do: raise(ArgumentError, "#{call}: invalid #{inspect(name)} (#{type_name(type)})")
+
+    opts
+  end
+
+  defp type?(:timeout, value), do: value == :infinity or (is_integer(value) and value >= 0)
+  defp type?(:shutdown, value), do: value == :brutal_kill or type?(:timeout, value)
+  defp type?(:integer_or_nil, value), do: is_nil(value) or is_integer(value)
+  defp type?(:boolean, value), do: is_boolean(value)
+  defp type?(:pos_integer, value), do: is_integer(value) and value > 0
+  defp type?(:non_neg_integer, value), do: is_integer(value) and value >= 0
+  defp type?(:backoff_type, value), do: value in [:stop, :exp, :rand, :rand_exp]
+
+  defp type?(:pool, value),
+    do: is_atom(value) and Code.ensure_loaded?(value) and function_exported?(value, :checkout, 3)
+
+  defp type?(:log, value) do
+    case value do
+      nil -> true
+      fun when is_function(fun, 1) -> true
+      {m, f, a} -> is_atom(m) and is_atom(f) and is_list(a)
+      _other -> false
+    end
+  end
+
+  defp type_name(:timeout), do: "a non-negative integer or :infinity"
+  defp type_name(:shutdown), do: "a non-negative integer, :infinity or :brutal_kill"
+  defp type_name(:integer_or_nil), do: "an integer or nil"
+  defp type_name(:boolean), do: "a boolean"
+  defp type_name(:pos_integer), do: "a positive integer"
+  defp type_name(:non_neg_integer), do: "a non-negative integer"
+  defp type_name(:backoff_type), do: "one of :stop, :exp, :rand and :rand_exp"
+  defp type_name(:pool), do: "a DBConnection pool module"
+  defp type_name(:log), do: "a function of one argument, an {m, f, a} tuple or nil"
 
   # A pool, or the connection of a transaction or run, alive: DBConnection's
   # exits for a name with no process carry the name.
@@ -216,6 +291,7 @@ defmodule Sediment do
   def child_spec(opts) do
     Sediment.S3.Keys.scrubbed(fn ->
       opts = Sediment.S3.Keys.options!(opts, "Sediment.child_spec/1", [:key])
+      checked_options!(opts, @pool_options, "Sediment.child_spec/1")
       opts = opts |> hide_keys() |> with_s3_shutdown()
       spec = DBConnection.child_spec(Connection, opts)
 

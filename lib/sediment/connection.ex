@@ -277,6 +277,12 @@ defmodule Sediment.Connection do
 
   @impl true
   def handle_prepare(%Query{} = query, options, state) do
+    if text?(query.statement),
+      do: prepare_text(query, options, state),
+      else: {:error, not_text_error(), state}
+  end
+
+  defp prepare_text(query, options, state) do
     metadata = %{query: query.statement, database: state.path}
 
     :telemetry.span([:sediment, :prepare], metadata, fn ->
@@ -294,7 +300,13 @@ defmodule Sediment.Connection do
     {:ok, query, Result.new(command: :execute, rows: [[result]], num_rows: 1), state}
   end
 
-  def handle_execute(%Query{} = query, _params, _options, %{transaction_status: :error} = state) do
+  def handle_execute(%Query{} = query, params, options, state) do
+    if text?(query.statement),
+      do: execute_text(query, params, options, state),
+      else: {:error, not_text_error(), state}
+  end
+
+  defp execute_text(%Query{} = query, _params, _options, %{transaction_status: :error} = state) do
     # The transaction was already rolled back natively; only a ROLLBACK
     # issued as a plain query is accepted, to acknowledge it.
     if rollback_statement?(query.statement) do
@@ -305,7 +317,7 @@ defmodule Sediment.Connection do
     end
   end
 
-  def handle_execute(%Query{} = query, params, options, state) do
+  defp execute_text(%Query{} = query, params, options, state) do
     metadata = %{query: query.statement, params: params, database: state.path}
 
     :telemetry.span([:sediment, :query], metadata, fn ->
@@ -556,6 +568,23 @@ defmodule Sediment.Connection do
     end
   end
 
+  # A statement that isn't text (options or a key ring given in its place)
+  # is refused before a telemetry span names it or anything raises on it,
+  # with the value in the exception's stack trace.
+  defp text?(statement) when is_binary(statement), do: true
+
+  defp text?(statement) when is_list(statement) do
+    _length = IO.iodata_length(statement)
+    true
+  rescue
+    ArgumentError -> false
+  end
+
+  defp text?(_statement), do: false
+
+  defp not_text_error,
+    do: %Error{message: "the statement must be a string or iodata"}
+
   defp rollback_statement?(statement) do
     statement
     |> IO.iodata_to_binary()
@@ -654,7 +683,13 @@ defmodule Sediment.Connection do
     end
   end
 
-  def handle_begin(_options, %{transaction_status: :error} = state), do: {:error, state}
+  # A savepoint on a transaction the database rolled back (in practice under
+  # Ecto's SQL sandbox, whose test transaction is the outer one): refused
+  # like any statement there, as an error, the connection kept. A status
+  # result ({:error, state}) would make DBConnection disconnect, and the
+  # sandbox doesn't take it.
+  def handle_begin(_options, %{transaction_status: :error} = state),
+    do: {:error, aborted_error("SAVEPOINT sediment_savepoint"), state}
 
   @impl true
   def handle_commit(_options, %{transaction_status: :error} = state), do: {:error, state}
@@ -762,15 +797,21 @@ defmodule Sediment.Connection do
   end
 
   @impl true
-  def handle_declare(
-        %Query{statement: statement},
-        _params,
-        _opts,
-        %{transaction_status: :error} = state
-      ),
-      do: {:error, aborted_error(statement), state}
-
   def handle_declare(%Query{} = query, params, opts, state) do
+    if text?(query.statement),
+      do: declare_text(query, params, opts, state),
+      else: {:error, not_text_error(), state}
+  end
+
+  defp declare_text(
+         %Query{statement: statement},
+         _params,
+         _opts,
+         %{transaction_status: :error} = state
+       ),
+       do: {:error, aborted_error(statement), state}
+
+  defp declare_text(%Query{} = query, params, opts, state) do
     # Cursors are emulated with a prepared statement that is stepped through,
     # so the query ref is the cursor.
     result =

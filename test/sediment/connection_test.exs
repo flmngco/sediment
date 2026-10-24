@@ -223,6 +223,71 @@ defmodule Sediment.ConnectionTest do
     end
   end
 
+  describe ".handle_begin/2" do
+    # A begin on a transaction the database rolled back is refused with
+    # {:error, error, state}, and DBConnection keeps that state: the key net
+    # (Sediment.S3.Keys.scrubbed/1) leaves it as it is, even where a path
+    # and a cached statement hold runs of 32+ hex digits.
+    test "a refused begin returns the state unchanged, its statement cache intact" do
+      dir = Path.join(Temp.path!(), String.duplicate("ab", 16))
+      File.mkdir_p!(dir)
+      {:ok, state} = Connection.connect(database: Path.join(dir, "app.db"))
+
+      {:ok, _, _, state} =
+        Connection.handle_execute(
+          %Query{statement: "create table t (id integer primary key)"},
+          [],
+          [],
+          state
+        )
+
+      hex = %Query{statement: "select x'#{String.duplicate("cd", 16)}'"}
+      {:ok, %{ref: ref}, state} = Connection.handle_prepare(hex, [], state)
+      {:ok, _, state} = Connection.handle_begin([], state)
+
+      {:ok, _, _, state} =
+        Connection.handle_execute(%Query{statement: "insert into t values (1)"}, [], [], state)
+
+      {:error, _, state} =
+        Connection.handle_execute(
+          %Query{statement: "insert or rollback into t values (1)"},
+          [],
+          [],
+          state
+        )
+
+      assert state.transaction_status == :error
+
+      assert {:error, %Sediment.Error{message: "the transaction was rolled back" <> _}, ^state} =
+               Connection.handle_begin([mode: :savepoint], state)
+
+      assert {:ok, %{ref: ^ref}, _state} = Connection.handle_prepare(hex, [], state)
+      :ok = Connection.disconnect(:normal, state)
+    end
+
+    # Codex's reproduction (with the {:error, state} result then): with the
+    # state redacted, the cache mapped "SELECT '<redacted>'" to the statement
+    # of the 64-hex literal.
+    test "after a refused begin and a rollback, each cached statement answers its own SQL" do
+      literal = String.duplicate("e5", 32)
+      select = "SELECT '#{literal}'"
+      {:ok, conn} = Sediment.Basic.open(":memory:")
+      {:ok, _, %{rows: [[^literal]]}, conn} = Sediment.Basic.exec(conn, select)
+      {:ok, _, _, conn} = Sediment.Basic.exec(conn, "create table t (id integer primary key)")
+      {:ok, _, _, conn} = Sediment.Basic.exec(conn, "insert into t values (1)")
+      {:ok, _, conn} = Connection.handle_begin([], conn)
+      {:error, _, conn} = Sediment.Basic.exec(conn, "insert or rollback into t values (1)")
+      {:error, _, conn} = Connection.handle_begin([], conn)
+      {:ok, _, conn} = Connection.handle_rollback([], conn)
+
+      assert {:ok, _, %{rows: [["<redacted>"]]}, conn} =
+               Sediment.Basic.exec(conn, "SELECT '<redacted>'")
+
+      assert {:ok, _, %{rows: [[^literal]]}, conn} = Sediment.Basic.exec(conn, select)
+      :ok = Sediment.Basic.close(conn)
+    end
+  end
+
   defp get_pragma(db, pragma_name) do
     {:ok, statement} = Engine.prepare(db, "PRAGMA #{pragma_name}")
 

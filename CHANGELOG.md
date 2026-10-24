@@ -92,15 +92,40 @@
     passing through, has each run of 32 or more hex digits replaced by
     `<redacted>` (keys are hex), in Elixir and in the native code, so a key
     echoed by any message never shows. Fingerprints in messages and in a
-    fenced result are shown by their first 16 hex digits;
+    fenced result are shown by their first 16 hex digits. Only text is
+    rewritten: a connection state, query or result in an error tuple is
+    returned as it is (of `{:error | :disconnect, exception, state}` only
+    the exception), and a `Sediment.Error` keeps its `:statement` as given,
+    its message and `inspect` showing it redacted. Values of the caller's
+    holding such a run (a prefix or path with a dashless UUID) show
+    redacted in messages too;
   * messages show a value a caller gave only as an atom, string or number
     that couldn't be a key, otherwise by its type (`"unsupported type:
     %ArgumentError{...}"`, `"argument error: a value of type map"`);
   * an S3 option that doesn't parse is named, never shown (it was echoed:
     `encryption: "<key>"` inside `:s3`), and so is an unknown option, mode
     or journal mode that could be a key.
-  `Sediment.transaction/3` checks its arguments the same way (its function's
-  exceptions stay the caller's own).
+  * a statement that isn't text (options or a ring given in its place) is
+    refused with an error before a telemetry span names it, and
+    `Sediment.S3.flush/2` checks its timeout before its span starts:
+    telemetry handlers never see such a value (a span's exception event
+    carries the stack trace with its arguments);
+  * the options DBConnection reads are type-checked with fixed messages:
+    `Sediment.transaction/3`'s (`:timeout`, `:pool`, `:queue`, `:log`, ...)
+    and a pool's (`:pool_size`, `:pool`, `:queue_target`, `:backoff_type`,
+    ..., at `Sediment.start_link/1` and `child_spec/1`; a bad one failed in
+    the pool's process, with the value in its crash report).
+  `Sediment.transaction/3` runs DBConnection's setup and completion inside
+  the boundary and its function outside it: the function's results,
+  rollback reasons, exceptions, exits and throws reach the caller as they
+  are.
+* `Sediment.Connection.handle_begin/2` on a transaction the database rolled
+  back (a write-write conflict, `ON CONFLICT ROLLBACK`) returns
+  `{:error, %Sediment.Error{}, state}` ("the transaction was rolled back by
+  the database ..."), keeping the connection, instead of the
+  `{:error, state}` status, on which DBConnection disconnected and Ecto's
+  SQL sandbox crashed (a savepoint begun in a test whose transaction the
+  database had rolled back).
 * With a `key_for` ring, every open and every rekey of a warm copy
   (a clean close's) downloaded the whole database: the first round, which
   asks `key_for` for the key, deleted the warm sidecar before it stopped.

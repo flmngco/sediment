@@ -794,6 +794,8 @@ defmodule Sediment.S3 do
   def flush(db, timeout \\ 15_000)
 
   def flush(db, timeout) when is_reference(db) do
+    timeout!(timeout, "Sediment.S3.flush/2")
+
     Telemetry.span([:s3, :flush], %{timeout: timeout}, fn ->
       case Native.s3_flush(db, timeout_ms(timeout), Native.admit(db)) do
         {:ok, _durable} -> :ok
@@ -804,7 +806,11 @@ defmodule Sediment.S3 do
 
   # The pool checkout must outlast the wait.
   def flush(conn, :infinity), do: pool_call(conn, {:flush, :infinity}, timeout: :infinity)
-  def flush(conn, timeout), do: pool_call(conn, {:flush, timeout}, timeout: timeout + 5_000)
+
+  def flush(conn, timeout) do
+    timeout!(timeout, "Sediment.S3.flush/2")
+    pool_call(conn, {:flush, timeout}, timeout: timeout + 5_000)
+  end
 
   @doc """
   Acknowledges that commits were lost, so that `flush/2` and `sync: true`
@@ -847,6 +853,8 @@ defmodule Sediment.S3 do
   # [:s3, :flush] span as flush/2.
   @spec flush_commit(Sediment.Engine.db(), timeout()) :: :ok | {:error, term()}
   def flush_commit(db, timeout) do
+    timeout!(timeout, "Sediment.S3.flush_commit/2")
+
     Telemetry.span([:s3, :flush], %{timeout: timeout}, fn ->
       case Native.s3_flush_commit(db, timeout_ms(timeout), Native.admit(db)) do
         {:ok, _} -> :ok
@@ -857,6 +865,12 @@ defmodule Sediment.S3 do
 
   # :infinity (a DBConnection timeout, say) as a wait the native side takes
   # in milliseconds: a day, in practice until cancel/1 or a disconnect.
+  # Checked before a span starts: its metadata names the timeout.
+  defp timeout!(timeout, call) do
+    unless timeout == :infinity or (is_integer(timeout) and timeout >= 0),
+      do: raise(ArgumentError, "#{call}: the timeout must be a non-negative integer or :infinity")
+  end
+
   defp timeout_ms(:infinity), do: 86_400_000
   defp timeout_ms(ms) when is_integer(ms) and ms >= 0, do: ms
 

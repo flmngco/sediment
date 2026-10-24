@@ -251,17 +251,28 @@ defmodule Sediment.S3.Keys do
   #     any other (a FunctionClauseError, KeyError or MatchError holds the
   #     value it failed on) becomes an ArgumentError naming only its type;
   #   * the net: in what passes (an exception, an exit's reason, an
-  #     `{:error, reason}` result), every run of 32 or more hex digits is
-  #     replaced by "<redacted>". Keys are hex, so a key echoed anywhere,
-  #     now or by a future message, never leaves. Nothing Sediment shows
-  #     legitimately is such a run (fingerprints show 16 hex digits).
+  #     `{:error, reason}` result), every run of 32 or more hex digits in
+  #     its text is replaced by "<redacted>". Keys are hex, so a key echoed
+  #     anywhere, now or by a future message, never leaves. Nothing Sediment
+  #     shows legitimately is such a run (fingerprints show 16 hex digits).
+  #     Only text is rewritten (see `redact/1`): a struct other than an
+  #     exception, such as the connection state DBConnection keeps from a
+  #     callback's `{:error, state}`, is returned as it is. Of an
+  #     `{:error | :disconnect, exception, state}` result only the exception
+  #     is.
   #
   # Throws pass untouched (a transaction's rollback is one).
   @spec scrubbed((-> result)) :: result when result: term()
   def scrubbed(fun) do
     case fun.() do
-      {:error, reason} -> {:error, redact(reason)}
-      result -> result
+      {:error, reason} ->
+        {:error, redact(reason)}
+
+      {status, %{__exception__: true} = e, state} when status in [:error, :disconnect] ->
+        {status, redact(e), state}
+
+      result ->
+        result
     end
   rescue
     exception ->
@@ -273,8 +284,11 @@ defmodule Sediment.S3.Keys do
   end
 
   @doc false
-  # `term` with every run of 32 or more hex digits in its strings and atoms
-  # replaced by "<redacted>", its shape kept.
+  # `term` with every run of 32 or more hex digits in its text (strings and
+  # atoms, in lists, tuples, maps and exceptions' fields) replaced by
+  # "<redacted>", its shape kept. Any other struct (a connection's state, a
+  # query, a result) is data a caller or DBConnection keeps, not a message,
+  # and is returned as it is.
   @spec redact(term()) :: term()
   def redact(binary) when is_binary(binary),
     do: Regex.replace(~r/[0-9a-fA-F]{32,}/, binary, "<redacted>")
@@ -293,10 +307,15 @@ defmodule Sediment.S3.Keys do
   def redact(tuple) when is_tuple(tuple),
     do: tuple |> Tuple.to_list() |> redact() |> List.to_tuple()
 
-  def redact(%module{} = struct) do
-    struct |> Map.from_struct() |> redact() |> Map.put(:__struct__, module)
+  # Its statement is the caller's, kept for them; message/1 and inspect/2
+  # show it redacted.
+  def redact(%Sediment.Error{} = error), do: %{error | message: redact(error.message)}
+
+  def redact(%module{__exception__: true} = exception) do
+    exception |> Map.from_struct() |> redact() |> Map.put(:__struct__, module)
   end
 
+  def redact(%_{} = struct), do: struct
   def redact(map) when is_map(map), do: Map.new(map, fn {k, v} -> {redact(k), redact(v)} end)
   def redact(other), do: other
 
@@ -367,6 +386,55 @@ defmodule Sediment.S3.Keys do
   # An exception an inner boundary withheld already.
   defp withheld?(%ArgumentError{message: message}), do: String.ends_with?(message, @withheld)
   defp withheld?(_exception), do: false
+
+  defmodule Caller do
+    @moduledoc false
+    # What a caller's function returned, threw or raised, carried through
+    # the boundary untouched (see Sediment.S3.Keys.around/2).
+    defstruct [:value, :kind, :stacktrace]
+  end
+
+  @doc false
+  # `run` (a library's setup and completion around the caller's function
+  # `fun`, such as DBConnection.transaction/3) in the boundary, `fun` out of
+  # it: what `fun` returns, its rollback reason (DBConnection.rollback/2),
+  # its exceptions, exits and throws reach the caller as they are, with
+  # their stack traces. `run` gets `fun` wrapped, a function of one argument.
+  @spec around((term() -> term()), ((term() -> term()) -> result)) :: result
+        when result: term()
+  def around(fun, run) do
+    case scrubbed(fn -> run.(carried(fun)) end) do
+      {:ok, %Caller{kind: nil, value: value}} -> {:ok, value}
+      {:error, %Caller{kind: nil, value: reason}} -> {:error, reason}
+      result -> result
+    end
+  catch
+    :throw, %Caller{kind: kind, value: reason, stacktrace: stacktrace} ->
+      :erlang.raise(kind, reason, stacktrace)
+  end
+
+  defp carried(fun) do
+    fn %{conn_ref: conn_ref} = conn ->
+      try do
+        %Caller{value: fun.(conn)}
+      catch
+        # A rollback of this transaction: DBConnection ends it with the
+        # (carried) reason.
+        :throw, {DBConnection, ^conn_ref, reason} ->
+          throw({DBConnection, conn_ref, %Caller{value: reason}})
+
+        # Of another transaction, or carried already (a nested one's).
+        :throw, {DBConnection, _ref, _reason} = rollback ->
+          throw(rollback)
+
+        :throw, %Caller{} = carried ->
+          throw(carried)
+
+        kind, reason ->
+          throw(%Caller{kind: kind, value: reason, stacktrace: __STACKTRACE__})
+      end
+    end
+  end
 
   @ring_options [:key, :keys, :key_for, :cipher, :active]
 
