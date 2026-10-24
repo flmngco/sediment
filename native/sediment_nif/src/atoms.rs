@@ -30,4 +30,5 @@ rustler::atoms! {
     resolvable,
     key_needed,
     indeterminate,
+    opening,
 }

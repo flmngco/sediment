@@ -381,6 +381,10 @@ fn s3_restore<'a>(
         },
         Err(_) => Target::Latest,
     };
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("a restore into this file"),
+    );
     let restored = match on_turso_stack(|| s3::restore_to(&config, Path::new(&path), target)) {
         Ok(restored) => restored,
         Err(reason) => return error_tuple(env, reason),
@@ -450,6 +454,10 @@ fn s3_import<'a>(
         verify,
         source_encryption: source_key,
     };
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("an import of this file"),
+    );
     let imported = match on_turso_stack(|| s3::import(&config, Path::new(&path), &import_opts)) {
         Ok(imported) => imported,
         Err(reason) => return error_tuple(env, reason),
@@ -534,8 +542,10 @@ fn s3_rekey<'a>(
         Ok(config) => config,
         Err(reason) => return error_tuple(env, reason),
     };
-    let lock = crate::conn::path_lock(&path);
-    let _opening = lock.as_deref().map(crate::conn::lock);
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("a rekey of this database"),
+    );
     let rekeyed =
         on_turso_stack(|| s3::rekey(&config, Path::new(&path), to.as_deref(), force, allow_reuse));
     let rekeyed = match rekeyed {
@@ -573,8 +583,10 @@ fn s3_release_key<'a>(
         Ok(config) => config,
         Err(reason) => return error_tuple(env, reason),
     };
-    let lock = crate::conn::path_lock(&path);
-    let _opening = lock.as_deref().map(crate::conn::lock);
+    let _maintenance = crate::conn::hold(
+        &path,
+        crate::conn::Holder::Maintenance("a key release of this database"),
+    );
     let released = match on_turso_stack(|| s3::release_key(&config, Path::new(&path), &key, force))
     {
         Ok(released) => released,

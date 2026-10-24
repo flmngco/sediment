@@ -70,7 +70,7 @@ defmodule Sediment.S3.Many do
     census = fn target -> {target, S3.key_census(target.s3)} end
 
     results =
-      collect(targets, Keyword.get(opts, :max_concurrency, 8), census, opts[:on_result], nil)
+      collect(targets, Keyword.get(opts, :max_concurrency, 2), census, opts[:on_result], nil)
 
     acc = %{keys: %{}, absent: [], unencrypted: [], unreadable: []}
 

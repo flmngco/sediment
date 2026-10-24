@@ -79,10 +79,30 @@ defmodule Sediment.Engine do
     mode = opts[:mode] || [:readwrite, :create]
     ring = Sediment.S3.Keys.normalize(opts[:encryption])
 
-    with {:ok, conn} <-
-           Sediment.S3.Keys.run(ring, &Native.open(path, native_open_opts(mode, opts, &1))) do
+    open = fn ring ->
+      after_opens(fn -> Native.open(path, native_open_opts(mode, opts, ring)) end)
+    end
+
+    with {:ok, conn} <- Sediment.S3.Keys.run(ring, open) do
       if opts[:s3], do: flush_s3_at_exit()
       set_mvcc_checkpoint_threshold(conn, opts)
+    end
+  end
+
+  # Opens of a file are serialized, but never by waiting inside the NIF (it
+  # would hold a dirty I/O scheduler, and an S3 open restores for as long as
+  # the download takes): while another open of the file runs, the NIF
+  # returns {:error, :opening} and this process waits and tries again. While
+  # a rekey, key release, restore or import holds the file, the open fails
+  # at once with a "busy: ..." error (a pool's backoff retries it).
+  defp after_opens(open, wait \\ 1) do
+    case open.() do
+      {:error, :opening} ->
+        Process.sleep(wait)
+        after_opens(open, min(wait * 2, 50))
+
+      result ->
+        result
     end
   end
 

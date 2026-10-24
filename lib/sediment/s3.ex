@@ -541,8 +541,10 @@ defmodule Sediment.S3 do
   there are replaced). The rekey is a writer open that re-encrypts what it
   restored, then a clean close, which leaves the copy warm under the new
   key, so the next open of `path` downloads nothing. Stop the pool (every
-  writer) first rather than letting it fail meanwhile: opens of `path` wait
-  on its lock until the rekey ends, each holding a dirty I/O scheduler. It:
+  writer) first rather than letting it fail meanwhile: opens of `path` fail
+  at once with `"busy: a rekey of this database is running; retry once it
+  ends"` until the rekey ends (a pool's connections retry with its backoff).
+  The rekey runs on one dirty I/O scheduler for its whole run. It:
 
     1. takes the writer lease; like `destroy/2`, it refuses while the
        database is open in this VM, and any unexpired lease (this owner's
@@ -566,10 +568,10 @@ defmodule Sediment.S3 do
   `{:error, {:indeterminate, message}}`, a store error) the switch may have
   happened, or may still happen: a manifest write in flight can land after
   the error is reported, and a `key_census/1` taken in between shows the
-  old key. The only way to know is to run `rekey/3` again (`force: true`,
-  or after the lease's TTL, when a crashed run still holds the lease): its
-  takeover ends any write still in flight, and it returns `{:ok, :current}`
-  or completes the rekey. Until a run returns `{:ok, _}`, keep both keys in
+  old key. The only way to know is to run `rekey/3` again (after the
+  lease's TTL when a crashed run still holds the lease; `force: true` only
+  when you know the holder is that run): its takeover ends any write still
+  in flight, and it returns `{:ok, :current}` or completes the rekey. Until a run returns `{:ok, _}`, keep both keys in
   every ring.
 
   The epoch it ends and every epoch retained then are kept, whatever
@@ -601,7 +603,10 @@ defmodule Sediment.S3 do
     * `:force` - take the lease even while a writer holds it. That writer
       is fenced: it acknowledges no further commit, and with `durability:
       :async` the commits it acknowledged but had not uploaded yet are lost,
-      as with `destroy/2`. Use it for a writer that can't be stopped.
+      as with `destroy/2`. Not the answer to `"s3 lease held by ..."`, which
+      means another VM has the database open: stop it there. Use it only
+      for a holder known to be gone (a crashed run whose lease you can't
+      wait out).
     * `:allow_reuse` - allow a retired key (see above).
 
   Returns `{:ok, %{from: id, to: id, epoch: epoch}}`, `{:ok, :current}` when
@@ -748,8 +753,11 @@ defmodule Sediment.S3 do
   `:attempts` times, waiting `:backoff` ms, then twice that, and so on. A
   refusal (the database open in this VM, the lease held, a retired or
   missing key, a corrupt database) is reported at once: retrying it changes
-  nothing. A failed run that leaves the lease taken (a crash) gets
-  `"s3 lease held ..."` until its TTL passes; `:force` is never implied.
+  nothing. `"s3 lease held ..."` means another VM has the database open (or
+  a crashed run's lease, until its TTL passes): stop it there and run again.
+  `:force` is never implied. `:around` and the checks only see this VM:
+  run it on the node that has the databases open (or with every node
+  stopped).
 
   **Cost.** Each rekey downloads the database (nothing for a warm copy at
   `path`), needs about twice its size free next to `path`, and uploads a
@@ -757,6 +765,13 @@ defmodule Sediment.S3 do
   disk at once, and the egress and S3 requests (one snapshot upload, its
   multipart parts, a few manifest and lease requests per database) of the
   whole fleet. The database is unavailable to writers meanwhile.
+
+  **Schedulers.** Each running rekey (and each S3 open, restore or import)
+  holds one dirty I/O scheduler, which every query and file operation of
+  the VM also needs: keep `max_concurrency` well below
+  `:erlang.system_info(:dirty_io_schedulers)` (10 by default; raise it with
+  the `+SDio` emulator flag, `+SDio 32` in `vm.args` or `ERL_FLAGS`). Opens
+  of a database being rekeyed fail at once rather than wait for one.
 
   ## Options
 
@@ -832,7 +847,8 @@ defmodule Sediment.S3 do
 
   ## Options
 
-    * `:max_concurrency` - how many manifests are read at once (default 8).
+    * `:max_concurrency` - how many manifests are read at once (default 2:
+      each read holds a dirty I/O scheduler, see `rekey_many/2`).
     * `:on_result` - `fn target, result -> any end`, as for `rekey_many/2`.
   """
   @spec key_census_many(Enumerable.t(), keyword()) :: %{

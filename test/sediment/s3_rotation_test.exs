@@ -312,6 +312,83 @@ defmodule Sediment.S3RotationTest do
     end
   end
 
+  # A rekey holds its file (and one dirty I/O scheduler) for its whole run.
+  # Opens of that file fail at once, holding no scheduler: twice as many as
+  # the VM has dirty I/O schedulers, retrying all along, leave the other
+  # databases' queries running; a pool over the file backs off and connects
+  # once the rekey is done.
+  test "an open of a file a rekey holds fails at once; a pool connects after it", %{
+    s3: s3,
+    dir: dir
+  } do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    both = ring(["r2", "r1"])
+    task = paused_rekey(path, s3, both)
+
+    {time, result} = :timer.tc(fn -> Engine.open(path, s3: s3, encryption: both) end)
+    assert {:error, "busy: a rekey of this database is running; retry once it ends"} = result
+    assert time < 500_000
+
+    {:ok, other} = Engine.open(Path.join(dir, "other.db"))
+    :ok = Engine.execute(other, "CREATE TABLE x (v)")
+    deadline = System.monotonic_time(:millisecond) + 1_000
+
+    openers =
+      for _ <- 1..(2 * :erlang.system_info(:dirty_io_schedulers)) do
+        Task.async(fn ->
+          Stream.repeatedly(fn -> Engine.open(path, s3: s3, encryption: both) end)
+          |> Enum.take_while(fn _ -> System.monotonic_time(:millisecond) < deadline end)
+          |> Enum.uniq()
+        end)
+      end
+
+    for i <- 1..20 do
+      {time, :ok} = :timer.tc(fn -> Engine.execute(other, "INSERT INTO x VALUES (#{i})") end)
+      assert time < 500_000, "a query on another database waited #{div(time, 1000)} ms"
+    end
+
+    for task <- openers do
+      assert [{:error, "busy: a rekey" <> _}] = Task.await(task, 10_000)
+    end
+
+    :ok = Engine.close(other)
+
+    {:ok, pool} =
+      Sediment.start_link(
+        database: path,
+        s3: s3,
+        encryption: both,
+        pool_size: 1,
+        backoff_min: 50,
+        backoff_max: 200
+      )
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      Process.sleep(300)
+      assert {:error, _} = Sediment.query(pool, "SELECT v FROM t", [], timeout: 100)
+      Native.s3_test_hook(s3, "publish", :release)
+      assert {:ok, %{to: "r2"}} = Task.await(task, 30_000)
+      assert %{rows: [["a"]]} = connected_query!(pool, "SELECT v FROM t", 100)
+    end)
+
+    GenServer.stop(pool)
+  end
+
+  # A pool reconnecting with backoff drops queued requests meanwhile.
+  defp connected_query!(_pool, _sql, 0), do: flunk("the pool never connected")
+
+  defp connected_query!(pool, sql, n) do
+    case Sediment.query(pool, sql) do
+      {:ok, result} ->
+        result
+
+      {:error, %DBConnection.ConnectionError{}} ->
+        Process.sleep(100)
+        connected_query!(pool, sql, n - 1)
+    end
+  end
+
   test "a takeover during a rekey fences it: nothing switched, no commit lost", %{
     s3: s3,
     dir: dir

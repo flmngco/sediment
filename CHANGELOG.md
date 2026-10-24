@@ -79,7 +79,7 @@ destroy the prefix).
 * Rotation over many databases: `Sediment.S3.rekey_many/2`,
   `release_key_many/3` and `key_census_many/2` run the operation over a list
   of `{path, s3_opts}` or `%{id:, path:, s3:}` targets, a few at a time
-  (`max_concurrency`, 1 by default; 8 for the census), never stopping at a
+  (`max_concurrency`, 1 by default; 2 for the census), never stopping at a
   failure, and report every target by id (`rekeyed`, `current`, `absent`,
   `failed`, `skipped`; the census by key, with `removable?/2`). A result
   that may still change (fenced, indeterminate, a store error) is retried
