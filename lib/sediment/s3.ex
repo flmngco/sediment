@@ -812,14 +812,16 @@ defmodule Sediment.S3 do
       reported in `skipped`.
 
   The functions above get the target as given, with every `:encryption`
-  in it (of a map or a keyword list, such as a repo's configuration)
+  in it (of a map, a struct or a keyword list, such as a repo's
+  configuration)
   wrapped in an opaque value that inspects as
   `#Sediment.S3.Keys.Hidden<redacted>` and that every function taking
   `:encryption` (a pool's or repo's options, `rekey/3`) accepts as the ring.
 
   Reasons and results hold key ids and fingerprints, never keys: the
   reasons of the caller's functions too, through the same net as
-  Sediment's errors (every run of 32 or more hex digits replaced). A
+  Sediment's errors (every run of 32 or more hex digits replaced), the
+  fields of structs in them included. A
   function of the caller's that raises fails its target with
   `{:callback_raised, name, exception_type}` (its message isn't kept: it
   may hold anything); one raising in `:on_result` or `:stop_on` stops the

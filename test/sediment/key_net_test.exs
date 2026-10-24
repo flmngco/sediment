@@ -74,6 +74,18 @@ defmodule Sediment.KeyNetTest do
 
   defp ring(key), do: [keys: [{"r1", key}], cipher: "aegis256"]
 
+  # A caller's struct holding a ring: in a callback's reason or exception,
+  # and as a target.
+  defmodule Held do
+    @moduledoc false
+    defstruct [:ring]
+  end
+
+  defmodule StructTarget do
+    @moduledoc false
+    defstruct [:id, :path, :s3, :encryption]
+  end
+
   # Wrong shapes, each holding `key`.
   defp shapes(key) do
     [
@@ -400,6 +412,8 @@ defmodule Sediment.KeyNetTest do
             {[%{target | s3: s3 ++ [encryption: shape]}], [encryption: ring(key)], true},
             {[Map.put(target, :encryption, shape)], [encryption: fn t -> t.encryption end], true},
             {[{target.path, s3 ++ [encryption: shape]}], [encryption: ring(key)], true},
+            {[struct(StructTarget, Map.put(target, :encryption, shape))],
+             [encryption: fn t -> t.encryption end], true},
             {[%{target | s3: shape}], [encryption: ring(key)], false},
             {[target],
              [
@@ -470,6 +484,28 @@ defmodule Sediment.KeyNetTest do
 
     assert_received {:target, %{encryption: %Sediment.S3.Keys.Hidden{} = hidden}}
     assert Sediment.S3.Keys.normalize(hidden) == Sediment.S3.Keys.normalize(ring)
+
+    # A struct target: its type kept, its ring hidden.
+    Sediment.S3.rekey_many(
+      [%StructTarget{id: "a", path: Temp.path!(), s3: [bucket: "b"], encryption: ring}],
+      encryption: fn target -> target.encryption end,
+      check: fn target ->
+        send(test, {:target, target})
+        {:error, :checked}
+      end
+    )
+
+    assert_received {:target, %StructTarget{encryption: %Sediment.S3.Keys.Hidden{}}}
+  end
+
+  # A reason's struct comes back of its type, its fields through the net.
+  test "a callback's struct reason keeps its type, its key redacted" do
+    assert %{failed: [{"a", {%Held{ring: [keys: [{"r1", "<redacted>"}], cipher: _]}, _}}]} =
+             Sediment.S3.rekey_many(
+               [%{id: "a", path: Temp.path!(), s3: [bucket: "b"]}],
+               encryption: ring(@key),
+               check: fn _ -> {:error, {%Held{ring: ring(@key)}, :refused}} end
+             )
   end
 
   # The callbacks' own failures, each holding `shape`; check: and around:
@@ -500,7 +536,29 @@ defmodule Sediment.KeyNetTest do
       {[target], [encryption: ring(key), on_result: fn _, _ -> throw({:progress, shape}) end],
        true},
       {[target], [encryption: ring(key), stop_on: fn _, _ -> raise inspect(shape) end], true},
-      {[target], [encryption: ring(key), stop_on: fn _, _ -> exit({:stop, shape}) end], true}
+      {[target], [encryption: ring(key), stop_on: fn _, _ -> exit({:stop, shape}) end], true},
+      # Structs, their fields walked.
+      {[target], [encryption: ring(key), check: fn _ -> {:error, %Held{ring: shape}} end], true},
+      {[target], [encryption: ring(key), around: fn _, _ -> {:error, %Held{ring: shape}} end],
+       true},
+      {[target],
+       [
+         encryption: ring(key),
+         around: fn _, run ->
+           run.()
+           {:error, %Held{ring: shape}}
+         end
+       ], true},
+      {[target],
+       [
+         encryption: ring(key),
+         on_result: fn _, _ -> raise MatchError, term: %Held{ring: shape} end
+       ], true},
+      {[target],
+       [
+         encryption: ring(key),
+         stop_on: fn _, _ -> raise MatchError, term: %Held{ring: shape} end
+       ], true}
     ]
   end
 

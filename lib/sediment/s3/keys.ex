@@ -51,8 +51,8 @@ defmodule Sediment.S3.Keys do
   def hide(encryption), do: %Hidden{get: fn -> encryption end}
 
   @doc false
-  # `term` with every `:encryption` in it (of a map or a keyword list, at any
-  # depth but in structs) hidden: a target as the caller's functions get it
+  # `term` with every `:encryption` in it (of a map, a struct or a keyword
+  # list, at any depth) hidden: a target as the caller's functions get it
   # back, its rings still usable to reopen a database.
   @spec hide_rings(term()) :: term()
   def hide_rings(list) when is_list(list), do: hide_rings_list(list)
@@ -60,7 +60,10 @@ defmodule Sediment.S3.Keys do
   def hide_rings(tuple) when is_tuple(tuple),
     do: tuple |> Tuple.to_list() |> hide_rings() |> List.to_tuple()
 
-  def hide_rings(%_{} = struct), do: struct
+  def hide_rings(%Hidden{} = hidden), do: hidden
+
+  def hide_rings(%module{} = struct),
+    do: struct |> Map.from_struct() |> hide_rings() |> Map.put(:__struct__, module)
 
   def hide_rings(map) when is_map(map),
     do: Map.new(map, fn {k, v} -> hide_ring({k, v}) end)
@@ -347,6 +350,33 @@ defmodule Sediment.S3.Keys do
   def redact(%_{} = struct), do: struct
   def redact(map) when is_map(map), do: Map.new(map, fn {k, v} -> {redact(k), redact(v)} end)
   def redact(other), do: other
+
+  @doc false
+  # `redact/1` for a diagnostic only (what the caller's functions return or
+  # raise at the boundaries of the functions over many databases): the
+  # fields of every struct are rewritten too, its type kept, but
+  # Hidden's (opaque). Not for data a caller keeps (a result, a
+  # transaction's value, a connection's state): `redact/1` leaves those.
+  @spec diagnostic(term()) :: term()
+  def diagnostic(%Hidden{} = hidden), do: hidden
+
+  def diagnostic(%module{} = struct),
+    do: struct |> Map.from_struct() |> diagnostic() |> Map.put(:__struct__, module)
+
+  def diagnostic(map) when is_map(map),
+    do: Map.new(map, fn {k, v} -> {diagnostic(k), diagnostic(v)} end)
+
+  def diagnostic(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> diagnostic() |> List.to_tuple()
+
+  def diagnostic(list) when is_list(list), do: diagnostic_list(list)
+  def diagnostic(other), do: redact(other)
+
+  defp diagnostic_list([head | tail]) when is_list(tail),
+    do: [diagnostic(head) | diagnostic_list(tail)]
+
+  defp diagnostic_list([head | tail]), do: [diagnostic(head) | diagnostic(tail)]
+  defp diagnostic_list([]), do: []
 
   defp redact_list([head | tail]) when is_list(tail), do: [redact(head) | redact_list(tail)]
   defp redact_list([head | tail]), do: [redact(head) | redact(tail)]

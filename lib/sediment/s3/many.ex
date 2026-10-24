@@ -239,7 +239,7 @@ defmodule Sediment.S3.Many do
         returned = callback(:around, fn -> around.(target.given, runner) end)
 
         case {Process.get(key), returned} do
-          {nil, {:error, reason}} -> {{:error, Keys.redact(reason)}, []}
+          {nil, {:error, reason}} -> {{:error, Keys.diagnostic(reason)}, []}
           {nil, _other} -> {{:error, :not_run}, []}
           {{result, _earlier} = outcome, result} -> outcome
           {{result, earlier}, {:error, reason}} -> {around_failed(reason, result), earlier}
@@ -249,7 +249,7 @@ defmodule Sediment.S3.Many do
   end
 
   defp around_failed(reason, result),
-    do: {:error, {:around_failed, Keys.redact(reason), result}}
+    do: {:error, Keys.diagnostic({:around_failed, reason, result})}
 
   defp attempts(target, opts, op) do
     with :ok <- check(target, opts[:check]),
@@ -265,7 +265,7 @@ defmodule Sediment.S3.Many do
 
   defp check(target, check) do
     case callback(:check, fn -> check.(target.given) end) do
-      {:error, reason} -> {:error, Keys.redact(reason)}
+      {:error, reason} -> {:error, Keys.diagnostic(reason)}
       _ok -> :ok
     end
   end
@@ -336,7 +336,7 @@ defmodule Sediment.S3.Many do
   # arguments (ours hold the targets).
   defp loop(_queue, running, _max, _one, _callbacks, _done, {kind, reason, stacktrace})
        when running == %{},
-       do: :erlang.raise(kind, Keys.redact(reason), Keys.scrub_stacktrace(stacktrace))
+       do: :erlang.raise(kind, Keys.diagnostic(reason), Keys.scrub_stacktrace(stacktrace))
 
   defp loop(queue, running, _max, _one, _callbacks, done, stop)
        when running == %{} and (queue == [] or stop != nil),
