@@ -140,7 +140,10 @@ defmodule Sediment.S3 do
 
   # Every public function runs in the key-scrubbing boundary
   # (Sediment.S3.Keys.Sealed).
-  use Sediment.S3.Keys.Sealed
+  # The functions over many databases run the caller's functions (around:,
+  # on_result:, ...): they check their arguments in the boundary themselves.
+  use Sediment.S3.Keys.Sealed,
+    except: [rekey_many: 2, release_key_many: 3, key_census_many: 2]
 
   require Logger
 
@@ -712,6 +715,141 @@ defmodule Sediment.S3 do
           | {:ok, :no_database}
           | {:error, term()}
   def key_census(s3_opts), do: Keys.scrubbed(fn -> Native.s3_key_census(s3_opts) end)
+
+  @doc """
+  Runs `rekey/3` over many databases, a few at a time, and reports on every
+  one: it never stops at a failure.
+
+  `targets` is a list of `{path, s3_opts}` or `%{path: path, s3: s3_opts}`
+  (with an optional `:id` naming it in the report; the path by default).
+  Each is rekeyed like `rekey/3`, through its working copy at `path`.
+
+      S3.rekey_many(
+        for(t <- tenants, do: %{id: t.id, path: t.path, s3: t.s3}),
+        encryption: fn %{id: id} -> MyApp.Keys.ring(id) end,
+        max_concurrency: 4,
+        on_result: fn %{id: id}, result -> Logger.info("rekey \#{id}: \#{inspect(result)}") end
+      )
+
+  Returns `%{rekeyed: [id], current: [id], absent: [id], failed: [{id,
+  reason}], skipped: [id]}`, ids in the targets' order:
+
+    * `rekeyed` - moved to the new key; `current` - under it already;
+    * `absent` - no database at the location;
+    * `failed` - the last result's reason, after the retries below;
+    * `skipped` - not started, after `:stop_on` stopped the run.
+
+  A re-run finds the rekeyed ones `current`, so running it again until
+  `failed` is empty finishes the rotation (see "Only `{:ok, _}` is an
+  outcome" in `rekey/3`: keep both keys in every ring until then).
+
+  **Retries.** A result that may still change (`{:error, {:fenced, _}}`,
+  `{:error, {:indeterminate, _}}`, an S3 store error) is retried up to
+  `:attempts` times, waiting `:backoff` ms, then twice that, and so on. A
+  refusal (the database open in this VM, the lease held, a retired or
+  missing key, a corrupt database) is reported at once: retrying it changes
+  nothing. A failed run that leaves the lease taken (a crash) gets
+  `"s3 lease held ..."` until its TTL passes; `:force` is never implied.
+
+  **Cost.** Each rekey downloads the database (nothing for a warm copy at
+  `path`), needs about twice its size free next to `path`, and uploads a
+  full snapshot under the new key: with `max_concurrency: n`, n times that
+  disk at once, and the egress and S3 requests (one snapshot upload, its
+  multipart parts, a few manifest and lease requests per database) of the
+  whole fleet. The database is unavailable to writers meanwhile.
+
+  ## Options
+
+    * `:encryption` (required) - the key ring for every target, or a
+      function of the target (as given) returning its ring, for per-tenant
+      rings or `key_for`.
+    * `:to`, `:force`, `:allow_reuse` - as for `rekey/3`, for every target.
+    * `:max_concurrency` - how many databases at once (default 1).
+    * `:attempts` - runs per database for the results above (default 3);
+      `:backoff` - the first wait, in ms (default 1000).
+    * `:around` - `fn target, rekey -> ... end`, run for each target in
+      place of the rekey: it must call `rekey.()` once, which runs the
+      rekey with its retries and returns its result. Close the database's
+      pool before and reopen it after, so each database pauses only for
+      its own rekey while the others stay up. Returning `{:error, reason}`
+      without calling it skips the target, reported in `failed`.
+    * `:check` - `fn target -> :ok | {:error, reason} end`, run right before
+      the rekey (inside `:around`): an error refuses the target, without
+      retries.
+    * `:on_result` - `fn target, result -> any end`, called in this process
+      as each database finishes (progress, logging).
+    * `:stop_on` - `fn id, result -> boolean end`: once it returns true, no
+      further database starts (those running finish) and the rest are
+      reported in `skipped`.
+
+  Reasons and results hold key ids and fingerprints, never keys. A function
+  of the caller's that raises fails its target with `{:callback_raised,
+  name, exception_type}` (its message isn't kept: it may hold anything);
+  one raising in `:on_result` or `:stop_on` stops the run and is re-raised
+  once the databases running finish.
+  """
+  @spec rekey_many(Enumerable.t(), keyword()) :: %{
+          rekeyed: [term()],
+          current: [term()],
+          absent: [term()],
+          failed: [{term(), term()}],
+          skipped: [term()]
+        }
+  def rekey_many(targets, opts \\ []), do: Sediment.S3.Many.rekey_many(targets, opts)
+
+  @doc """
+  Runs `release_key/4` over many databases, like `rekey_many/2` (the same
+  targets, options but `:to` and `:allow_reuse`, retries and callbacks).
+
+  Returns `%{released: [id], unchanged: [id], absent: [id], failed: [{id,
+  reason}], skipped: [id]}`: `released` dropped epochs under the key,
+  `unchanged` had none. Once `failed` is empty and `key_census_many/2`
+  says the key is `removable?/2`, it can leave the rings.
+  """
+  @spec release_key_many(Enumerable.t(), String.t(), keyword()) :: %{
+          released: [term()],
+          unchanged: [term()],
+          absent: [term()],
+          failed: [{term(), term()}],
+          skipped: [term()]
+        }
+  def release_key_many(targets, key_id, opts \\ []),
+    do: Sediment.S3.Many.release_key_many(targets, key_id, opts)
+
+  @doc """
+  `key_census/1` over many databases, aggregated by key. It reads manifests
+  only, so it is safe while the databases are open.
+
+  `targets` as for `rekey_many/2` (the path isn't needed: `%{id: id, s3:
+  s3_opts}` will do). Returns
+
+      %{
+        keys: %{key_id => %{current: [id], retained: [id]}},
+        absent: [id],
+        unencrypted: [id],
+        unreadable: [{id, reason}]
+      }
+
+  ## Options
+
+    * `:max_concurrency` - how many manifests are read at once (default 8).
+    * `:on_result` - `fn target, result -> any end`, as for `rekey_many/2`.
+  """
+  @spec key_census_many(Enumerable.t(), keyword()) :: %{
+          keys: %{String.t() => %{current: [term()], retained: [term()]}},
+          absent: [term()],
+          unencrypted: [term()],
+          unreadable: [{term(), term()}]
+        }
+  def key_census_many(targets, opts \\ []), do: Sediment.S3.Many.key_census_many(targets, opts)
+
+  @doc """
+  Whether the key `key_id` can leave the rings, from a `key_census_many/2`
+  result: no database has it current or retained, and none was unreadable
+  (an unread manifest may still need it).
+  """
+  @spec removable?(map(), String.t()) :: boolean()
+  def removable?(census, key_id), do: Sediment.S3.Many.removable?(census, key_id)
 
   @doc false
   # `encryption: false` (the explicit opt-out of encryption) travels with

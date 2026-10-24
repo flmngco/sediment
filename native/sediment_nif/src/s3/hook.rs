@@ -1,6 +1,7 @@
 //! Test hooks at fixed points of a rekey or key release
 //! (`Sediment.Native.s3_test_hook/3`): hold the operation there until
-//! released, fail it, or crash it (the lease stays taken, as after a kill).
+//! released, fail it (as a refusal, or as an S3 request would), or crash it
+//! (the lease stays taken, as after a kill).
 //! Armed for one database (its store and prefix) and one use.
 
 use std::sync::{Condvar, Mutex};
@@ -16,6 +17,9 @@ pub const PUBLISH: &str = "publish";
 pub enum Action {
     Pause,
     Fail,
+    /// Fails as an S3 request would (a store error): a transient fault,
+    /// the lease released as after any error.
+    StoreFail,
     Crash,
 }
 
@@ -87,6 +91,13 @@ pub(crate) fn at(stage: &str, place: &str, lease: &Lease) -> Result<()> {
         Action::Fail => {
             armed.state = State::Done;
             Err(S3Error::Config(format!("test hook: failed at {stage}")))
+        }
+        Action::StoreFail => {
+            armed.state = State::Done;
+            Err(S3Error::Store(object_store::Error::Generic {
+                store: "test hook",
+                source: format!("failed at {stage}").into(),
+            }))
         }
         Action::Crash => {
             armed.state = State::Done;

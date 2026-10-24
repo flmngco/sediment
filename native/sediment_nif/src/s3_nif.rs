@@ -662,13 +662,14 @@ fn s3_test_hook<'a>(env: Env<'a>, opts: Term<'a>, stage: String, action: Atom) -
     match action.as_str() {
         "pause" => s3::hook::arm(&place, &stage, s3::hook::Action::Pause),
         "fail" => s3::hook::arm(&place, &stage, s3::hook::Action::Fail),
+        "store_fail" => s3::hook::arm(&place, &stage, s3::hook::Action::StoreFail),
         "crash" => s3::hook::arm(&place, &stage, s3::hook::Action::Crash),
         "release" => s3::hook::release(&place),
         "state" => {}
         _ => {
             return error_tuple(
                 env,
-                "action must be :pause, :fail, :crash, :release or :state",
+                "action must be :pause, :fail, :store_fail, :crash, :release or :state",
             )
         }
     }

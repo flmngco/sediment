@@ -364,6 +364,78 @@ defmodule Sediment.KeyNetTest do
     for {m, f, 0} <- functions, do: assert({m, f, 0} in @no_arguments)
   end
 
+  # The functions over many databases with a valid target (whose store
+  # can't be reached) and a key in each option, and in the target: no key
+  # in the result, a reason or a callback's arguments.
+  test "the functions over many databases never show a key" do
+    dir = Temp.path!()
+    File.mkdir_p!(dir)
+
+    s3 = [
+      bucket: "b",
+      prefix: "p",
+      endpoint: "http://127.0.0.1:1",
+      region: "us-east-1",
+      access_key_id: "a",
+      secret_access_key: "s"
+    ]
+
+    test = self()
+    on_result = fn target, result -> send(test, {:callback, target, result}) end
+    target = %{id: "a", path: Path.join(dir, "a.db"), s3: s3}
+
+    key = @key
+
+    for shape <- shapes(key),
+        {targets, opts} <- [
+          {[target], [encryption: shape]},
+          {[target], [encryption: ring(key), to: shape]},
+          {[target], [encryption: fn _ -> shape end]},
+          {[%{target | s3: s3 ++ [encryption: shape]}], [encryption: ring(key)]},
+          {[%{target | s3: shape}], [encryption: ring(key)]},
+          {[target], [encryption: ring(key), around: fn _, _ -> raise inspect(shape) end]},
+          {[target],
+           [encryption: ring(key), check: fn _ -> {:error, :refused} end, max_concurrency: shape]}
+        ],
+        call <- [
+          fn -> Sediment.S3.rekey_many(targets, [attempts: 1, on_result: on_result] ++ opts) end,
+          fn ->
+            Sediment.S3.release_key_many(
+              targets,
+              "r1",
+              [attempts: 1, on_result: on_result] ++ opts
+            )
+          end,
+          fn -> Sediment.S3.key_census_many(targets, on_result: on_result) end
+        ] do
+      texts =
+        try do
+          [inspect(call.(), limit: :infinity)]
+        rescue
+          e ->
+            [
+              Exception.format(:error, e, __STACKTRACE__),
+              inspect(__STACKTRACE__, limit: :infinity)
+            ]
+        end
+
+      callbacks =
+        for {:callback, _target, result} <- flush(), do: inspect(result, limit: :infinity)
+
+      for text <- texts ++ callbacks do
+        refute shows?(text, key), String.slice(text, 0, 300)
+      end
+    end
+  end
+
+  defp flush do
+    receive do
+      message -> [message | flush()]
+    after
+      0 -> []
+    end
+  end
+
   @doc false
   def forward(event, measurements, metadata, test),
     do: send(test, {:telemetry, event, measurements, metadata})

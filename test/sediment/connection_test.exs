@@ -277,7 +277,7 @@ defmodule Sediment.ConnectionTest do
       {:ok, _, _, conn} = Sediment.Basic.exec(conn, "insert into t values (1)")
       {:ok, _, conn} = Connection.handle_begin([], conn)
       {:error, _, conn} = Sediment.Basic.exec(conn, "insert or rollback into t values (1)")
-      {:error, _, conn} = Connection.handle_begin([], conn)
+      {:error, _, conn} = Connection.handle_begin([mode: :savepoint], conn)
       {:ok, _, conn} = Connection.handle_rollback([], conn)
 
       assert {:ok, _, %{rows: [["<redacted>"]]}, conn} =
@@ -285,6 +285,51 @@ defmodule Sediment.ConnectionTest do
 
       assert {:ok, _, %{rows: [[^literal]]}, conn} = Sediment.Basic.exec(conn, select)
       :ok = Sediment.Basic.close(conn)
+    end
+
+    # A top-level begin on a transaction the database rolled back and nobody
+    # ended starts a new transaction (the savepoint above is refused).
+    test "a new transaction after one the database rolled back begins" do
+      {:ok, conn} = Sediment.Basic.open(":memory:")
+      {:ok, _, _, conn} = Sediment.Basic.exec(conn, "create table t (id integer primary key)")
+      {:ok, _, _, conn} = Sediment.Basic.exec(conn, "insert into t values (1)")
+      {:ok, _, conn} = Connection.handle_begin([], conn)
+      {:error, _, conn} = Sediment.Basic.exec(conn, "insert or rollback into t values (1)")
+      assert conn.transaction_status == :error
+
+      assert {:ok, _, conn} = Connection.handle_begin([mode: :immediate], conn)
+      assert conn.transaction_status == :transaction
+      {:ok, _, _, conn} = Sediment.Basic.exec(conn, "insert into t values (2)")
+      {:ok, _, conn} = Connection.handle_commit([], conn)
+
+      assert {:ok, _, %{rows: [[1], [2]]}, conn} =
+               Sediment.Basic.exec(conn, "select id from t order by id")
+
+      :ok = Sediment.Basic.close(conn)
+    end
+
+    # A BEGIN run as a query, aborted by the database and checked in
+    # unfinished: the pool's next transaction heals the connection (before,
+    # it disconnected; for a moment it was stuck).
+    test "a pooled connection left in a rolled-back transaction heals at the next transaction" do
+      {:ok, pool} = Sediment.start_link(database: ":memory:", pool_size: 1)
+      Sediment.query!(pool, "create table t (id integer primary key)")
+      Sediment.query!(pool, "insert into t values (1)")
+
+      DBConnection.run(pool, fn conn ->
+        Sediment.query!(conn, "BEGIN")
+
+        assert {:error, _} = Sediment.query(conn, "insert or rollback into t values (1)")
+      end)
+
+      assert {:ok, :ok} =
+               Sediment.transaction(pool, fn conn ->
+                 Sediment.query!(conn, "insert into t values (2)")
+                 :ok
+               end)
+
+      assert %{rows: [[1], [2]]} = Sediment.query!(pool, "select id from t order by id")
+      GenServer.stop(pool)
     end
   end
 

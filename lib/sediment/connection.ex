@@ -683,13 +683,31 @@ defmodule Sediment.Connection do
     end
   end
 
-  # A savepoint on a transaction the database rolled back (in practice under
-  # Ecto's SQL sandbox, whose test transaction is the outer one): refused
-  # like any statement there, as an error, the connection kept. A status
-  # result ({:error, state}) would make DBConnection disconnect, and the
-  # sandbox doesn't take it.
-  def handle_begin(_options, %{transaction_status: :error} = state),
-    do: {:error, aborted_error("SAVEPOINT sediment_savepoint"), state}
+  # A transaction the database rolled back (a write-write conflict, ON
+  # CONFLICT ROLLBACK) and nobody ended:
+  #
+  #   * a savepoint on it (in practice under Ecto's SQL sandbox, whose test
+  #     transaction is the outer one) is refused like any statement there,
+  #     as an error, the connection kept (a status result, {:error, state},
+  #     would make DBConnection disconnect, and the sandbox doesn't take it);
+  #   * a new transaction (a BEGIN run as a query and checked in without its
+  #     ROLLBACK leaves the connection so) ends it first: the database has,
+  #     so only the status is reset (a ROLLBACK if it hasn't, or a
+  #     disconnect if that fails).
+  def handle_begin(options, %{transaction_status: :error} = state) do
+    if Keyword.get(options, :mode) == :savepoint do
+      {:error, aborted_error("SAVEPOINT sediment_savepoint"), state}
+    else
+      healed = %{state | transaction_status: :idle, pending_begin: false}
+
+      with {:ok, status} when status != :idle <- Engine.transaction_status(state.db),
+           {:error, reason} <- Engine.execute(state.db, "ROLLBACK") do
+        {:disconnect, %Error{message: to_string(reason), statement: "ROLLBACK"}, state}
+      else
+        _ended -> handle_begin(options, healed)
+      end
+    end
+  end
 
   @impl true
   def handle_commit(_options, %{transaction_status: :error} = state), do: {:error, state}

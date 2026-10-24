@@ -349,7 +349,7 @@ defmodule Sediment.S3.Keys do
   # (and pass through the net anyway): a key ring's errors (normalization,
   # a failed key_for), the ArgumentErrors and RuntimeErrors raised in a
   # module of Sediment's (a NIF's badarg is raised in Sediment.Native, as
-  # "argument error"), Sediment.Error, and DBConnection's errors, which
+  # "argument error") or of Ecto's, Sediment.Error, and DBConnection's errors, which
   # callers handle by their type.
   @passing [
     Sediment.Error,
@@ -371,8 +371,12 @@ defmodule Sediment.S3.Keys do
 
   defp passes?(_exception, _stacktrace), do: false
 
+  # Sediment's modules, and Ecto's: Ecto's ArgumentErrors and RuntimeErrors
+  # say why a repo didn't start (a `log: :verbose`, a driver missing), and
+  # name options, not their values; the net still covers them.
   defp sediment_module?(module) do
     case Atom.to_string(module) do
+      "Elixir.Ecto." <> _ -> true
       "Elixir." <> _ -> "Sediment" in Module.split(module)
       _erlang -> false
     end
@@ -472,6 +476,11 @@ defmodule Sediment.S3.Keys do
   defp keyword?([]), do: true
   defp keyword?([{key, _value} | rest]) when is_atom(key), do: keyword?(rest)
   defp keyword?(_other), do: false
+
+  @doc false
+  # A stack trace without its frames' arguments (see scrubbed/1).
+  @spec scrub_stacktrace(Exception.stacktrace()) :: Exception.stacktrace()
+  def scrub_stacktrace(stacktrace), do: Enum.map(stacktrace, &scrub_frame/1)
 
   # A frame's module and function are atoms a caller can have given too
   # (a key as a module, called).
