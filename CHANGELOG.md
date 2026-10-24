@@ -81,9 +81,12 @@ destroy the prefix).
   of `{path, s3_opts}` or `%{id:, path:, s3:}` targets, a few at a time
   (`max_concurrency`, 1 by default; 2 for the census), never stopping at a
   failure, and report every target by id (`rekeyed`, `current`, `absent`,
-  `failed`, `skipped`; the census by key, with `removable?/2`). A result
-  that may still change (fenced, indeterminate, a store error) is retried
-  (`attempts`, `backoff`); a refusal isn't. `around:` wraps each target's
+  `failed`, `skipped`; the census by key, with `removable?/3`, false while
+  any target is absent or unreadable: a wrong bucket or prefix reads as
+  absent; `current: new_id` also needs every target under the new key). A
+  result that may still change (fenced, indeterminate, a store error) is
+  retried (`attempts`, `backoff`; a retried failure reports every
+  attempt's reason); a refusal isn't. `around:` wraps each target's
   operation (close a tenant's pool before, reopen it after), `check:`
   refuses a target, `on_result:` reports progress, `stop_on:` stops
   starting targets; `encryption:` is a ring or a function of the target. A

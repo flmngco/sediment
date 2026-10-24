@@ -126,7 +126,9 @@ defmodule Sediment.S3RotationManyTest do
 
     census = S3.key_census_many(targets)
     assert census.keys == %{"r2" => %{current: all, retained: []}}
+    assert census.targets == all
     assert S3.removable?(census, "r1")
+    assert S3.removable?(census, "r1", current: "r2")
 
     assert %{released: [], unchanged: ^all, failed: []} =
              S3.release_key_many(targets, "r1", encryption: ring(["r2"]))
@@ -176,6 +178,20 @@ defmodule Sediment.S3RotationManyTest do
     assert rows(t2, ["r2"]) == ["t2"]
   end
 
+  # A crash at the publication (fenced, retried) leaves the lease taken, so
+  # the retry is refused ("lease held"): the failure keeps both reasons, the
+  # first saying the rekey may have switched.
+  test "a retried failure reports every attempt's reason", %{base: base, dir: dir} do
+    [t1] = targets = tenants(1, base, dir)
+    :armed = Native.s3_test_hook(t1.s3, "publish", :crash)
+
+    assert %{failed: [{"t1", {:attempts, [first, last]}}]} =
+             S3.rekey_many(targets, encryption: ring(["r2", "r1"]), backoff: 10)
+
+    assert first =~ "s3 writer fenced: test hook: crashed at publish"
+    assert last =~ "s3 lease held"
+  end
+
   test "around: runs once per target, around its rekey; it can refuse one; stop_on: stops",
        %{base: base, dir: dir} do
     targets = tenants(3, base, dir)
@@ -214,6 +230,32 @@ defmodule Sediment.S3RotationManyTest do
                encryption: ring(["r2", "r1"]),
                stop_on: fn "t1", {:ok, :current} -> true end
              )
+  end
+
+  # A wrong prefix (an unset environment variable, say) reads every target
+  # absent, with nothing failed: the key the real databases need is never
+  # reported removable.
+  test "a misaddressed fleet never makes the old key removable", %{base: base, dir: dir} do
+    real = tenants(2, base, dir)
+    wrong = for t <- real, do: %{t | s3: s3_opts("#{base}-wrong/#{t.id}")}
+
+    assert %{rekeyed: [], absent: ["t1", "t2"], failed: []} =
+             S3.rekey_many(wrong, encryption: ring(["r2", "r1"]))
+
+    census = S3.key_census_many(wrong)
+    assert %{keys: keys, absent: ["t1", "t2"], targets: ["t1", "t2"]} = census
+    assert keys == %{}
+    refute S3.removable?(census, "r1")
+    refute S3.removable?(census, "r1", current: "r2")
+
+    # One real database rekeyed, one target misaddressed: still kept.
+    [t1, _t2] = real
+    assert %{rekeyed: ["t1"]} = S3.rekey_many([t1], encryption: ring(["r2", "r1"]))
+    %{failed: []} = S3.release_key_many([t1], "r1", encryption: ring(["r2"]))
+    mixed = S3.key_census_many([t1, List.last(wrong)])
+    assert %{absent: ["t2"]} = mixed
+    refute S3.removable?(mixed, "r1")
+    refute S3.removable?(mixed, "r1", current: "r2")
   end
 
   test "an empty location is reported absent", %{base: base, dir: dir} do

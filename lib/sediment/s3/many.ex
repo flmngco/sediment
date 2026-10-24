@@ -72,7 +72,7 @@ defmodule Sediment.S3.Many do
     results =
       collect(targets, Keyword.get(opts, :max_concurrency, 2), census, opts[:on_result], nil)
 
-    acc = %{keys: %{}, absent: [], unencrypted: [], unreadable: []}
+    acc = %{keys: %{}, absent: [], unencrypted: [], unreadable: [], targets: ids(targets)}
 
     results
     |> Enum.sort_by(fn {target, _} -> target.index end)
@@ -87,24 +87,40 @@ defmodule Sediment.S3.Many do
     |> Map.update!(:unreadable, &Enum.reverse/1)
   end
 
-  @spec removable?(map(), String.t()) :: boolean()
-  def removable?(%{keys: keys, unreadable: unreadable}, key_id) do
+  @spec removable?(map(), String.t(), keyword()) :: boolean()
+  def removable?(census, key_id, opts \\ [])
+
+  def removable?(%{keys: keys, absent: absent, unreadable: unreadable} = census, key_id, opts) do
     id = to_string(key_id)
 
-    unreadable == [] and
-      case keys do
-        %{^id => %{current: [], retained: []}} -> true
-        %{^id => _} -> false
-        _ -> true
-      end
+    # A target read as absent may be a misaddressed one (a wrong bucket or
+    # prefix) whose real database needs the key: never removable then.
+    free? =
+      absent == [] and unreadable == [] and
+        case keys do
+          %{^id => %{current: [], retained: []}} -> true
+          %{^id => _} -> false
+          _ -> true
+        end
+
+    case Keyword.fetch(opts, :current) do
+      :error -> free?
+      {:ok, current} -> free? and all_current?(census, to_string(current))
+    end
   end
 
-  def removable?(_census, _key_id),
+  def removable?(_census, _key_id, _opts),
     do:
       raise(
         ArgumentError,
-        "Sediment.S3.removable?/2 expects the result of key_census_many/2"
+        "Sediment.S3.removable?/3 expects the result of key_census_many/2"
       )
+
+  # Every target read, under `current`.
+  defp all_current?(%{targets: targets, keys: keys}, current),
+    do: targets != [] and match?(%{^current => %{current: ^targets}}, keys)
+
+  defp ids(targets), do: Enum.map(targets, & &1.id)
 
   ## Outcomes
 
@@ -156,7 +172,11 @@ defmodule Sediment.S3.Many do
   # operation with its retries; on_result: and stop_on: run in the caller,
   # in completion order. Returns the outcome lists in the targets' order.
   defp run(targets, opts, op, outcome, kinds) do
-    one = fn target -> {target, attempt(target, opts, op)} end
+    one = fn target ->
+      {result, earlier} = attempt(target, opts, op)
+      {Map.put(target, :earlier, earlier), result}
+    end
+
     stop_on = opts[:stop_on]
     stop? = stop_on && fn {target, result} -> stop_on.(target.id, result) end
 
@@ -171,7 +191,7 @@ defmodule Sediment.S3.Many do
       |> Enum.sort_by(fn {target, _} -> target.index end)
       |> Enum.reduce(acc, fn {target, result}, acc ->
         case outcome.(result) do
-          :failed -> Map.update!(acc, :failed, &[{target.id, reason(result)} | &1])
+          :failed -> Map.update!(acc, :failed, &[{target.id, failure(target, result)} | &1])
           kind -> Map.update!(acc, kind, &[target.id | &1])
         end
       end)
@@ -181,12 +201,21 @@ defmodule Sediment.S3.Many do
     |> Map.put(:skipped, for(target <- targets, target.index not in done, do: target.id))
   end
 
+  # The last result's reason; after retries every attempt's, in order (an
+  # indeterminate result followed by a refusal reads as what it is: the
+  # operation may have happened).
+  defp failure(%{earlier: [_ | _] = earlier}, result),
+    do: {:attempts, Enum.map(earlier ++ [result], &reason/1)}
+
+  defp failure(_target, result), do: reason(result)
+
   defp reason({:error, reason}), do: reason
   defp reason(other), do: {:unexpected, other}
 
   # The caller's around: wraps all of the target's attempts. The result is
   # what the operation returned when around: ran it, else around:'s own
-  # {:error, reason} (a refusal of its own), else {:error, :not_run}.
+  # {:error, reason} (a refusal of its own), else {:error, :not_run}; with
+  # the results of the attempts before the last.
   defp attempt(target, opts, op) do
     case opts[:around] do
       nil ->
@@ -197,18 +226,18 @@ defmodule Sediment.S3.Many do
         Process.delete(key)
 
         runner = fn ->
-          result = attempts(target, opts, op)
-          Process.put(key, result)
+          {result, _earlier} = outcome = attempts(target, opts, op)
+          Process.put(key, outcome)
           result
         end
 
         returned = callback(:around, fn -> around.(target.given, runner) end)
 
         case {Process.get(key), returned} do
-          {_ran, {:error, {:callback_raised, :around, _}} = raised} -> raised
-          {nil, {:error, _} = refused} -> refused
-          {nil, _other} -> {:error, :not_run}
-          {result, _returned} -> result
+          {_ran, {:error, {:callback_raised, :around, _}} = raised} -> {raised, []}
+          {nil, {:error, _} = refused} -> {refused, []}
+          {nil, _other} -> {{:error, :not_run}, []}
+          {outcome, _returned} -> outcome
         end
     end
   end
@@ -216,14 +245,10 @@ defmodule Sediment.S3.Many do
   defp attempts(target, opts, op) do
     with :ok <- check(target, opts[:check]),
          {:ok, ring} <- ring(target, opts[:encryption]) do
-      retrying(
-        target,
-        ring,
-        op,
-        Keyword.get(opts, :attempts, 3),
-        Keyword.get(opts, :backoff, 1_000),
-        1
-      )
+      attempts = Keyword.get(opts, :attempts, 3)
+      retrying(target, ring, op, {attempts, Keyword.get(opts, :backoff, 1_000)}, [])
+    else
+      refused -> {refused, []}
     end
   end
 
@@ -245,14 +270,16 @@ defmodule Sediment.S3.Many do
 
   defp ring(_target, ring), do: {:ok, ring}
 
-  defp retrying(target, ring, op, attempts, backoff, n) do
+  # The last result, and those before it.
+  defp retrying(target, ring, op, {attempts, backoff} = retries, earlier) do
     result = operation(fn -> op.(target, ring) end)
+    n = length(earlier) + 1
 
     if retry?(result) and n < attempts do
       Process.sleep(backoff * Integer.pow(2, n - 1))
-      retrying(target, ring, op, attempts, backoff, n + 1)
+      retrying(target, ring, op, retries, earlier ++ [result])
     else
-      result
+      {result, earlier}
     end
   end
 
@@ -287,7 +314,7 @@ defmodule Sediment.S3.Many do
   defp loop([target | rest], running, max, one, callbacks, done, nil)
        when map_size(running) < max do
     task = Task.async(fn -> one.(target) end)
-    loop(rest, Map.put(running, task.ref, task), max, one, callbacks, done, nil)
+    loop(rest, Map.put(running, task.ref, target), max, one, callbacks, done, nil)
   end
 
   # The caller's exception, its frames without their arguments (ours hold
@@ -301,14 +328,21 @@ defmodule Sediment.S3.Many do
        do: Enum.reverse(done)
 
   defp loop(queue, running, max, one, {on_result, stop?} = callbacks, done, stop) do
-    receive do
-      {ref, {target, result}} when is_map_key(running, ref) ->
-        Process.demonitor(ref, [:flush])
-        running = Map.delete(running, ref)
-        done = [{target, result} | done]
-        stop = stop || after_result(target, result, on_result, stop?)
-        loop(queue, running, max, one, callbacks, done, stop)
-    end
+    {target, result, running} =
+      receive do
+        {ref, {target, result}} when is_map_key(running, ref) ->
+          Process.demonitor(ref, [:flush])
+          {target, result, Map.delete(running, ref)}
+
+        # A task killed from outside (its own failures are results): with
+        # the caller trapping exits, it would otherwise wait forever.
+        {:DOWN, ref, :process, _pid, _reason} when is_map_key(running, ref) ->
+          {Map.fetch!(running, ref), {:error, :crashed}, Map.delete(running, ref)}
+      end
+
+    done = [{target, result} | done]
+    stop = stop || after_result(target, result, on_result, stop?)
+    loop(queue, running, max, one, callbacks, done, stop)
   end
 
   defp after_result(target, result, on_result, stop?) do

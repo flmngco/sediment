@@ -740,13 +740,22 @@ defmodule Sediment.S3 do
   reason}], skipped: [id]}`, ids in the targets' order:
 
     * `rekeyed` - moved to the new key; `current` - under it already;
-    * `absent` - no database at the location;
-    * `failed` - the last result's reason, after the retries below;
+    * `absent` - no database at the location: a database that doesn't
+      exist, or a wrong bucket or prefix;
+    * `failed` - the result's reason; for a target retried,
+      `{:attempts, [reason]}`, every attempt's in order (an indeterminate
+      result followed by a refusal may still have switched);
     * `skipped` - not started, after `:stop_on` stopped the run.
 
   A re-run finds the rekeyed ones `current`, so running it again until
   `failed` is empty finishes the rotation (see "Only `{:ok, _}` is an
-  outcome" in `rekey/3`: keep both keys in every ring until then).
+  outcome" in `rekey/3`: keep both keys in every ring until then). **The
+  rotation is finished only when `failed` is empty and `absent` holds only
+  databases you know don't exist**: a wrong bucket or prefix reads as
+  absent, with nothing failed. Take the targets from the application's own
+  list of databases, and check with `key_census_many/2` and
+  `removable?(census, old_id, current: new_id)` before a key leaves the
+  rings.
 
   **Retries.** A result that may still change (`{:error, {:fenced, _}}`,
   `{:error, {:indeterminate, _}}`, an S3 store error) is retried up to
@@ -818,8 +827,9 @@ defmodule Sediment.S3 do
 
   Returns `%{released: [id], unchanged: [id], absent: [id], failed: [{id,
   reason}], skipped: [id]}`: `released` dropped epochs under the key,
-  `unchanged` had none. Once `failed` is empty and `key_census_many/2`
-  says the key is `removable?/2`, it can leave the rings.
+  `unchanged` had none. Once `failed` is empty, `absent` holds only
+  databases you know don't exist, and `removable?/3` says so on a fresh
+  `key_census_many/2`, the key can leave the rings.
   """
   @spec release_key_many(Enumerable.t(), String.t(), keyword()) :: %{
           released: [term()],
@@ -842,8 +852,13 @@ defmodule Sediment.S3 do
         keys: %{key_id => %{current: [id], retained: [id]}},
         absent: [id],
         unencrypted: [id],
-        unreadable: [{id, reason}]
+        unreadable: [{id, reason}],
+        targets: [id]
       }
+
+  `absent` lists the targets with no database at their location: expected
+  for a database that doesn't exist yet, and the sign of a wrong bucket or
+  prefix otherwise (see `removable?/3`). `targets` lists every target.
 
   ## Options
 
@@ -855,17 +870,32 @@ defmodule Sediment.S3 do
           keys: %{String.t() => %{current: [term()], retained: [term()]}},
           absent: [term()],
           unencrypted: [term()],
-          unreadable: [{term(), term()}]
+          unreadable: [{term(), term()}],
+          targets: [term()]
         }
   def key_census_many(targets, opts \\ []), do: Sediment.S3.Many.key_census_many(targets, opts)
 
   @doc """
   Whether the key `key_id` can leave the rings, from a `key_census_many/2`
-  result: no database has it current or retained, and none was unreadable
-  (an unread manifest may still need it).
+  result: no database has it current or retained, none was unreadable, and
+  none was absent.
+
+  An absent target makes it false: a fleet addressed wrongly (a wrong
+  bucket or prefix, an unset environment variable, a re-pointed
+  configuration) reads as all absent, and its real databases still need
+  the key. Take the targets from the application's own list of databases,
+  never from a guess, and drop from it the ones you know don't exist.
+
+  With `current: new_id` (the documented form, after a rotation to
+  `new_id`), it is true only when, besides, every target was read under
+  `new_id`:
+
+      census = Sediment.S3.key_census_many(targets)
+      Sediment.S3.removable?(census, "r1", current: "r2")
   """
-  @spec removable?(map(), String.t()) :: boolean()
-  def removable?(census, key_id), do: Sediment.S3.Many.removable?(census, key_id)
+  @spec removable?(map(), String.t(), keyword()) :: boolean()
+  def removable?(census, key_id, opts \\ []),
+    do: Sediment.S3.Many.removable?(census, key_id, opts)
 
   @doc false
   # `encryption: false` (the explicit opt-out of encryption) travels with
