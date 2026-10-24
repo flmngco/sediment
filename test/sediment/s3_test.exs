@@ -1301,6 +1301,12 @@ defmodule Sediment.S3Test do
       assert restored_ids(s3, dir) == [1]
     end
 
+    # The refused storage acknowledges no commit, and every commit
+    # acknowledged is durable. Which connection the next insert gets is
+    # timing: the other one, still on the poisoned storage (refused), or
+    # one already reconnected, which took the database over afresh once the
+    # poisoned storage was gone (an open never attaches to a poisoned one):
+    # its commit is acknowledged and durable.
     test "through DBConnection", %{s3: s3, dir: dir} do
       {:ok, conn} =
         DBConnection.start_link(Sediment.Connection,
@@ -1311,11 +1317,25 @@ defmodule Sediment.S3Test do
 
       {:ok, _} = Sediment.query(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
       {:ok, _} = Sediment.query(conn, "INSERT INTO t VALUES (1)", [])
+      {:ok, %{generation: generation}} = S3.info(conn)
       assert {:error, _} = Sediment.query(conn, "PRAGMA journal_mode = wal", [])
-      assert {:error, _} = Sediment.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      {insert, info} =
+        DBConnection.run(conn, fn c ->
+          {Sediment.query(c, "INSERT INTO t VALUES (2)", []), S3.info(c)}
+        end)
+
       GenServer.stop(conn)
 
-      assert restored_ids(s3, dir) == [1]
+      case insert do
+        {:error, _} ->
+          assert restored_ids(s3, dir) == [1]
+
+        {:ok, _} ->
+          assert {:ok, %{generation: later, poisoned: nil}} = info
+          assert later > generation
+          assert restored_ids(s3, dir) == [1, 2]
+      end
     end
   end
 
