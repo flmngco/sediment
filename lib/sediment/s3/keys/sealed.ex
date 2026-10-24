@@ -41,13 +41,23 @@ defmodule Sediment.S3.Keys.Sealed do
   end
 
   defp sealed?(module, {name, arity} = definition, except, only) do
-    {:v1, _kind, meta, _clauses} = Module.get_definition(module, definition)
+    {:v1, _kind, meta, clauses} = Module.get_definition(module, definition)
 
     # A head generated for default arguments calls the full arity, which is
     # sealed.
-    meta[:context] != :elixir_def and
+    not default_head?(meta, clauses) and
       not String.starts_with?(Atom.to_string(name), "__") and
       {name, arity} not in except and
       (only == nil or {name, arity} in only)
+  end
+
+  # Elixir 1.20 marks the head's metadata; 1.18 only its body, a `super`
+  # call tagged as a default's.
+  defp default_head?(meta, clauses) do
+    meta[:context] == :elixir_def or
+      case clauses do
+        [{_meta, _args, [], {:super, call, _args_passed}}] -> call[:default] == true
+        _ -> false
+      end
   end
 end
