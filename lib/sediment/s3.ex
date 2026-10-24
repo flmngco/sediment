@@ -828,13 +828,19 @@ defmodule Sediment.S3 do
   run and is re-raised, through the net, once the databases running
   finish.
 
-  Each database runs in a process of its own, monitored, not linked: one
-  that exits (a linked process of `:around`'s exiting, a kill) fails its
-  target with `:crashed` (the rekey may have happened, the database may be
-  left closed: `:around`'s `after` doesn't run on an exit) and the others
-  go on. If the caller dies, the databases running still finish (with
-  `:around` reopening each) and no further one starts: run it again for
-  the report.
+  Each database runs in a process of its own, monitored, not linked, that
+  traps exits: a process linked to it (one `:around` started) exiting
+  abnormally doesn't stop the rekey or `:around`; once both end, the target
+  fails with `{:linked_exit, result}`, `result` the rekey's (`:around`
+  must return: one waiting forever on a process that died holds its slot
+  forever). A process killed all the same (`Process.exit(pid, :kill)`) may
+  leave its rekey running natively, holding a dirty I/O scheduler, the
+  file and the lease: its target fails with `{:crashed, why}`, no further
+  database starts (the rest are `skipped`), and the databases running
+  finish. Wait until that rekey ends (an open of its path no longer fails
+  with `"busy: ..."`), then run again. If the caller dies, the databases
+  running still finish (with `:around` reopening each) and no further one
+  starts: run it again for the report.
   """
   @spec rekey_many(Enumerable.t(), keyword()) :: %{
           rekeyed: [term()],
@@ -885,7 +891,9 @@ defmodule Sediment.S3 do
 
   `absent` lists the targets with no database at their location: expected
   for a database that doesn't exist yet, and the sign of a wrong bucket or
-  prefix otherwise (see `removable?/3`). `targets` lists every target.
+  prefix otherwise (see `removable?/3`). `unreadable` lists a target not
+  read after a reader's process was killed with reason `:skipped`.
+  `targets` lists every target.
 
   ## Options
 

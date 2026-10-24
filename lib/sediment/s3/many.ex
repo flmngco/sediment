@@ -7,6 +7,9 @@ defmodule Sediment.S3.Many do
   alias Sediment.S3
   alias Sediment.S3.Keys
 
+  @crashed "its process was killed; its operation may still be running: wait until it ends " <>
+             "(an open of its path no longer busy), then run again"
+
   @common [
     :encryption,
     :max_concurrency,
@@ -71,6 +74,10 @@ defmodule Sediment.S3.Many do
 
     results =
       collect(targets, Keyword.get(opts, :max_concurrency, 2), census, opts[:on_result], nil)
+
+    # Not read, after a worker died: unreadable, never a sign of a free key.
+    read = MapSet.new(results, fn {target, _} -> target.index end)
+    results = results ++ for(t <- targets, t.index not in read, do: {t, {:error, :skipped}})
 
     acc = %{keys: %{}, absent: [], unencrypted: [], unreadable: [], targets: ids(targets)}
 
@@ -317,11 +324,15 @@ defmodule Sediment.S3.Many do
   # as each finishes. Once stop? is true (or on_result or stop? raises, which
   # is re-raised once the workers running finish), no further target starts.
   #
-  # The workers are monitored, never linked: one that exits (a linked
-  # helper of around: exiting, a kill) fails its target with :crashed, the
-  # others running on; and if this process dies, those running still
-  # finish their target (around: reopening its database), none further
-  # starting.
+  # The workers are monitored, never linked, and trap exits: a process
+  # linked to one (a helper of around:'s) exiting abnormally can't stop it
+  # mid-operation; the target fails with {:linked_exit, result} once its
+  # operation and around: end. One that dies all the same (a kill) may
+  # leave its native operation running, holding a dirty I/O scheduler, the
+  # file and the lease, which its slot must not hand to the next target:
+  # its target fails with {:crashed, why} and no further target starts. If
+  # this process dies, the workers running still finish their target
+  # (around: reopening its database), none further starting.
   defp collect(targets, max, one, on_result, stop?) do
     loop(targets, %{}, max, one, {on_result, stop?}, [], nil)
   end
@@ -343,35 +354,48 @@ defmodule Sediment.S3.Many do
        do: Enum.reverse(done)
 
   defp loop(queue, running, max, one, {on_result, stop?} = callbacks, done, stop) do
-    {target, result, running} =
+    {target, result, running, crashed} =
       receive do
         {__MODULE__, pid, {target, result}} when is_map_key(running, pid) ->
           {ref, _target} = Map.fetch!(running, pid)
           Process.demonitor(ref, [:flush])
-          {target, result, Map.delete(running, pid)}
+          {target, result, Map.delete(running, pid), nil}
 
-        # A worker that exited (its own failures are results): its reason
+        # A worker that died (its own failures are results): its reason
         # isn't kept (it may hold anything).
         {:DOWN, _ref, :process, pid, _reason} when is_map_key(running, pid) ->
           {_ref, target} = Map.fetch!(running, pid)
-          {target, {:error, :crashed}, Map.delete(running, pid)}
+          {target, {:error, {:crashed, @crashed}}, Map.delete(running, pid), :stop}
       end
 
     done = [{target, result} | done]
-    stop = stop || after_result(target, result, on_result, stop?)
+    stop = stop || after_result(target, result, on_result, stop?) || crashed
     loop(queue, running, max, one, callbacks, done, stop)
   end
 
   # A worker as Task.async/1 starts one (its $callers, for a sandbox's
-  # allowances), monitored but not linked.
+  # allowances), monitored but not linked, trapping exits.
   defp start(target, one) do
     caller = self()
     callers = [caller | Process.get(:"$callers", [])]
 
     spawn_monitor(fn ->
+      Process.flag(:trap_exit, true)
       Process.put(:"$callers", callers)
-      send(caller, {__MODULE__, self(), one.(target)})
+      {target, result} = one.(target)
+      result = if linked_exit?(), do: {:error, {:linked_exit, result}}, else: result
+      send(caller, {__MODULE__, self(), {target, result}})
     end)
+  end
+
+  # Whether a linked process exited abnormally meanwhile (its reason isn't
+  # kept: it may hold anything).
+  defp linked_exit? do
+    receive do
+      {:EXIT, _pid, reason} when reason != :normal -> true
+    after
+      0 -> false
+    end
   end
 
   defp after_result(target, result, on_result, stop?) do

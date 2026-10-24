@@ -94,8 +94,10 @@ destroy the prefix).
   its `:encryption` hidden (still usable to reopen it), and their reasons
   and re-raised exceptions pass the key net. An `around:` failing after the
   operation fails the target with `{:around_failed, reason, result}`. Each
-  target runs in a monitored, unlinked process: one that exits fails its
-  target with `:crashed`, and the others go on.
+  target runs in a monitored, unlinked process trapping exits: a linked
+  process exiting fails the target with `{:linked_exit, result}` once its
+  operation ends; one killed fails it with `{:crashed, why}` and stops
+  further starts, as its native operation may still be running.
 
 ### Fixed
 

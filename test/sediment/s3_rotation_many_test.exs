@@ -233,8 +233,8 @@ defmodule Sediment.S3RotationManyTest do
   end
 
   # A tenant's reopen failing after its rekey, and a process linked to
-  # around: exiting, each fail their target alone, the rekey's outcome kept
-  # in the first; the caller, not trapping exits, gets the report.
+  # around: exiting, each fail their target alone, the rekey's outcome
+  # kept; the caller, not trapping exits, gets the report.
   test "around: failing after the rekey, or its process exiting, fails that target alone",
        %{base: base, dir: dir} do
     targets = tenants(4, base, dir)
@@ -252,9 +252,9 @@ defmodule Sediment.S3RotationManyTest do
           raise "reopen failed"
         end
 
-      %{id: "t3"}, _rekey ->
+      %{id: "t3"}, rekey ->
         spawn_link(fn -> exit(:tenant_worker_failed) end)
-        Process.sleep(:infinity)
+        rekey.()
 
       _target, rekey ->
         rekey.()
@@ -282,14 +282,138 @@ defmodule Sediment.S3RotationManyTest do
                {"t2",
                 {:around_failed, {:callback_raised, :around, RuntimeError},
                  {:ok, %{from: "r1", to: "r2"}}}},
-               {"t3", :crashed}
+               {"t3", {:linked_exit, {:ok, %{from: "r1", to: "r2"}}}}
              ],
              skipped: []
            } = report
 
     # The rekeys whose reopen failed happened: a re-run finds them current.
-    assert %{current: ["t1", "t2", "t4"], rekeyed: ["t3"], failed: []} =
+    assert %{current: ["t1", "t2", "t3", "t4"], failed: []} =
              S3.rekey_many(targets, encryption: ring(["r2", "r1"]))
+  end
+
+  # The rekeys running at once (one telemetry span each), at most.
+  defp most_at_once do
+    counts = :atomics.new(2, [])
+    handler = {__MODULE__, :at_once, self()}
+
+    :telemetry.attach_many(
+      handler,
+      [[:sediment, :s3, :rekey, :start], [:sediment, :s3, :rekey, :stop]],
+      fn
+        [_, _, _, :start], _, _, _ ->
+          now = :atomics.add_get(counts, 1, 1)
+          if now > :atomics.get(counts, 2), do: :atomics.put(counts, 2, now)
+
+        [_, _, _, :stop], _, _, _ ->
+          :atomics.sub(counts, 1, 1)
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    fn -> :atomics.get(counts, 2) end
+  end
+
+  # A query on a database of its own, again and again until told: the
+  # slowest one's time, in ms.
+  defp slowest_query(dir) do
+    test = self()
+
+    spawn_link(fn ->
+      {:ok, db} = Engine.open(Path.join(dir, "other.db"))
+      send(test, {:slowest, query_loop(db, 0)})
+      Engine.close(db)
+    end)
+  end
+
+  defp query_loop(db, slowest) do
+    {micros, :ok} = :timer.tc(fn -> Engine.execute(db, "SELECT 1") end)
+    slowest = max(slowest, div(micros, 1000))
+
+    receive do
+      :done -> slowest
+    after
+      5 -> query_loop(db, slowest)
+    end
+  end
+
+  # More targets than dirty I/O schedulers, each with a linked helper
+  # exiting mid-rekey: each worker finishes its rekey before its slot is
+  # handed on, so one rekey runs at a time and other queries stay fast.
+  test "a linked exit mid-rekey never frees the slot of a rekey still running",
+       %{base: base, dir: dir} do
+    n = :erlang.system_info(:dirty_io_schedulers) + 2
+    targets = tenants(n, base, dir)
+    at_once = most_at_once()
+    querier = slowest_query(dir)
+
+    around = fn _target, rekey ->
+      spawn_link(fn ->
+        Process.sleep(5)
+        exit(:tenant_worker_failed)
+      end)
+
+      rekey.()
+    end
+
+    report =
+      S3.rekey_many(targets,
+        encryption: ring(["r2", "r1"]),
+        max_concurrency: 1,
+        around: around
+      )
+
+    send(querier, :done)
+    assert_receive {:slowest, slowest}, 10_000
+
+    assert %{failed: failed, skipped: []} = report
+    assert length(failed) == n
+    for {_id, reason} <- failed, do: assert({:linked_exit, {:ok, %{to: "r2"}}} = reason)
+    assert at_once.() == 1
+    assert slowest < 2_000
+  end
+
+  # Killed mid-rekey, a worker may leave its native rekey running: no
+  # further target starts; once that rekey ends, a re-run finishes.
+  test "a worker killed mid-rekey stops the run, the rest skipped", %{base: base, dir: dir} do
+    [t1 | _] = targets = tenants(3, base, dir)
+    test = self()
+
+    around = fn %{id: id}, rekey ->
+      send(test, {:rekeying, id, self()})
+      rekey.()
+    end
+
+    run =
+      Task.async(fn ->
+        S3.rekey_many(targets, encryption: ring(["r2", "r1"]), around: around)
+      end)
+
+    assert_receive {:rekeying, "t1", worker}, 10_000
+    Process.sleep(20)
+    Process.exit(worker, :kill)
+
+    assert %{failed: [{"t1", {:crashed, why}}], skipped: ["t2", "t3"]} =
+             Task.await(run, 30_000)
+
+    assert why =~ "may still be running"
+    refute_received {:rekeying, _, _}
+
+    # Once t1's rekey ends (a re-run refused as busy meanwhile).
+    assert eventually(fn ->
+             match?(%{failed: []}, S3.rekey_many([t1], encryption: ring(["r2", "r1"])))
+           end)
+
+    assert %{failed: []} = S3.rekey_many(targets, encryption: ring(["r2", "r1"]))
+  end
+
+  defp eventually(fun, tries \\ 100) do
+    cond do
+      fun.() -> true
+      tries == 1 -> false
+      true -> Process.sleep(200) && eventually(fun, tries - 1)
+    end
   end
 
   # A wrong prefix (an unset environment variable, say) reads every target

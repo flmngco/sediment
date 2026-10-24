@@ -95,7 +95,8 @@ defmodule Sediment.S3ManyTest do
 
     assert_receive {:task, pid}, 5_000
     Process.exit(pid, :kill)
-    assert %{failed: [{"a", :crashed}]} = Task.await(run, 5_000)
+    assert %{failed: [{"a", {:crashed, why}}]} = Task.await(run, 5_000)
+    assert why =~ "may still be running"
   end
 
   # A store that can't be reached: each rekey fails at once.
@@ -127,11 +128,21 @@ defmodule Sediment.S3ManyTest do
     end
   end
 
-  test "a process linked to around: exiting fails its target alone; the caller gets the report" do
+  # The worker traps exits: the rekey and around: run to their end (a
+  # native rekey never outlives its slot), the target failed after.
+  test "a process linked to around: exiting fails its target alone, once its rekey ends" do
+    test = self()
+
     around = fn
-      %{id: "a"}, _rekey ->
+      %{id: "a"}, rekey ->
         spawn_link(fn -> exit(:tenant_worker_failed) end)
-        Process.sleep(:infinity)
+        Process.sleep(50)
+
+        try do
+          rekey.()
+        after
+          send(test, :a_reopened)
+        end
 
       _target, rekey ->
         Process.sleep(100)
@@ -148,7 +159,38 @@ defmodule Sediment.S3ManyTest do
         )
       end)
 
-    assert %{failed: [{"a", :crashed}, {"b", "s3 " <> _}], skipped: []} = report
+    assert %{
+             failed: [{"a", {:linked_exit, {:error, "s3 " <> _}}}, {"b", "s3 " <> _}],
+             skipped: []
+           } =
+             report
+
+    assert_received :a_reopened
+  end
+
+  # Killed, a worker may leave its native operation running: its slot isn't
+  # handed on.
+  test "a worker killed stops further starts: its target crashed, the rest skipped" do
+    test = self()
+
+    around = fn %{id: id}, _rekey ->
+      send(test, {:running, id, self()})
+      Process.sleep(:infinity)
+    end
+
+    caller =
+      Task.async(fn ->
+        S3.rekey_many([target("a"), target("b"), target("c")],
+          encryption: ring(),
+          around: around
+        )
+      end)
+
+    assert_receive {:running, "a", worker}, 5_000
+    Process.exit(worker, :kill)
+
+    assert %{failed: [{"a", {:crashed, _}}], skipped: ["b", "c"]} = Task.await(caller, 5_000)
+    refute_received {:running, _, _}
   end
 
   # The caller dying leaves no database closed: the target running
