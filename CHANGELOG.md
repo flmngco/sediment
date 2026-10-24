@@ -90,7 +90,12 @@ destroy the prefix).
   operation (close a tenant's pool before, reopen it after), `check:`
   refuses a target, `on_result:` reports progress, `stop_on:` stops
   starting targets; `encryption:` is a ring or a function of the target. A
-  re-run finds the done ones `current`.
+  re-run finds the done ones `current`. The callbacks get each target with
+  its `:encryption` hidden (still usable to reopen it), and their reasons
+  and re-raised exceptions pass the key net. An `around:` failing after the
+  operation fails the target with `{:around_failed, reason, result}`. Each
+  target runs in a monitored, unlinked process: one that exits fails its
+  target with `:crashed`, and the others go on.
 
 ### Fixed
 

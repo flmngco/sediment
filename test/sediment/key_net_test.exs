@@ -366,7 +366,8 @@ defmodule Sediment.KeyNetTest do
 
   # The functions over many databases with a valid target (whose store
   # can't be reached) and a key in each option, and in the target: no key
-  # in the result, a reason or a callback's arguments.
+  # in the result, a reason, an exception re-raised, or a callback's
+  # arguments (the target given back with its :encryption hidden).
   test "the functions over many databases never show a key" do
     dir = Temp.path!()
     File.mkdir_p!(dir)
@@ -382,31 +383,47 @@ defmodule Sediment.KeyNetTest do
 
     test = self()
     on_result = fn target, result -> send(test, {:callback, target, result}) end
+    seen = fn target -> send(test, {:target, target}) end
     target = %{id: "a", path: Path.join(dir, "a.db"), s3: s3}
 
     key = @key
 
     for shape <- shapes(key),
-        {targets, opts} <- [
-          {[target], [encryption: shape]},
-          {[target], [encryption: ring(key), to: shape]},
-          {[target], [encryption: fn _ -> shape end]},
-          {[%{target | s3: s3 ++ [encryption: shape]}], [encryption: ring(key)]},
-          {[%{target | s3: shape}], [encryption: ring(key)]},
-          {[target], [encryption: ring(key), around: fn _, _ -> raise inspect(shape) end]},
-          {[target],
-           [encryption: ring(key), check: fn _ -> {:error, :refused} end, max_concurrency: shape]}
-        ],
+        # The target is given back as given but its :encryption: one whose
+        # S3 options are a key ring itself isn't checked. The callbacks'
+        # failures for two of the shapes (each call takes half a second).
+        {targets, opts, given?} <-
+          [
+            {[target], [encryption: shape], true},
+            {[target], [encryption: ring(key), to: shape], true},
+            {[target], [encryption: fn _ -> shape end], true},
+            {[%{target | s3: s3 ++ [encryption: shape]}], [encryption: ring(key)], true},
+            {[Map.put(target, :encryption, shape)], [encryption: fn t -> t.encryption end], true},
+            {[{target.path, s3 ++ [encryption: shape]}], [encryption: ring(key)], true},
+            {[%{target | s3: shape}], [encryption: ring(key)], false},
+            {[target],
+             [
+               encryption: ring(key),
+               check: fn _ -> {:error, :refused} end,
+               max_concurrency: shape
+             ], true}
+          ] ++
+            if(shape in [key, ring(key)], do: callback_cases(target, key, shape, seen), else: []),
         call <- [
-          fn -> Sediment.S3.rekey_many(targets, [attempts: 1, on_result: on_result] ++ opts) end,
+          fn -> Sediment.S3.rekey_many(targets, opts ++ [attempts: 1, on_result: on_result]) end,
           fn ->
             Sediment.S3.release_key_many(
               targets,
               "r1",
-              [attempts: 1, on_result: on_result] ++ opts
+              opts ++ [attempts: 1, on_result: on_result]
             )
           end,
-          fn -> Sediment.S3.key_census_many(targets, on_result: on_result) end
+          fn ->
+            Sediment.S3.key_census_many(
+              targets,
+              Keyword.take(opts ++ [on_result: on_result], [:on_result])
+            )
+          end
         ] do
       texts =
         try do
@@ -415,17 +432,76 @@ defmodule Sediment.KeyNetTest do
           e ->
             [
               Exception.format(:error, e, __STACKTRACE__),
+              inspect(e, limit: :infinity),
               inspect(__STACKTRACE__, limit: :infinity)
             ]
+        catch
+          kind, reason ->
+            [Exception.format(kind, reason, __STACKTRACE__), inspect(reason, limit: :infinity)]
         end
 
-      callbacks =
-        for {:callback, _target, result} <- flush(), do: inspect(result, limit: :infinity)
+      messages = flush()
 
-      for text <- texts ++ callbacks do
+      callbacks =
+        for {:callback, target, result} <- messages,
+            do: inspect(if(given?, do: {target, result}, else: result), limit: :infinity)
+
+      targets = for {:target, target} <- messages, given?, do: inspect(target, limit: :infinity)
+
+      for text <- texts ++ callbacks ++ targets do
         refute shows?(text, key), String.slice(text, 0, 300)
       end
     end
+  end
+
+  # The target a callback gets back holds its ring hidden, usable as one.
+  test "the functions over many databases give the callbacks the ring hidden" do
+    ring = ring(@key)
+    test = self()
+
+    Sediment.S3.rekey_many(
+      [%{id: "a", path: Temp.path!(), s3: [bucket: "b"], encryption: ring}],
+      encryption: fn target -> target.encryption end,
+      check: fn target ->
+        send(test, {:target, target})
+        {:error, :checked}
+      end
+    )
+
+    assert_received {:target, %{encryption: %Sediment.S3.Keys.Hidden{} = hidden}}
+    assert Sediment.S3.Keys.normalize(hidden) == Sediment.S3.Keys.normalize(ring)
+  end
+
+  # The callbacks' own failures, each holding `shape`; check: and around:
+  # sending the target they get to `seen`.
+  defp callback_cases(target, key, shape, seen) do
+    [
+      {[target], [encryption: ring(key), around: fn _, _ -> raise inspect(shape) end], true},
+      {[target], [encryption: ring(key), around: fn _, _ -> {:error, {:refused, shape}} end],
+       true},
+      {[target],
+       [
+         encryption: ring(key),
+         around: fn t, run ->
+           seen.(t)
+           run.()
+           {:error, {:reopen_failed, shape}}
+         end
+       ], true},
+      {[target],
+       [
+         encryption: ring(key),
+         check: fn t ->
+           seen.(t)
+           {:error, {:preflight, shape}}
+         end
+       ], true},
+      {[target], [encryption: ring(key), on_result: fn _, _ -> raise inspect(shape) end], true},
+      {[target], [encryption: ring(key), on_result: fn _, _ -> throw({:progress, shape}) end],
+       true},
+      {[target], [encryption: ring(key), stop_on: fn _, _ -> raise inspect(shape) end], true},
+      {[target], [encryption: ring(key), stop_on: fn _, _ -> exit({:stop, shape}) end], true}
+    ]
   end
 
   defp flush do

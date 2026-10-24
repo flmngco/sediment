@@ -51,6 +51,35 @@ defmodule Sediment.S3.Keys do
   def hide(encryption), do: %Hidden{get: fn -> encryption end}
 
   @doc false
+  # `term` with every `:encryption` in it (of a map or a keyword list, at any
+  # depth but in structs) hidden: a target as the caller's functions get it
+  # back, its rings still usable to reopen a database.
+  @spec hide_rings(term()) :: term()
+  def hide_rings(list) when is_list(list), do: hide_rings_list(list)
+
+  def hide_rings(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> hide_rings() |> List.to_tuple()
+
+  def hide_rings(%_{} = struct), do: struct
+
+  def hide_rings(map) when is_map(map),
+    do: Map.new(map, fn {k, v} -> hide_ring({k, v}) end)
+
+  def hide_rings(other), do: other
+
+  defp hide_ring({:encryption, encryption}), do: {:encryption, hide(encryption)}
+  defp hide_ring({k, v}), do: {k, hide_rings(v)}
+
+  defp hide_rings_list([{_, _} = head | tail]) when is_list(tail),
+    do: [hide_ring(head) | hide_rings_list(tail)]
+
+  defp hide_rings_list([head | tail]) when is_list(tail),
+    do: [hide_rings(head) | hide_rings_list(tail)]
+
+  defp hide_rings_list([head | tail]), do: [hide_rings(head) | hide_rings(tail)]
+  defp hide_rings_list([]), do: []
+
+  @doc false
   @spec normalize(keyword() | map() | Hidden.t() | false | nil) :: ring() | false | nil
   def normalize(encryption), do: sealed(fn -> do_normalize(encryption) end)
 

@@ -97,4 +97,118 @@ defmodule Sediment.S3ManyTest do
     Process.exit(pid, :kill)
     assert %{failed: [{"a", :crashed}]} = Task.await(run, 5_000)
   end
+
+  # A store that can't be reached: each rekey fails at once.
+  defp target(id) do
+    s3 = [
+      bucket: "b",
+      prefix: "p/#{id}",
+      endpoint: "http://127.0.0.1:1",
+      region: "us-east-1",
+      access_key_id: "a",
+      secret_access_key: "s"
+    ]
+
+    %{id: id, path: Path.join(Temp.path!(), "#{id}.db"), s3: s3}
+  end
+
+  defp ring, do: [keys: [{"r1", String.duplicate("ab", 32)}], cipher: "aegis256"]
+
+  # In a process of its own, not trapping exits: its report, or how it died.
+  defp run_in_caller(fun) do
+    test = self()
+    {pid, ref} = spawn_monitor(fn -> send(test, {:report, self(), fun.()}) end)
+
+    receive do
+      {:report, ^pid, report} -> report
+      {:DOWN, ^ref, :process, ^pid, reason} -> {:caller_died, reason}
+    after
+      30_000 -> flunk("no report")
+    end
+  end
+
+  test "a process linked to around: exiting fails its target alone; the caller gets the report" do
+    around = fn
+      %{id: "a"}, _rekey ->
+        spawn_link(fn -> exit(:tenant_worker_failed) end)
+        Process.sleep(:infinity)
+
+      _target, rekey ->
+        Process.sleep(100)
+        rekey.()
+    end
+
+    report =
+      run_in_caller(fn ->
+        S3.rekey_many([target("a"), target("b")],
+          encryption: ring(),
+          attempts: 1,
+          max_concurrency: 2,
+          around: around
+        )
+      end)
+
+    assert %{failed: [{"a", :crashed}, {"b", "s3 " <> _}], skipped: []} = report
+  end
+
+  # The caller dying leaves no database closed: the target running
+  # finishes, around: reopening it, and no further one starts.
+  test "a caller that dies leaves the targets running to finish; none further starts" do
+    test = self()
+
+    around = fn %{id: id}, rekey ->
+      send(test, {:closed, id, self()})
+      receive do: (:go -> :ok)
+
+      try do
+        rekey.()
+      after
+        send(test, {:reopened, id})
+      end
+    end
+
+    caller =
+      spawn(fn ->
+        S3.rekey_many([target("a"), target("b")],
+          encryption: ring(),
+          attempts: 1,
+          around: around
+        )
+      end)
+
+    assert_receive {:closed, "a", worker}, 5_000
+    ref = Process.monitor(caller)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^caller, :killed}
+    send(worker, :go)
+    assert_receive {:reopened, "a"}, 10_000
+    refute_receive {:closed, "b", _}, 300
+  end
+
+  test "an around: failing after its rekey fails the target, the rekey's result kept" do
+    for {around, reason} <- [
+          {fn _, rekey ->
+             rekey.()
+             {:error, :reopen_failed}
+           end, :reopen_failed},
+          {fn _, rekey ->
+             try do
+               rekey.()
+             after
+               raise "reopen failed"
+             end
+           end, {:callback_raised, :around, RuntimeError}}
+        ] do
+      assert %{failed: [{"a", {:around_failed, ^reason, {:error, "s3 " <> _}}}]} =
+               S3.rekey_many([target("a")], encryption: ring(), attempts: 1, around: around)
+    end
+
+    # Returning the rekey's own result: that result.
+    assert %{failed: [{"a", "s3 " <> _}]} =
+             S3.rekey_many([target("a")],
+               encryption: ring(),
+               attempts: 1,
+               around: fn _, rekey -> rekey.() end
+             )
+  end
 end

@@ -796,7 +796,12 @@ defmodule Sediment.S3 do
       rekey with its retries and returns its result. Close the database's
       pool before and reopen it after, so each database pauses only for
       its own rekey while the others stay up. Returning `{:error, reason}`
-      without calling it skips the target, reported in `failed`.
+      without calling it skips the target, reported in `failed`. Return
+      what `rekey.()` returned: an `{:error, reason}` of its own after it
+      (a failed reopen), or raising after it, fails the target with
+      `{:around_failed, reason, result}`, `result` the rekey's (it may
+      have happened; the database may be left closed). Check the reopen's
+      result: in an `after` block, a returned error is discarded.
     * `:check` - `fn target -> :ok | {:error, reason} end`, run right before
       the rekey (inside `:around`): an error refuses the target, without
       retries.
@@ -806,11 +811,28 @@ defmodule Sediment.S3 do
       further database starts (those running finish) and the rest are
       reported in `skipped`.
 
-  Reasons and results hold key ids and fingerprints, never keys. A function
-  of the caller's that raises fails its target with `{:callback_raised,
-  name, exception_type}` (its message isn't kept: it may hold anything);
-  one raising in `:on_result` or `:stop_on` stops the run and is re-raised
-  once the databases running finish.
+  The functions above get the target as given, with every `:encryption`
+  in it (of a map or a keyword list, such as a repo's configuration)
+  wrapped in an opaque value that inspects as
+  `#Sediment.S3.Keys.Hidden<redacted>` and that every function taking
+  `:encryption` (a pool's or repo's options, `rekey/3`) accepts as the ring.
+
+  Reasons and results hold key ids and fingerprints, never keys: the
+  reasons of the caller's functions too, through the same net as
+  Sediment's errors (every run of 32 or more hex digits replaced). A
+  function of the caller's that raises fails its target with
+  `{:callback_raised, name, exception_type}` (its message isn't kept: it
+  may hold anything); one raising in `:on_result` or `:stop_on` stops the
+  run and is re-raised, through the net, once the databases running
+  finish.
+
+  Each database runs in a process of its own, monitored, not linked: one
+  that exits (a linked process of `:around`'s exiting, a kill) fails its
+  target with `:crashed` (the rekey may have happened, the database may be
+  left closed: `:around`'s `after` doesn't run on an exit) and the others
+  go on. If the caller dies, the databases running still finish (with
+  `:around` reopening each) and no further one starts: run it again for
+  the report.
   """
   @spec rekey_many(Enumerable.t(), keyword()) :: %{
           rekeyed: [term()],

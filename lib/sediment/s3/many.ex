@@ -216,9 +216,11 @@ defmodule Sediment.S3.Many do
   defp reason(other), do: {:unexpected, other}
 
   # The caller's around: wraps all of the target's attempts. The result is
-  # what the operation returned when around: ran it, else around:'s own
-  # {:error, reason} (a refusal of its own), else {:error, :not_run}; with
-  # the results of the attempts before the last.
+  # what the operation returned when around: ran it (unless around: then
+  # failed, returning another {:error, reason} or raising: {:error,
+  # {:around_failed, reason, result}}, a database maybe left closed), else
+  # around:'s own {:error, reason} (a refusal of its own), else {:error,
+  # :not_run}; with the results of the attempts before the last.
   defp attempt(target, opts, op) do
     case opts[:around] do
       nil ->
@@ -237,13 +239,17 @@ defmodule Sediment.S3.Many do
         returned = callback(:around, fn -> around.(target.given, runner) end)
 
         case {Process.get(key), returned} do
-          {_ran, {:error, {:callback_raised, :around, _}} = raised} -> {raised, []}
-          {nil, {:error, _} = refused} -> {refused, []}
+          {nil, {:error, reason}} -> {{:error, Keys.redact(reason)}, []}
           {nil, _other} -> {{:error, :not_run}, []}
+          {{result, _earlier} = outcome, result} -> outcome
+          {{result, earlier}, {:error, reason}} -> {around_failed(reason, result), earlier}
           {outcome, _returned} -> outcome
         end
     end
   end
+
+  defp around_failed(reason, result),
+    do: {:error, {:around_failed, Keys.redact(reason), result}}
 
   defp attempts(target, opts, op) do
     with :ok <- check(target, opts[:check]),
@@ -259,7 +265,7 @@ defmodule Sediment.S3.Many do
 
   defp check(target, check) do
     case callback(:check, fn -> check.(target.given) end) do
-      {:error, _} = refused -> refused
+      {:error, reason} -> {:error, Keys.redact(reason)}
       _ok -> :ok
     end
   end
@@ -306,25 +312,31 @@ defmodule Sediment.S3.Many do
     kind, _reason -> {:error, {:callback_raised, name, kind}}
   end
 
-  # Runs `one` over the targets in tasks, at most `max` at once; calls
+  # Runs `one` over the targets in workers, at most `max` at once; calls
   # on_result.(given, result) and stop?.({target, result}) in this process
   # as each finishes. Once stop? is true (or on_result or stop? raises, which
-  # is re-raised once the tasks running finish), no further target starts.
+  # is re-raised once the workers running finish), no further target starts.
+  #
+  # The workers are monitored, never linked: one that exits (a linked
+  # helper of around: exiting, a kill) fails its target with :crashed, the
+  # others running on; and if this process dies, those running still
+  # finish their target (around: reopening its database), none further
+  # starting.
   defp collect(targets, max, one, on_result, stop?) do
     loop(targets, %{}, max, one, {on_result, stop?}, [], nil)
   end
 
   defp loop([target | rest], running, max, one, callbacks, done, nil)
        when map_size(running) < max do
-    task = Task.async(fn -> one.(target) end)
-    loop(rest, Map.put(running, task.ref, target), max, one, callbacks, done, nil)
+    {pid, ref} = start(target, one)
+    loop(rest, Map.put(running, pid, {ref, target}), max, one, callbacks, done, nil)
   end
 
-  # The caller's exception, its frames without their arguments (ours hold
-  # the targets).
+  # The caller's exception, through the net, its frames without their
+  # arguments (ours hold the targets).
   defp loop(_queue, running, _max, _one, _callbacks, _done, {kind, reason, stacktrace})
        when running == %{},
-       do: :erlang.raise(kind, reason, Keys.scrub_stacktrace(stacktrace))
+       do: :erlang.raise(kind, Keys.redact(reason), Keys.scrub_stacktrace(stacktrace))
 
   defp loop(queue, running, _max, _one, _callbacks, done, stop)
        when running == %{} and (queue == [] or stop != nil),
@@ -333,19 +345,33 @@ defmodule Sediment.S3.Many do
   defp loop(queue, running, max, one, {on_result, stop?} = callbacks, done, stop) do
     {target, result, running} =
       receive do
-        {ref, {target, result}} when is_map_key(running, ref) ->
+        {__MODULE__, pid, {target, result}} when is_map_key(running, pid) ->
+          {ref, _target} = Map.fetch!(running, pid)
           Process.demonitor(ref, [:flush])
-          {target, result, Map.delete(running, ref)}
+          {target, result, Map.delete(running, pid)}
 
-        # A task killed from outside (its own failures are results): with
-        # the caller trapping exits, it would otherwise wait forever.
-        {:DOWN, ref, :process, _pid, _reason} when is_map_key(running, ref) ->
-          {Map.fetch!(running, ref), {:error, :crashed}, Map.delete(running, ref)}
+        # A worker that exited (its own failures are results): its reason
+        # isn't kept (it may hold anything).
+        {:DOWN, _ref, :process, pid, _reason} when is_map_key(running, pid) ->
+          {_ref, target} = Map.fetch!(running, pid)
+          {target, {:error, :crashed}, Map.delete(running, pid)}
       end
 
     done = [{target, result} | done]
     stop = stop || after_result(target, result, on_result, stop?)
     loop(queue, running, max, one, callbacks, done, stop)
+  end
+
+  # A worker as Task.async/1 starts one (its $callers, for a sandbox's
+  # allowances), monitored but not linked.
+  defp start(target, one) do
+    caller = self()
+    callers = [caller | Process.get(:"$callers", [])]
+
+    spawn_monitor(fn ->
+      Process.put(:"$callers", callers)
+      send(caller, {__MODULE__, self(), one.(target)})
+    end)
   end
 
   defp after_result(target, result, on_result, stop?) do
@@ -416,7 +442,8 @@ defmodule Sediment.S3.Many do
   end
 
   # Each target as %{index:, id:, path:, s3:, given:}; `given` is what the
-  # caller gave, passed back to its functions.
+  # caller gave, passed back to its functions, every `:encryption` in it
+  # hidden (Keys.hide_rings/1).
   defp targets!(targets, call, path?) do
     if Enumerable.impl_for(targets) == nil,
       do: raise(ArgumentError, "#{call}: the targets must be a list")
@@ -439,7 +466,7 @@ defmodule Sediment.S3.Many do
           "#{call}: the S3 options of target #{index} must be a keyword list or a map"
         )
 
-    %{index: index, id: id || index, path: path, s3: s3, given: given}
+    %{index: index, id: id || index, path: path, s3: s3, given: Keys.hide_rings(given)}
   end
 
   defp parts!({path, s3}, _index, _call), do: {path, path, s3}

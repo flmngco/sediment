@@ -232,6 +232,66 @@ defmodule Sediment.S3RotationManyTest do
              )
   end
 
+  # A tenant's reopen failing after its rekey, and a process linked to
+  # around: exiting, each fail their target alone, the rekey's outcome kept
+  # in the first; the caller, not trapping exits, gets the report.
+  test "around: failing after the rekey, or its process exiting, fails that target alone",
+       %{base: base, dir: dir} do
+    targets = tenants(4, base, dir)
+    test = self()
+
+    around = fn
+      %{id: "t1"}, rekey ->
+        rekey.()
+        {:error, :tenant_reopen_failed}
+
+      %{id: "t2"}, rekey ->
+        try do
+          rekey.()
+        after
+          raise "reopen failed"
+        end
+
+      %{id: "t3"}, _rekey ->
+        spawn_link(fn -> exit(:tenant_worker_failed) end)
+        Process.sleep(:infinity)
+
+      _target, rekey ->
+        rekey.()
+    end
+
+    {caller, ref} =
+      spawn_monitor(fn ->
+        report =
+          S3.rekey_many(targets,
+            encryption: ring(["r2", "r1"]),
+            max_concurrency: 2,
+            around: around
+          )
+
+        send(test, {:report, report})
+      end)
+
+    assert_receive {:report, report}, 60_000
+    assert_receive {:DOWN, ^ref, :process, ^caller, :normal}
+
+    assert %{
+             rekeyed: ["t4"],
+             failed: [
+               {"t1", {:around_failed, :tenant_reopen_failed, {:ok, %{from: "r1", to: "r2"}}}},
+               {"t2",
+                {:around_failed, {:callback_raised, :around, RuntimeError},
+                 {:ok, %{from: "r1", to: "r2"}}}},
+               {"t3", :crashed}
+             ],
+             skipped: []
+           } = report
+
+    # The rekeys whose reopen failed happened: a re-run finds them current.
+    assert %{current: ["t1", "t2", "t4"], rekeyed: ["t3"], failed: []} =
+             S3.rekey_many(targets, encryption: ring(["r2", "r1"]))
+  end
+
   # A wrong prefix (an unset environment variable, say) reads every target
   # absent, with nothing failed: the key the real databases need is never
   # reported removable.
