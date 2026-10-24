@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-beta.1 (Unreleased)
+## 0.2.0-beta.1 (2026-10-24)
 
 0.2 breaks 0.1: the S3 manifest is version 4 (it records each epoch's key),
 `:encryption` is a key ring, and the options of functions taking keys must
