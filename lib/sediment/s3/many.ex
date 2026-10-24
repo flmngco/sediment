@@ -90,27 +90,13 @@ defmodule Sediment.S3.Many do
   @spec removable?(map(), String.t(), keyword()) :: boolean()
   def removable?(census, key_id, opts \\ [])
 
-  def removable?(
-        %{keys: keys, absent: absent, unreadable: unreadable, targets: targets} = census,
-        key_id,
-        opts
-      ) do
-    id = to_string(key_id)
-
-    # A target read as absent may be a misaddressed one (a wrong bucket or
-    # prefix) whose real database needs the key: never removable then. Nor
-    # after a census of no target at all (an empty list proves nothing).
-    free? =
-      targets != [] and absent == [] and unreadable == [] and
-        case keys do
-          %{^id => %{current: [], retained: []}} -> true
-          %{^id => _} -> false
-          _ -> true
-        end
-
+  def removable?(%{keys: _, absent: _, unreadable: _, targets: _} = census, key_id, opts) do
     case Keyword.fetch(opts, :current) do
-      :error -> free?
-      {:ok, current} -> free? and all_current?(census, to_string(current))
+      :error ->
+        free?(census, to_string(key_id))
+
+      {:ok, current} ->
+        free?(census, to_string(key_id)) and all_current?(census, to_string(current))
     end
   end
 
@@ -120,6 +106,18 @@ defmodule Sediment.S3.Many do
         ArgumentError,
         "Sediment.S3.removable?/3 expects the result of key_census_many/2"
       )
+
+  # No target needs `id`, and every one was read: a target read as absent
+  # may be a misaddressed one (a wrong bucket or prefix) whose real database
+  # needs the key, and a census of no target at all proves nothing.
+  defp free?(%{keys: keys, absent: absent, unreadable: unreadable, targets: targets}, id) do
+    targets != [] and absent == [] and unreadable == [] and
+      case keys do
+        %{^id => %{current: [], retained: []}} -> true
+        %{^id => _} -> false
+        _ -> true
+      end
+  end
 
   # Every target read, under `current`.
   defp all_current?(%{targets: targets, keys: keys}, current),
