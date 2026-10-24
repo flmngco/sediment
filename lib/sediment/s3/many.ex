@@ -90,13 +90,18 @@ defmodule Sediment.S3.Many do
   @spec removable?(map(), String.t(), keyword()) :: boolean()
   def removable?(census, key_id, opts \\ [])
 
-  def removable?(%{keys: keys, absent: absent, unreadable: unreadable} = census, key_id, opts) do
+  def removable?(
+        %{keys: keys, absent: absent, unreadable: unreadable, targets: targets} = census,
+        key_id,
+        opts
+      ) do
     id = to_string(key_id)
 
     # A target read as absent may be a misaddressed one (a wrong bucket or
-    # prefix) whose real database needs the key: never removable then.
+    # prefix) whose real database needs the key: never removable then. Nor
+    # after a census of no target at all (an empty list proves nothing).
     free? =
-      absent == [] and unreadable == [] and
+      targets != [] and absent == [] and unreadable == [] and
         case keys do
           %{^id => %{current: [], retained: []}} -> true
           %{^id => _} -> false

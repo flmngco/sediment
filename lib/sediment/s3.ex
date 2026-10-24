@@ -827,9 +827,12 @@ defmodule Sediment.S3 do
 
   Returns `%{released: [id], unchanged: [id], absent: [id], failed: [{id,
   reason}], skipped: [id]}`: `released` dropped epochs under the key,
-  `unchanged` had none. Once `failed` is empty, `absent` holds only
-  databases you know don't exist, and `removable?/3` says so on a fresh
-  `key_census_many/2`, the key can leave the rings.
+  `unchanged` had none. The key can leave the rings once `failed` is empty,
+  `absent` holds only databases you know don't exist, and a fresh
+  `key_census_many/2` of every database says so:
+
+      census = Sediment.S3.key_census_many(targets)
+      true = Sediment.S3.removable?(census, old_id, current: new_id)
   """
   @spec release_key_many(Enumerable.t(), String.t(), keyword()) :: %{
           released: [term()],
@@ -877,8 +880,9 @@ defmodule Sediment.S3 do
 
   @doc """
   Whether the key `key_id` can leave the rings, from a `key_census_many/2`
-  result: no database has it current or retained, none was unreadable, and
-  none was absent.
+  result: no database has it current or retained, none was unreadable,
+  none was absent, and the census had targets (a census of none is never
+  proof).
 
   An absent target makes it false: a fleet addressed wrongly (a wrong
   bucket or prefix, an unset environment variable, a re-pointed

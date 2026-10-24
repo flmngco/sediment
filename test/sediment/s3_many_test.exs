@@ -25,6 +25,11 @@ defmodule Sediment.S3ManyTest do
     refute S3.removable?(census, "r1", current: "r2")
   end
 
+  test "a census of no target never makes a key removable" do
+    refute S3.removable?(census(targets: []), "r1")
+    refute S3.removable?(census(targets: []), "r1", current: "r2")
+  end
+
   test "one absent or unreadable target is enough to keep the key" do
     keys = %{"r2" => %{current: ["a"], retained: []}}
     refute S3.removable?(census(keys: keys, absent: ["b"], targets: ["a", "b"]), "r1")
