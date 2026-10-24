@@ -61,7 +61,7 @@ So the name is our own. **Sediment** describes how the S3 layer works: committed
 ```elixir
 defp deps do
   [
-    {:sediment, "~> 0.1"}
+    {:sediment, "~> 0.2.0-beta.1"}
   ]
 end
 ```
@@ -69,7 +69,7 @@ end
 With Ecto, depend on the adapter instead; it brings `sediment` with it:
 
 ```elixir
-{:ecto_sediment, "~> 0.1"}
+{:ecto_sediment, "~> 0.2.0-beta.1"}
 ```
 
 Elixir 1.18 or later; the package is tested on Elixir 1.18 with OTP 27 and

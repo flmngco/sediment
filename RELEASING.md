@@ -47,7 +47,7 @@ downloads them from (`.../releases/download/v<version>`).
    the upload, delete the release's NIF assets before re-running it: the
    upload never replaces existing assets.
 6. Release ecto_sediment afterwards if it needs the new version: its Hex
-   dependency is `{:sediment, "~> 0.1.0"}`, and its release workflow checks
+   dependency is `{:sediment, "~> 0.2.0-beta.1"}`, and its release workflow checks
    that the required sediment version exists on Hex.
 
 ### Targets

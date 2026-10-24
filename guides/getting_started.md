@@ -10,7 +10,7 @@ the SQLite-compatible database written in Rust. Its API mirrors
 ```elixir
 def deps do
   [
-    {:sediment, "~> 0.1"}
+    {:sediment, "~> 0.2.0-beta.1"}
   ]
 end
 ```
@@ -23,7 +23,7 @@ toolchain (1.91 or later). A git or path dependency always builds from
 source. A source build takes a few minutes.
 
 For Ecto, depend on the `ecto_sediment` adapter instead, which brings this
-package with it: `{:ecto_sediment, "~> 0.1"}`.
+package with it: `{:ecto_sediment, "~> 0.2.0-beta.1"}`.
 
 ## A connection pool
 

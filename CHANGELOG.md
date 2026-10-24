@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0-beta.1 (Unreleased)
+
+0.2 breaks 0.1: the S3 manifest is version 4 (it records each epoch's key),
+`:encryption` is a key ring, and the options of functions taking keys must
+be keyword lists (see below). Data written by 0.1 is not migrated: an S3
+prefix written by 0.1 is refused (read its data with 0.1 and export it, or
+destroy the prefix).
 
 ### Breaking
 
@@ -70,6 +76,18 @@
 * Replicas and `Sediment.S3.refresh/2` follow a rekey at the next refresh
   when their ring holds the new key; `refresh/2` takes `encryption:` for a
   ring with `key_for`.
+* Rotation over many databases: `Sediment.S3.rekey_many/2`,
+  `release_key_many/3` and `key_census_many/2` run the operation over a list
+  of `{path, s3_opts}` or `%{id:, path:, s3:}` targets, a few at a time
+  (`max_concurrency`, 1 by default; 8 for the census), never stopping at a
+  failure, and report every target by id (`rekeyed`, `current`, `absent`,
+  `failed`, `skipped`; the census by key, with `removable?/2`). A result
+  that may still change (fenced, indeterminate, a store error) is retried
+  (`attempts`, `backoff`); a refusal isn't. `around:` wraps each target's
+  operation (close a tenant's pool before, reopen it after), `check:`
+  refuses a target, `on_result:` reports progress, `stop_on:` stops
+  starting targets; `encryption:` is a ring or a function of the target. A
+  re-run finds the done ones `current`.
 
 ### Fixed
 
@@ -87,7 +105,9 @@
   * an exception raised there loses its stack frames' arguments, and one
     that isn't Sediment's own (a `FunctionClauseError` on a map of options,
     a `KeyError`, a `MatchError`) is replaced by an `ArgumentError` naming
-    its type only; Sediment's errors and DBConnection's keep their type;
+    its type only; Sediment's errors and DBConnection's keep their type, and
+    the `ArgumentError`s and `RuntimeError`s of Sediment's and Ecto's
+    modules their message (an Ecto repo's configuration error says why);
   * a net: every error Sediment returns or raises, and every exit reason
     passing through, has each run of 32 or more hex digits replaced by
     `<redacted>` (keys are hex), in Elixir and in the native code, so a key
@@ -119,13 +139,16 @@
   the boundary and its function outside it: the function's results,
   rollback reasons, exceptions, exits and throws reach the caller as they
   are.
-* `Sediment.Connection.handle_begin/2` on a transaction the database rolled
-  back (a write-write conflict, `ON CONFLICT ROLLBACK`) returns
-  `{:error, %Sediment.Error{}, state}` ("the transaction was rolled back by
-  the database ..."), keeping the connection, instead of the
-  `{:error, state}` status, on which DBConnection disconnected and Ecto's
-  SQL sandbox crashed (a savepoint begun in a test whose transaction the
-  database had rolled back).
+* A transaction begun on a transaction the database rolled back (a
+  write-write conflict, `ON CONFLICT ROLLBACK`) and nobody ended:
+  * a savepoint (Ecto's SQL sandbox, in a test whose transaction the
+    database had rolled back) is refused with `{:error, %Sediment.Error{},
+    state}` ("the transaction was rolled back by the database ..."), the
+    connection kept, where the sandbox crashed on the `{:error, state}`
+    status;
+  * a new transaction (on a pooled connection checked in after a `BEGIN`
+    run as a query was aborted) ends it and begins, where DBConnection
+    disconnected.
 * With a `key_for` ring, every open and every rekey of a warm copy
   (a clean close's) downloaded the whole database: the first round, which
   asks `key_for` for the key, deleted the warm sidecar before it stopped.
