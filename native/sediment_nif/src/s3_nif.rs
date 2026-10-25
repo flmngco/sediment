@@ -577,6 +577,7 @@ fn s3_exists<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
 
 /// Moves the database to another key of the ring (see `s3::rekey`). Opens of
 /// `path` are serialized with it, as with `open`.
+#[allow(clippy::too_many_arguments)]
 #[rustler::nif(schedule = "DirtyIo")]
 fn s3_rekey<'a>(
     env: Env<'a>,

@@ -344,13 +344,18 @@ defmodule Sediment.S3 do
       opts = Keys.options!(opts, "Sediment.S3.restore/3")
       path = to_string(path)
 
-      with {:ok, target} <- restore_target(opts) do
-        case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
-          nil -> do_restore(path, s3_opts, opts, target)
-          existing -> {:error, "restore target exists: #{existing}"}
-        end
+      with {:ok, target} <- restore_target(opts),
+           :ok <- restore_path_free(path) do
+        do_restore(path, s3_opts, opts, target)
       end
     end)
+  end
+
+  defp restore_path_free(path) do
+    case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
+      nil -> :ok
+      existing -> {:error, "restore target exists: #{existing}"}
+    end
   end
 
   @restore_options [:at, :epoch, :epoch_start, :encryption]

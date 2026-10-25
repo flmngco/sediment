@@ -351,20 +351,7 @@ defmodule Sediment.S3.Many do
       to = to || ring.active || with({id, _, _} <- List.first(ring.keys), do: id)
       {ring, current_fp} = Keys.fingerprint(ring, current)
       {_ring, to_fp} = if to == current, do: {ring, current_fp}, else: Keys.fingerprint(ring, to)
-
-      cond do
-        current_fp != nil and current_fp != recorded[current] ->
-          {:done, other_material(current, current_fp, recorded[current])}
-
-        to != current and to_fp != nil and is_map_key(recorded, to) and to_fp != recorded[to] ->
-          {:done, other_material(to, to_fp, recorded[to])}
-
-        to == current and current_fp != nil ->
-          {:done, {:ok, :current}}
-
-        true ->
-          :proceed
-      end
+      verdict({current, current_fp}, {to, to_fp}, recorded)
     else
       _ -> :proceed
     end
@@ -385,6 +372,28 @@ defmodule Sediment.S3.Many do
   end
 
   defp precheck(_target, _ring, nil), do: :proceed
+
+  # The ring's fingerprints of the current and target ids against the
+  # manifest's (`recorded`); nil where the ring lacks the key.
+  defp verdict({current, current_fp}, {to, to_fp}, recorded) do
+    cond do
+      other?(current_fp, recorded[current]) ->
+        {:done, other_material(current, current_fp, recorded[current])}
+
+      to != current and other?(to_fp, recorded[to]) ->
+        {:done, other_material(to, to_fp, recorded[to])}
+
+      to == current and current_fp != nil ->
+        {:done, {:ok, :current}}
+
+      true ->
+        :proceed
+    end
+  end
+
+  # The ring has a key under an id the manifest records, but another one.
+  defp other?(ring_fp, recorded_fp),
+    do: ring_fp != nil and recorded_fp != nil and ring_fp != recorded_fp
 
   defp other_material(id, ring_fp, recorded_fp),
     do:
