@@ -448,52 +448,6 @@ fn admit(reserved: &mut u64, free: Option<(PathBuf, u64)>, needed: u64, what: &s
     Ok(())
 }
 
-#[cfg(test)]
-mod space_tests {
-    use super::{admit, chain_peak};
-    use crate::s3::layout::SnapshotLink;
-    use std::path::PathBuf;
-
-    fn link(size: u64) -> SnapshotLink {
-        SnapshotLink {
-            key: String::new(),
-            stored_size: 0,
-            size,
-            crc32c: 0,
-        }
-    }
-
-    #[test]
-    fn a_chain_peaks_at_an_image_and_its_staged_delta() {
-        const GIB: u64 = 1 << 30;
-        assert_eq!(chain_peak(&[link(GIB)]), GIB);
-        assert_eq!(chain_peak(&[link(GIB), link(GIB)]), 2 * GIB);
-        // An earlier, larger image: it is there while the delta is staged.
-        assert_eq!(chain_peak(&[link(2 * GIB), link(GIB), link(GIB)]), 3 * GIB);
-        assert_eq!(chain_peak(&[link(GIB), link(3 * GIB)]), 6 * GIB);
-    }
-
-    #[test]
-    fn admission_counts_what_others_reserved() {
-        let dir = || Some((PathBuf::from("/data"), 100));
-        let mut reserved = 0;
-        admit(&mut reserved, dir(), 60, "rekey").unwrap();
-        let err = admit(&mut reserved, dir(), 60, "rekey")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("rekey needs about 60 bytes free in /data")
-                && err.contains("and 60 reserved by the others running in this VM")
-                && err.contains("only 100 are"),
-            "{err}"
-        );
-        assert_eq!(reserved, 60);
-        admit(&mut reserved, dir(), 40, "release_key").unwrap();
-        assert_eq!(reserved, 100);
-        admit(&mut reserved, None, 1 << 40, "rekey").unwrap();
-    }
-}
-
 /// [`space_needed`] for `Sediment.S3.space_needed/3`: the manifest read
 /// without the lease. `None`: no database.
 pub fn space_needed_at(cfg: &S3Config, local_path: &Path, rekey: bool) -> Result<Option<u64>> {
@@ -555,5 +509,51 @@ impl Copy {
 impl Drop for Copy {
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::{admit, chain_peak};
+    use crate::s3::layout::SnapshotLink;
+    use std::path::PathBuf;
+
+    fn link(size: u64) -> SnapshotLink {
+        SnapshotLink {
+            key: String::new(),
+            stored_size: 0,
+            size,
+            crc32c: 0,
+        }
+    }
+
+    #[test]
+    fn a_chain_peaks_at_an_image_and_its_staged_delta() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(chain_peak(&[link(GIB)]), GIB);
+        assert_eq!(chain_peak(&[link(GIB), link(GIB)]), 2 * GIB);
+        // An earlier, larger image: it is there while the delta is staged.
+        assert_eq!(chain_peak(&[link(2 * GIB), link(GIB), link(GIB)]), 3 * GIB);
+        assert_eq!(chain_peak(&[link(GIB), link(3 * GIB)]), 6 * GIB);
+    }
+
+    #[test]
+    fn admission_counts_what_others_reserved() {
+        let dir = || Some((PathBuf::from("/data"), 100));
+        let mut reserved = 0;
+        admit(&mut reserved, dir(), 60, "rekey").unwrap();
+        let err = admit(&mut reserved, dir(), 60, "rekey")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rekey needs about 60 bytes free in /data")
+                && err.contains("and 60 reserved by the others running in this VM")
+                && err.contains("only 100 are"),
+            "{err}"
+        );
+        assert_eq!(reserved, 60);
+        admit(&mut reserved, dir(), 40, "release_key").unwrap();
+        assert_eq!(reserved, 100);
+        admit(&mut reserved, None, 1 << 40, "rekey").unwrap();
     }
 }
