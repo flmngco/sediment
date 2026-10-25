@@ -58,6 +58,10 @@
   snapshot images a crashed writer left beside its path only once it holds
   the lease. Before, one refused with "lease held" (a second process on the
   same path) had removed the images of the live writer's pending snapshot.
+* A query its timeout stopped sometimes failed with "connection_closed"
+  (when the disconnect closed the connection before the statement saw the
+  interrupt) instead of "interrupted", as `Sediment.Connection` documents.
+  It is "interrupted" either way.
 * A rekey killed while running left its copy, `.<name>.rekey.db` (the
   database's size), until the next rekey. The next open, rekey or release
   of the database removes it, under the file's lock and the lease, and so

@@ -629,9 +629,15 @@ defmodule Sediment.Connection do
         {:disconnect, error, state}
 
       # disconnect/2 closed the handle (the client timed out): the error may
-      # be the interrupt, or a statement finalized with the connection.
+      # be the interrupt, or, when the close came first, a statement
+      # finalized with the connection. Either way the statement was stopped
+      # by the disconnect: "interrupted", as the docs promise.
       closed?(state) ->
-        message = if message == "invalid_statement", do: "connection_closed", else: message
+        message =
+          if message in ["invalid_statement", "connection_closed"],
+            do: "interrupted",
+            else: message
+
         {:disconnect, %{error | message: message}, state}
 
       true ->
