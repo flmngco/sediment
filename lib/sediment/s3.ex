@@ -729,6 +729,13 @@ defmodule Sediment.S3 do
   for the key deletes what is left, with the rule a writer's garbage
   collection uses (see `orphans/1`), and returns `{:ok, _}` only once none
   is (`epochs: []` then, as they were released before).
+
+  Orphans can't be told apart by key, so the sweep covers every object the
+  manifest no longer references, whatever its key: any one of them that
+  can't be deleted (an object lock or retention period, a legal hold, a
+  bucket policy denying deletes on part of the prefix) blocks `{:ok, _}`
+  for every release of that database. `orphans/1` lists them; the fix is
+  in the bucket (lift the lock, or delete them when it allows).
   """
   @spec release_key(Path.t(), keyword() | map(), String.t(), keyword()) ::
           {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
@@ -1098,7 +1105,8 @@ defmodule Sediment.S3 do
   no object left (see `orphans/1`) is reported `unchanged` without calling
   `:around`, so a re-run doesn't reopen a database an earlier run left
   closed: reopen it from `:on_result`, or after the run (see the example in
-  `rekey_many/2`). The key can leave the rings once `failed` is empty,
+  `rekey_many/2`). A database with an object the store won't delete stays
+  in `failed` with `{:leftover, _}` (see `release_key/4`). The key can leave the rings once `failed` is empty,
   `absent` holds only databases you know don't exist, and a fresh
   `key_census_many/2` of every database says so:
 
