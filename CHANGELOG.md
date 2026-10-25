@@ -16,6 +16,9 @@
   2^64 - 1 or an epoch as results show it. Each returns `{:error, reason}`
   and restores nothing. The native restore refuses any target other than
   the latest state, a time or an epoch, where it restored the latest state.
+* `Sediment.export_sqlite/3` refuses an option it doesn't read, naming it
+  (never its value), and writes nothing: `at:` or `epoch:` exported the
+  latest state. For a point in time, restore to a file, then export it.
 * `Sediment.S3.release_key/4` returns `{:error, {:leftover, %{epochs:
   [...], objects: n, message: ...}}}` when deleting the released epochs'
   objects fails, where it returned `{:ok, _}`. The release did happen (the

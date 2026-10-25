@@ -304,6 +304,10 @@ defmodule Sediment do
     end)
   end
 
+  # The options export_sqlite/3 reads; any other (a point in time, :at or
+  # :epoch, which an export never reads) is refused rather than ignored.
+  @export_options [:encryption, :from_s3, :drop_fts]
+
   @doc """
   Exports a database to a new plain SQLite file at `dest`, the way back
   from Sediment to SQLite (see the "Leaving Sediment" guide).
@@ -342,6 +346,11 @@ defmodule Sediment do
       them, because SQLite can't read a file that has them. The indexed text
       stays.
 
+  Any other option is refused (`{:error, "Sediment.export_sqlite/3: unknown
+  option :at"}`), writing nothing. An S3 database is exported in its latest
+  state: for a point in time, restore it to a file (`Sediment.S3.restore/3`
+  with `:at` or `:epoch`), then export that file.
+
   Returns `{:ok, %{rows: n, objects: n, sequences: [{table, seq}], dropped_fts:
   [name]}}` or `{:error, message}`: `dest` (or its `-wal`/`-journal`) exists,
   the source can't be read (a missing or wrong key), FTS indexes without
@@ -356,21 +365,33 @@ defmodule Sediment do
   def export_sqlite(source, dest, opts \\ []) do
     Sediment.S3.Keys.scrubbed(fn ->
       opts = Sediment.S3.Keys.options!(opts, "Sediment.export_sqlite/3")
-      source = source && to_string(source)
-      dest = to_string(dest)
 
-      from_s3 =
-        case opts[:from_s3] do
-          nil -> nil
-          s3 -> Sediment.S3.with_encryption_choice(s3, opts[:encryption])
-        end
+      case Enum.find(Keyword.keys(opts), &(&1 not in @export_options)) do
+        nil ->
+          export_checked(source, dest, opts)
 
-      ring = Sediment.S3.Keys.normalize(opts[:encryption])
-      drop_fts = opts[:drop_fts] == true
+        name ->
+          {:error,
+           "Sediment.export_sqlite/3: unknown option #{Sediment.S3.Keys.shown_value(name)}"}
+      end
+    end)
+  end
 
-      Sediment.Telemetry.span([:export], %{source: source, dest: dest}, fn ->
-        export(source, dest, from_s3, ring, drop_fts)
-      end)
+  defp export_checked(source, dest, opts) do
+    source = source && to_string(source)
+    dest = to_string(dest)
+
+    from_s3 =
+      case opts[:from_s3] do
+        nil -> nil
+        s3 -> Sediment.S3.with_encryption_choice(s3, opts[:encryption])
+      end
+
+    ring = Sediment.S3.Keys.normalize(opts[:encryption])
+    drop_fts = opts[:drop_fts] == true
+
+    Sediment.Telemetry.span([:export], %{source: source, dest: dest}, fn ->
+      export(source, dest, from_s3, ring, drop_fts)
     end)
   end
 
