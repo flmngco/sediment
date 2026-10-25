@@ -468,6 +468,7 @@ fn prepare_under_lease(
     // a refused open must leave alone.
     remove_snapshot_images(local_path);
     rekey::remove_stale_copy(local_path);
+    remote::remove_download_temps(local_path);
 
     let current = match remote.get(MANIFEST_KEY)? {
         Some(object) => Some((ManifestState::decode(&object.bytes)?, object.version)),
@@ -507,16 +508,20 @@ fn prepare_under_lease(
                 }
             }
             // A rekey or release refused for space before it writes or
-            // downloads anything (its copy is checked again after).
-            if !matches!(op, Op::Open) {
+            // downloads anything (its copy is checked again after); what it
+            // needs stays reserved in this VM until the restore and the copy
+            // are done (the end of this arm).
+            let _reserved = if matches!(op, Op::Open) {
+                None
+            } else {
                 let what = if target.is_some() {
                     "rekey"
                 } else {
                     "release_key"
                 };
                 let needed = rekey::space_needed(remote, &decoded, local_path, target.is_some())?;
-                rekey::check_space(needed, local_path, what)?;
-            }
+                Some(rekey::check_space(needed, local_path, what)?)
+            };
             // The open goes ahead: the sidecar (and a temp file a cut-short
             // write left) goes before anything touches the local files.
             let discarded = warm::discard(local_path);

@@ -46,7 +46,11 @@
   working copy is warm, the rekey's copy, a margin). Both check it before
   they download anything and refuse with a message naming the bytes needed
   and free, where a rekey checked only for its copy, after the download had
-  filled the volume.
+  filled the volume. The check counts the rekeys and releases running in
+  the VM (each reserves its need until its restore and copy are done), and
+  the restore's peak for a chain of deltas (a rebuilt image and the staged
+  delta at once). Temporary files of a download a killed VM cut short are
+  removed under the lease first.
 * `keep_working_copy: false` for `rekey/3`, `release_key/4` and their
   `*_many` variants removes the working copy (the file, its WAL and log,
   the warm sidecar) after a run that returned `{:ok, _}`: an offline run

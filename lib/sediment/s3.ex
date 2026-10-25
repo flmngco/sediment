@@ -849,10 +849,21 @@ defmodule Sediment.S3 do
   The bytes a `rekey/3` (`:rekey`) or `release_key/4` (`:release`) at
   `path` needs free in its directory, as they check it before they download
   anything (refusing with `"s3 config: rekey needs about N bytes free in
-  DIR ..., only F are"`): the restore (the snapshot, unless the working
-  copy at `path` is warm, plus the current epoch's log), for a rekey its
-  re-encrypted copy (the snapshot plus that log), and a margin (a tenth,
-  and 64 MiB). For an operation over many databases at once, add theirs.
+  DIR ..., only F are"`): the restore's peak, unless the working copy at
+  `path` is warm (a full snapshot's size; for a chain of deltas, the most
+  that a rebuilt image and the delta staged beside it take at once), plus
+  the current epoch's log; for a rekey its re-encrypted copy (the snapshot
+  plus that log); and a margin (a tenth, and 64 MiB).
+
+  It is one operation's need. The check counts the rekeys and releases
+  running in this VM too: each reserves its need until its restore and
+  copy are done, and a check refuses unless the free space holds its need
+  besides theirs (`"..., and M reserved by the others running in this
+  VM"`). Operations of other VMs sharing the volume are not counted. A warm
+  copy the open then finds unusable is downloaded after all: the copy's
+  own check after the restore refuses that rekey if the space is gone.
+  Temporary files of a download a killed VM cut short are removed under
+  the lease before the check, so they never count.
 
   It reads the manifest and lists the epoch's log: no lease, no writes.
   Returns `{:ok, bytes}`, `{:ok, :no_database}` or `{:error, reason}`.
@@ -955,9 +966,9 @@ defmodule Sediment.S3 do
 
   **Cost.** Each rekey downloads the database (nothing for a warm copy at
   `path`), needs about twice its size free next to `path` (see
-  `space_needed/3`, which each rekey checks before downloading), and
-  uploads a full snapshot under the new key: with `max_concurrency: n`, n
-  times that disk at once, and the egress and S3 requests (one snapshot upload, its
+  `space_needed/3`, which each rekey checks before downloading, counting
+  those running in this VM), and uploads a full snapshot under the new
+  key: with `max_concurrency: n`, n times that disk at once, and the egress and S3 requests (one snapshot upload, its
   multipart parts, a few manifest and lease requests per database) of the
   whole fleet. The database is unavailable to writers meanwhile.
 

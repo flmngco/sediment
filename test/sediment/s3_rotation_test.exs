@@ -689,4 +689,64 @@ defmodule Sediment.S3RotationTest do
     # Nothing lost: the data is in S3.
     assert {:ok, "r2", ["a"]} = restored_rows(Path.join(dir, "check.db"), s3, ["r2"], [])
   end
+
+  # Concurrent rekeys in one VM: each check counts what the others running
+  # reserved, so together they never pass against the same free space.
+  test "a rekey's space check counts what another one running reserved", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    other = s3_opts("rotation/other-#{System.unique_integer([:positive])}-#{System.os_time()}")
+    db = open!(Path.join(dir, "seed-other.db"), other, ["r1"])
+    :ok = Engine.execute(db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+    :ok = Engine.close(db)
+
+    {a, b} = {Path.join(dir, "a.db"), Path.join(dir, "b.db")}
+    {:ok, need_a} = S3.space_needed(a, s3, :rekey)
+    {:ok, need_b} = S3.space_needed(b, other, :rekey)
+    on_exit(fn -> Native.s3_test_free_space(nil) end)
+    :ok = Native.s3_test_free_space(need_a + need_b - 1)
+
+    task = paused_rekey(a, s3, ring(["r2", "r1"]))
+    assert {:error, message} = S3.rekey(b, other, encryption: ring(["r2", "r1"]))
+    assert message =~ "rekey needs about #{need_b} bytes free"
+    assert message =~ "and #{need_a} reserved by the others running in this VM"
+
+    Native.s3_test_hook(s3, "publish", :release)
+    assert {:ok, %{to: "r2"}} = Task.await(task, 30_000)
+    # Given back once A's restore and copy were done.
+    assert {:ok, %{to: "r2"}} = S3.rekey(b, other, encryption: ring(["r2", "r1"]))
+  end
+
+  # A download a killed VM cut short leaves its temporary files: the next
+  # open, rekey or release removes them under the lease, before the space
+  # check could count them.
+  test "temporary files of a cut-short download are removed under the lease", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    both = ring(["r2", "r1"])
+    path = Path.join(dir, "r.db")
+
+    temps =
+      for suffix <- [".s3-restore", ".s3-chain", ".s3-chain.s3-restore", ".s3-delta"],
+          do: path <> suffix
+
+    plant = fn -> Enum.each(temps, &File.write!(&1, :binary.copy(<<0>>, 4096))) end
+
+    plant.()
+    {:ok, needed} = S3.space_needed(path, s3, :rekey)
+    on_exit(fn -> Native.s3_test_free_space(nil) end)
+    # Room for what it needs (the copy's own check after the restore
+    # measures the folded file, a few pages more than a tiny log suggests).
+    :ok = Native.s3_test_free_space(needed + 1_048_576)
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: both)
+    :ok = Native.s3_test_free_space(nil)
+    refute Enum.any?(temps, &File.exists?/1)
+
+    plant.()
+    assert {:ok, _} = S3.release_key(path, s3, "r1", encryption: both)
+    refute Enum.any?(temps, &File.exists?/1)
+
+    plant.()
+    db = open!(path, s3, ["r2"])
+    :ok = Engine.close(db)
+    refute Enum.any?(temps, &File.exists?/1)
+  end
 end

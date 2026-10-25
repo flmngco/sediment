@@ -344,11 +344,12 @@ fn pages(
 }
 
 /// The bytes a rekey (`rekey`) or a release needs free beside `local_path`,
-/// margin included: the restore (the snapshot, unless the working copy is
-/// warm, plus the epoch's log), and for a rekey its copy (the snapshot plus
-/// the log it may grow by). Warm, here, is a sidecar naming the manifest's
+/// margin included: the restore (its peak, unless the working copy is warm,
+/// plus the epoch's log), and for a rekey its copy (the snapshot plus the
+/// log it may grow by). Warm, here, is a sidecar naming the manifest's
 /// database, generation, epoch and key, beside a file of the snapshot's
-/// size (the open checks more: a copy it then refuses downloads anyway).
+/// size (the open checks more: a copy it then refuses downloads anyway, and
+/// the copy's own check after the restore catches what that costs).
 pub(crate) fn space_needed(
     remote: &super::remote::Remote,
     manifest: &super::layout::Manifest,
@@ -370,7 +371,7 @@ pub(crate) fn space_needed(
     let restore = if warm {
         log
     } else {
-        manifest.snapshot_size + log
+        chain_peak(&manifest.current().chain()) + log
     };
     let copy = if rekey {
         manifest.snapshot_size + log
@@ -380,16 +381,116 @@ pub(crate) fn space_needed(
     Ok(super::import::with_margin(restore + copy))
 }
 
+/// The most a cold restore of `chain` holds on disk at once: a full
+/// snapshot alone is its size; for a delta chain, at each delta, the image
+/// rebuilt so far (as large as before or after it) and the decoded delta
+/// staged beside it. A delta's decoded size isn't recorded: it is bounded
+/// by the database's size after it (its pages, page count times page size,
+/// are what a delta can change).
+pub(crate) fn chain_peak(chain: &[super::layout::SnapshotLink]) -> u64 {
+    let base = chain.first().map_or(0, |link| link.size);
+    chain
+        .windows(2)
+        .map(|pair| pair[0].size.max(pair[1].size) + pair[1].size)
+        .fold(base, u64::max)
+}
+
+/// The bytes reserved by the rekeys and releases of this VM between their
+/// space check and the end of their restore and copy: each check counts
+/// the others' (bytes they wrote already count twice: conservative).
+static RESERVED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// A reservation of [`RESERVED`], given back when dropped.
+pub(crate) struct Reservation(u64);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut reserved = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+        *reserved = reserved.saturating_sub(self.0);
+    }
+}
+
 /// Refuses a rekey or release at `local_path` before it downloads anything
-/// when [`space_needed`] is more than is free there.
-pub(crate) fn check_space(needed: u64, local_path: &Path, what: &str) -> Result<()> {
-    match super::import::free_space(local_path)? {
-        Some((dir, free)) if free < needed => Err(S3Error::Config(format!(
-            "{what} needs about {needed} bytes free in {} (the restore, the copy and a margin; \
-             see Sediment.S3.space_needed/3), only {free} are",
-            dir.display()
-        ))),
-        _ => Ok(()),
+/// when [`space_needed`], plus what the others running in this VM reserved,
+/// is more than is free there; else reserves it until the guard drops.
+pub(crate) fn check_space(needed: u64, local_path: &Path, what: &str) -> Result<Reservation> {
+    let mut reserved = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+    admit(
+        &mut reserved,
+        super::import::free_space(local_path)?,
+        needed,
+        what,
+    )?;
+    Ok(Reservation(needed))
+}
+
+/// Adds `needed` to `reserved` if `free` (the directory, and its free bytes;
+/// `None`: unknown) holds it besides what is reserved already.
+fn admit(reserved: &mut u64, free: Option<(PathBuf, u64)>, needed: u64, what: &str) -> Result<()> {
+    if let Some((dir, free)) = free {
+        if free < *reserved + needed {
+            let others = if *reserved > 0 {
+                format!(
+                    ", and {} reserved by the others running in this VM",
+                    *reserved
+                )
+            } else {
+                String::new()
+            };
+            return Err(S3Error::Config(format!(
+                "{what} needs about {needed} bytes free in {} (the restore, the copy and a \
+                 margin; see Sediment.S3.space_needed/3{others}), only {free} are",
+                dir.display()
+            )));
+        }
+    }
+    *reserved += needed;
+    Ok(())
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::{admit, chain_peak};
+    use crate::s3::layout::SnapshotLink;
+    use std::path::PathBuf;
+
+    fn link(size: u64) -> SnapshotLink {
+        SnapshotLink {
+            key: String::new(),
+            stored_size: 0,
+            size,
+            crc32c: 0,
+        }
+    }
+
+    #[test]
+    fn a_chain_peaks_at_an_image_and_its_staged_delta() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(chain_peak(&[link(GIB)]), GIB);
+        assert_eq!(chain_peak(&[link(GIB), link(GIB)]), 2 * GIB);
+        // An earlier, larger image: it is there while the delta is staged.
+        assert_eq!(chain_peak(&[link(2 * GIB), link(GIB), link(GIB)]), 3 * GIB);
+        assert_eq!(chain_peak(&[link(GIB), link(3 * GIB)]), 6 * GIB);
+    }
+
+    #[test]
+    fn admission_counts_what_others_reserved() {
+        let dir = || Some((PathBuf::from("/data"), 100));
+        let mut reserved = 0;
+        admit(&mut reserved, dir(), 60, "rekey").unwrap();
+        let err = admit(&mut reserved, dir(), 60, "rekey")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rekey needs about 60 bytes free in /data")
+                && err.contains("and 60 reserved by the others running in this VM")
+                && err.contains("only 100 are"),
+            "{err}"
+        );
+        assert_eq!(reserved, 60);
+        admit(&mut reserved, dir(), 40, "release_key").unwrap();
+        assert_eq!(reserved, 100);
+        admit(&mut reserved, None, 1 << 40, "rekey").unwrap();
     }
 }
 
