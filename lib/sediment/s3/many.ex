@@ -27,10 +27,10 @@ defmodule Sediment.S3.Many do
 
     {targets, opts} =
       Keys.scrubbed(fn ->
-        checked!(targets, opts, call, @common ++ [:to, :force, :allow_reuse])
+        checked!(targets, opts, call, @common ++ [:to, :force, :allow_reuse, :keep_working_copy])
       end)
 
-    pass = Keyword.take(opts, [:to, :force, :allow_reuse])
+    pass = Keyword.take(opts, [:to, :force, :allow_reuse, :keep_working_copy])
     rekey = fn target, ring -> S3.rekey(target.path, target.s3, [encryption: ring] ++ pass) end
 
     opts = Keyword.put(opts, :precheck, {:rekey, opts[:to]})
@@ -46,10 +46,10 @@ defmodule Sediment.S3.Many do
         unless (is_binary(key_id) or is_atom(key_id)) and key_id not in [nil, true, false],
           do: raise(ArgumentError, "#{call}: the key id must be a string")
 
-        checked!(targets, opts, call, @common ++ [:force])
+        checked!(targets, opts, call, @common ++ [:force, :keep_working_copy])
       end)
 
-    pass = Keyword.take(opts, [:force])
+    pass = Keyword.take(opts, [:force, :keep_working_copy])
 
     release = fn target, ring ->
       S3.release_key(target.path, target.s3, key_id, [encryption: ring] ++ pass)
@@ -523,7 +523,7 @@ defmodule Sediment.S3.Many do
     for name <- [:around, :on_result, :stop_on], do: function!(opts, name, 2, call)
     function!(opts, :check, 1, call)
 
-    for name <- [:force, :allow_reuse],
+    for name <- [:force, :allow_reuse, :keep_working_copy],
         Keyword.has_key?(opts, name),
         not is_boolean(opts[name]),
         do: raise(ArgumentError, "#{call}: #{inspect(name)} must be true or false")

@@ -200,14 +200,22 @@ defmodule Sediment.Native do
         ) :: {:ok, map()} | {:error, reason()}
   def s3_restore(_path, _opts, _target, _encryption), do: :erlang.nif_error(:not_loaded)
 
-  @spec s3_rekey(String.t(), keyword() | map(), ring(), String.t() | nil, boolean(), boolean()) ::
-          {:ok, map() | :current} | {:error, reason()}
-  def s3_rekey(_path, _opts, _encryption, _to, _force, _allow_reuse),
+  @spec s3_rekey(
+          String.t(),
+          keyword() | map(),
+          ring(),
+          String.t() | nil,
+          boolean(),
+          boolean(),
+          boolean()
+        ) :: {:ok, map() | :current} | {:error, reason()}
+  def s3_rekey(_path, _opts, _encryption, _to, _force, _allow_reuse, _keep_working_copy),
     do: :erlang.nif_error(:not_loaded)
 
-  @spec s3_release_key(String.t(), keyword() | map(), ring(), String.t(), boolean()) ::
+  @spec s3_release_key(String.t(), keyword() | map(), ring(), String.t(), boolean(), boolean()) ::
           {:ok, map()} | {:error, reason()}
-  def s3_release_key(_path, _opts, _encryption, _key, _force), do: :erlang.nif_error(:not_loaded)
+  def s3_release_key(_path, _opts, _encryption, _key, _force, _keep_working_copy),
+    do: :erlang.nif_error(:not_loaded)
 
   @spec s3_key_census(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
   def s3_key_census(_opts), do: :erlang.nif_error(:not_loaded)

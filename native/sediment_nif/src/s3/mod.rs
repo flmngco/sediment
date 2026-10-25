@@ -42,7 +42,7 @@ pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
 pub use keys::{short_fingerprint, shown, shown_value, Key, KeyRecord, KeyRing};
-pub use rekey::space_needed_at;
+pub use rekey::{drop_working_copy, space_needed_at};
 pub use rekey::{rekey, release_key, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;

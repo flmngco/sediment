@@ -661,6 +661,11 @@ defmodule Sediment.S3 do
       for a holder known to be gone (a crashed run whose lease you can't
       wait out).
     * `:allow_reuse` - allow a retired key (see above).
+    * `:keep_working_copy` - `false` removes the working copy at `path`
+      (the file, its WAL and log, the warm sidecar) once the rekey
+      returned `{:ok, _}`, for a run through a scratch directory that has
+      no use for it. Default `true`: the copy stays warm under the new
+      key, for the next open at `path`.
 
   Returns `{:ok, %{from: id, to: id, epoch: epoch}}`, `{:ok, :current}` when
   the database is under that key already (nothing is written),
@@ -678,10 +683,11 @@ defmodule Sediment.S3 do
       to = opts[:to] && key_id!(opts[:to], ":to", "rekey/3")
       force = boolean!(opts, :force, "rekey/3")
       allow_reuse = boolean!(opts, :allow_reuse, "rekey/3")
+      keep = boolean!(opts, :keep_working_copy, "rekey/3", true)
       ring = required_ring(opts[:encryption], "rekey/3")
 
       Telemetry.span([:s3, :rekey], %{path: path}, fn ->
-        Keys.run(ring, &Native.s3_rekey(path, s3_opts, &1, to, force, allow_reuse))
+        Keys.run(ring, &Native.s3_rekey(path, s3_opts, &1, to, force, allow_reuse, keep))
       end)
     end)
   end
@@ -693,7 +699,8 @@ defmodule Sediment.S3 do
   `key_census/1` no longer lists the key, and it can leave the ring.
 
   It refuses the current key (rekey first). It is a writer open with a
-  clean close at `path`, with the same lease rules as `rekey/3` (`:force`),
+  clean close at `path`, with the same lease rules as `rekey/3` (`:force`)
+  and its `:keep_working_copy`,
   and needs the `:encryption` ring holding the current key.
 
   This removes what the manifest references. A bucket with versioning
@@ -724,18 +731,19 @@ defmodule Sediment.S3 do
       path = to_string(path)
       key_id = key_id!(key_id, "the key id", "release_key/4")
       force = boolean!(opts, :force, "release_key/4")
+      keep = boolean!(opts, :keep_working_copy, "release_key/4", true)
       ring = required_ring(opts[:encryption], "release_key/4")
 
       Telemetry.span([:s3, :release_key], %{path: path}, fn ->
-        Keys.run(ring, &Native.s3_release_key(path, s3_opts, &1, key_id, force))
+        Keys.run(ring, &Native.s3_release_key(path, s3_opts, &1, key_id, force, keep))
       end)
     end)
   end
 
   # Checked here, with a fixed message: a value the NIF can't decode raises
   # a bare badarg.
-  defp boolean!(opts, name, call) do
-    case Keyword.get(opts, name, false) do
+  defp boolean!(opts, name, call, default \\ false) do
+    case Keyword.get(opts, name, default) do
       value when is_boolean(value) -> value
       _ -> raise ArgumentError, "Sediment.S3.#{call}: #{inspect(name)} must be true or false"
     end
@@ -958,7 +966,9 @@ defmodule Sediment.S3 do
     * `:encryption` (required) - the key ring for every target, or a
       function of the target (as given) returning its ring, for per-tenant
       rings or `key_for`.
-    * `:to`, `:force`, `:allow_reuse` - as for `rekey/3`, for every target.
+    * `:to`, `:force`, `:allow_reuse`, `:keep_working_copy` - as for
+      `rekey/3`, for every target (a target the pre-check reports
+      `current` runs nothing, and keeps a copy it has).
     * `:max_concurrency` - how many databases at once (default 1).
     * `:attempts` - runs per database for the results above (default 3);
       `:backoff` - the first wait, in ms (default 1000).

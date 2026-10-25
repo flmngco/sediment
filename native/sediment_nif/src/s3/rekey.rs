@@ -360,6 +360,21 @@ pub fn space_needed_at(cfg: &S3Config, local_path: &Path, rekey: bool) -> Result
     }
 }
 
+/// Removes the working copy at `path` after a rekey or release that was
+/// asked not to keep it (`keep_working_copy: false`): the file, its WAL and
+/// log, and the warm sidecar. Only under the file's lock.
+pub fn drop_working_copy(path: &Path) -> Result<()> {
+    super::warm::discard(path);
+    for file in [
+        restore::wal_path(path),
+        restore::log_path(path),
+        path.to_path_buf(),
+    ] {
+        restore::remove_if_exists(&file)?;
+    }
+    Ok(())
+}
+
 /// Removes the copy a rekey killed while running left beside `path` (a
 /// database's size). Only under the file's lock, which a running rekey of
 /// it holds, and the lease, which a rekey in another process holds.

@@ -47,6 +47,10 @@
   they download anything and refuse with a message naming the bytes needed
   and free, where a rekey checked only for its copy, after the download had
   filled the volume.
+* `keep_working_copy: false` for `rekey/3`, `release_key/4` and their
+  `*_many` variants removes the working copy (the file, its WAL and log,
+  the warm sidecar) after a run that returned `{:ok, _}`: an offline run
+  through a scratch directory has no use for it.
 * `Sediment.S3.orphans(s3_opts)` lists, without the lease, the objects a
   writer's garbage collection would delete (`objects`, `bytes`, `by_key`),
   with the collection's own rule: never a live writer's next snapshot or

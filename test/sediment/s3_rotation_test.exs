@@ -648,4 +648,45 @@ defmodule Sediment.S3RotationTest do
     assert {:ok, %{retained: %{"r1" => _}}} = S3.key_census(s3)
     assert {:ok, :no_database} = S3.space_needed(path, s3_opts("rotation/none"), :rekey)
   end
+
+  test "keep_working_copy: false removes the working copy after a run", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    both = ring(["r2", "r1"])
+
+    files = fn path ->
+      [
+        path,
+        path <> "-wal",
+        Path.rootname(path) <> ".db-log",
+        Path.join(dir, ".#{Path.basename(path)}.s3-warm")
+      ]
+    end
+
+    kept = Path.join(dir, "kept.db")
+    assert {:ok, %{to: "r2"}} = S3.rekey(kept, s3, encryption: both)
+    assert File.exists?(kept) and File.exists?(Path.join(dir, ".kept.db.s3-warm"))
+
+    for {name, run} <- [
+          {"current.db", &S3.rekey(&1, s3, encryption: both, keep_working_copy: false)},
+          {"released.db",
+           &S3.release_key(&1, s3, "r1", encryption: both, keep_working_copy: false)}
+        ] do
+      path = Path.join(dir, name)
+      assert {:ok, _} = run.(path)
+      refute Enum.any?(files.(path), &File.exists?/1), name
+    end
+
+    assert %{rekeyed: [], current: ["t"]} =
+             S3.rekey_many([%{id: "t", path: kept, s3: s3}],
+               encryption: both,
+               keep_working_copy: false
+             )
+
+    assert_raise ArgumentError, ~r/:keep_working_copy must be true or false/, fn ->
+      S3.rekey(kept, s3, encryption: both, keep_working_copy: :no)
+    end
+
+    # Nothing lost: the data is in S3.
+    assert {:ok, "r2", ["a"]} = restored_rows(Path.join(dir, "check.db"), s3, ["r2"], [])
+  end
 end

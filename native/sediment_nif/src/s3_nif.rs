@@ -586,6 +586,7 @@ fn s3_rekey<'a>(
     to: Option<String>,
     force: bool,
     allow_reuse: bool,
+    keep_working_copy: bool,
 ) -> Term<'a> {
     let config = match config_with_ring(opts, encryption) {
         Ok(config) => config,
@@ -595,8 +596,13 @@ fn s3_rekey<'a>(
         &path,
         crate::conn::Holder::Maintenance("a rekey of this database"),
     );
-    let rekeyed =
-        on_turso_stack(|| s3::rekey(&config, Path::new(&path), to.as_deref(), force, allow_reuse));
+    let rekeyed = on_turso_stack(|| {
+        let rekeyed = s3::rekey(&config, Path::new(&path), to.as_deref(), force, allow_reuse)?;
+        if !keep_working_copy {
+            s3::drop_working_copy(Path::new(&path))?;
+        }
+        Ok(rekeyed)
+    });
     let rekeyed = match rekeyed {
         Ok(rekeyed) => rekeyed,
         Err(reason) => return error_tuple(env, reason),
@@ -627,6 +633,7 @@ fn s3_release_key<'a>(
     encryption: Term<'a>,
     key: String,
     force: bool,
+    keep_working_copy: bool,
 ) -> Term<'a> {
     let config = match config_with_ring(opts, encryption) {
         Ok(config) => config,
@@ -636,8 +643,13 @@ fn s3_release_key<'a>(
         &path,
         crate::conn::Holder::Maintenance("a key release of this database"),
     );
-    let released = match on_turso_stack(|| s3::release_key(&config, Path::new(&path), &key, force))
-    {
+    let released = match on_turso_stack(|| {
+        let released = s3::release_key(&config, Path::new(&path), &key, force)?;
+        if !keep_working_copy {
+            s3::drop_working_copy(Path::new(&path))?;
+        }
+        Ok(released)
+    }) {
         Ok(released) => released,
         Err(reason) => return error_tuple(env, reason),
     };
