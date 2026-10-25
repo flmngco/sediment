@@ -70,6 +70,9 @@ pub struct ConnRes {
     broken: AtomicBool,
     /// Test hook: make the next guarded call into turso panic.
     pub panic_next_step: AtomicBool,
+    /// Test hook: the next `transaction_status` or `columns` call closes the
+    /// connection first, as a disconnect does (see `debug_close_before_status`).
+    pub close_before_status: AtomicBool,
     /// S3 group commit uploads in `sync`, which turso only calls for
     /// `synchronous = FULL` commits, so the connection is held at FULL.
     force_full_sync: AtomicBool,
@@ -319,6 +322,7 @@ impl ConnRes {
             running: AtomicU64::new(0),
             broken: AtomicBool::new(false),
             panic_next_step: AtomicBool::new(false),
+            close_before_status: AtomicBool::new(false),
             self_ref: Mutex::new(None),
             s3_guard: Mutex::new(None),
             force_full_sync: AtomicBool::new(false),
@@ -830,6 +834,7 @@ fn open<'a>(env: Env<'a>, path: String, opts: Term<'a>) -> NifResult<Term<'a>> {
         running: AtomicU64::new(0),
         broken: AtomicBool::new(false),
         panic_next_step: AtomicBool::new(false),
+        close_before_status: AtomicBool::new(false),
         self_ref: Mutex::new(None),
         s3_guard: Mutex::new(
             opened
@@ -1012,6 +1017,7 @@ fn last_insert_rowid(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn transaction_status(env: Env<'_>, res: ResourceArc<ConnRes>) -> Term<'_> {
+    ConnRes::close_if_asked(&res);
     with_conn(env, &res, |conn| {
         let status = if conn.get_auto_commit() {
             atoms::idle()
@@ -1055,6 +1061,25 @@ fn resource_counts() -> (i64, i64) {
 fn debug_panic_next_step(res: ResourceArc<ConnRes>) -> Atom {
     res.panic_next_step.store(true, Ordering::SeqCst);
     atoms::ok()
+}
+
+/// Test hook: the next `transaction_status` or `columns` call on this
+/// connection closes it first, as a disconnect does (closing flag set),
+/// after the statement before it completed.
+#[rustler::nif]
+fn debug_close_before_status(res: ResourceArc<ConnRes>) -> Atom {
+    res.close_before_status.store(true, Ordering::SeqCst);
+    atoms::ok()
+}
+
+impl ConnRes {
+    /// See `debug_close_before_status`.
+    pub(crate) fn close_if_asked(this: &ResourceArc<ConnRes>) {
+        if this.close_before_status.swap(false, Ordering::SeqCst) {
+            ConnRes::start_closing(this.clone());
+            this.close_now();
+        }
+    }
 }
 
 #[cfg(test)]

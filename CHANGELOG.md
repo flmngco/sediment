@@ -65,7 +65,10 @@
 * A query its timeout stopped sometimes failed with "connection_closed"
   (when the disconnect closed the connection before the statement saw the
   interrupt) instead of "interrupted", as `Sediment.Connection` documents.
-  It is "interrupted" either way.
+  It is "interrupted" either way. Only the call that runs the statement
+  reports it: a close after the statement or a COMMIT completed (while
+  its status or columns were read) is still "connection_closed", as the
+  write may have committed.
 * A rekey killed while running left its copy, `.<name>.rekey.db` (the
   database's size), until the next rekey. The next open, rekey or release
   of the database removes it, under the file's lock and the lease, and so

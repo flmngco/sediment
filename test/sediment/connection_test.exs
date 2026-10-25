@@ -644,6 +644,42 @@ defmodule Sediment.ConnectionTest do
   end
 
   describe "closed handle" do
+    # A disconnect that closes the handle after the statement (or COMMIT)
+    # completed: the follow-up call fails, and the write committed. It is
+    # reported "connection_closed", never "interrupted".
+    test "a close after a completed COMMIT or stepwise INSERT is connection_closed" do
+      path = Temp.path!()
+      {:ok, state} = Connection.connect(database: path)
+      {:ok, _, state} = Connection.handle_begin([], state)
+
+      {:ok, _, _, state} =
+        Connection.handle_execute(%Query{statement: "CREATE TABLE t (v INTEGER)"}, [], [], state)
+
+      {:ok, _, _, state} =
+        Connection.handle_execute(%Query{statement: "INSERT INTO t VALUES (1)"}, [], [], state)
+
+      :ok = Sediment.Native.debug_close_before_status(state.db)
+
+      assert {:disconnect, %Sediment.Error{message: "connection_closed"}, _} =
+               Connection.handle_commit([], state)
+
+      {:ok, state} = Connection.connect(database: path)
+
+      {:ok, query, state} =
+        Connection.handle_prepare(%Query{statement: "INSERT INTO t VALUES (:v)"}, [], state)
+
+      :ok = Sediment.Native.debug_close_before_status(state.db)
+
+      assert {:disconnect, %Sediment.Error{message: "connection_closed"}, _} =
+               Connection.handle_execute(query, %{":v" => 2}, [], state)
+
+      {:ok, db} = Engine.open(path)
+      {:ok, stmt} = Engine.prepare(db, "SELECT v FROM t ORDER BY v")
+      assert {:ok, [[1], [2]]} = Engine.fetch_all(db, stmt)
+      :ok = Engine.release(db, stmt)
+      :ok = Engine.close(db)
+    end
+
     test "callbacks disconnect instead of returning a bare error" do
       {:ok, state} = Connection.connect(database: ":memory:")
       {:ok, query, state} = Connection.handle_prepare(%Query{statement: "select 1"}, [], state)

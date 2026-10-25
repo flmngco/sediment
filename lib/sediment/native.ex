@@ -279,4 +279,7 @@ defmodule Sediment.Native do
   # Test hook: makes the next step on `conn` panic inside the NIF's guard.
   @spec debug_panic_next_step(db()) :: :ok
   def debug_panic_next_step(_conn), do: :erlang.nif_error(:not_loaded)
+
+  @spec debug_close_before_status(db()) :: :ok
+  def debug_close_before_status(_conn), do: :erlang.nif_error(:not_loaded)
 end
