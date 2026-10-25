@@ -41,6 +41,12 @@
   material under a recorded id fails the target before `:around`, with a
   message naming the id and both fingerprints. The encryption function is
   called once per target, before `:around`.
+* `Sediment.S3.space_needed(path, s3_opts, :rekey | :release)`: the bytes
+  a rekey or release needs free beside `path` (the restore unless the
+  working copy is warm, the rekey's copy, a margin). Both check it before
+  they download anything and refuse with a message naming the bytes needed
+  and free, where a rekey checked only for its copy, after the download had
+  filled the volume.
 * `Sediment.S3.orphans(s3_opts)` lists, without the lease, the objects a
   writer's garbage collection would delete (`objects`, `bytes`, `by_key`),
   with the collection's own rule: never a live writer's next snapshot or

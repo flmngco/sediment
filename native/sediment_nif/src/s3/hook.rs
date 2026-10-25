@@ -44,6 +44,23 @@ struct Armed {
 }
 
 static HOOK: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+/// A test's cap on the free space the space checks see (0: none).
+static FREE_SPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Caps the free space the space checks see at `bytes` (`None`: the real
+/// free space), for every database of the VM.
+pub fn limit_free_space(bytes: Option<u64>) {
+    FREE_SPACE.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The free space a space check uses: `real`, unless a test capped it.
+pub(crate) fn free_space(real: u64) -> u64 {
+    match FREE_SPACE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => real,
+        cap => real.min(cap),
+    }
+}
 static CHANGED: Condvar = Condvar::new();
 
 /// Arms the hook at `stage` for the database at `place` (`S3Config::place`).

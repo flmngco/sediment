@@ -641,8 +641,11 @@ defmodule Sediment.S3 do
   upload of a full snapshot, all proportional to its size. Opens meanwhile
   get `"s3 lease held ..."` and retry; the rekey renews its lease
   throughout. It needs about twice the database's size free next to `path`
-  (the copy beside it; it refuses to start without), and about 32 bytes of
-  memory per page plus what `integrity_check` takes.
+  (the restore and the copy beside it), and about 32 bytes of memory per
+  page plus what `integrity_check` takes. Before it downloads anything it
+  refuses when less is free than `space_needed/3` says (`"s3 config: rekey
+  needs about N bytes free in DIR ..., only F are"`); `release_key/4` too,
+  for its restore.
 
   ## Options
 
@@ -828,6 +831,29 @@ defmodule Sediment.S3 do
       )
 
   @doc """
+  The bytes a `rekey/3` (`:rekey`) or `release_key/4` (`:release`) at
+  `path` needs free in its directory, as they check it before they download
+  anything (refusing with `"s3 config: rekey needs about N bytes free in
+  DIR ..., only F are"`): the restore (the snapshot, unless the working
+  copy at `path` is warm, plus the current epoch's log), for a rekey its
+  re-encrypted copy (the snapshot plus that log), and a margin (a tenth,
+  and 64 MiB). For an operation over many databases at once, add theirs.
+
+  It reads the manifest and lists the epoch's log: no lease, no writes.
+  Returns `{:ok, bytes}`, `{:ok, :no_database}` or `{:error, reason}`.
+  """
+  @spec space_needed(Path.t(), keyword() | map(), :rekey | :release) ::
+          {:ok, non_neg_integer() | :no_database} | {:error, term()}
+  def space_needed(path, s3_opts, operation) when operation in [:rekey, :release] do
+    Keys.scrubbed(fn ->
+      Native.s3_space_needed(to_string(path), s3_opts, operation == :rekey)
+    end)
+  end
+
+  def space_needed(_path, _s3_opts, _operation),
+    do: raise(ArgumentError, "Sediment.S3.space_needed/3: the operation is :rekey or :release")
+
+  @doc """
   The objects of the database at the S3 location in `s3_opts` that its
   manifest no longer references: what a writer's garbage collection would
   delete, by the same rule, read without the lease. Informational: a
@@ -913,9 +939,10 @@ defmodule Sediment.S3 do
   stopped).
 
   **Cost.** Each rekey downloads the database (nothing for a warm copy at
-  `path`), needs about twice its size free next to `path`, and uploads a
-  full snapshot under the new key: with `max_concurrency: n`, n times that
-  disk at once, and the egress and S3 requests (one snapshot upload, its
+  `path`), needs about twice its size free next to `path` (see
+  `space_needed/3`, which each rekey checks before downloading), and
+  uploads a full snapshot under the new key: with `max_concurrency: n`, n
+  times that disk at once, and the egress and S3 requests (one snapshot upload, its
   multipart parts, a few manifest and lease requests per database) of the
   whole fleet. The database is unavailable to writers meanwhile.
 

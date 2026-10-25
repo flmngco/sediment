@@ -610,4 +610,42 @@ defmodule Sediment.S3RotationTest do
     assert :ok = S3.check_ring(many, ring(["r2", "r1"]))
     assert {:error, [{"r1", :mismatch}]} = S3.check_ring(many, swapped)
   end
+
+  # The space a rekey or release checks before it downloads anything is
+  # what space_needed/3 says; below it, the operation refuses, unchanged.
+  test "rekey and release check the free space space_needed/3 names, before downloading",
+       %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    margin = 64 * 1024 * 1024
+
+    assert {:ok, rekey} = S3.space_needed(path, s3, :rekey)
+    assert {:ok, release} = S3.space_needed(path, s3, :release)
+    assert rekey > release and release > margin
+
+    on_exit(fn -> Native.s3_test_free_space(nil) end)
+    :ok = Native.s3_test_free_space(rekey - 1)
+
+    assert {:error, message} = S3.rekey(path, s3, encryption: ring(["r2", "r1"]))
+    assert message =~ "rekey needs about #{rekey} bytes free in #{dir}"
+    assert message =~ "only #{rekey - 1} are"
+    refute File.exists?(path)
+    assert {:ok, %{current: "r1"}} = S3.key_census(s3)
+
+    :ok = Native.s3_test_free_space(nil)
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: ring(["r2", "r1"]))
+
+    # Warm now: the restore needs no snapshot.
+    assert {:ok, warm} = S3.space_needed(path, s3, :release)
+    assert {:ok, cold} = S3.space_needed(Path.join(dir, "cold.db"), s3, :release)
+    assert warm < cold
+
+    :ok = Native.s3_test_free_space(warm - 1)
+
+    assert {:error, "s3 config: release_key needs about " <> _} =
+             S3.release_key(path, s3, "r1", encryption: ring(["r2", "r1"]))
+
+    assert {:ok, %{retained: %{"r1" => _}}} = S3.key_census(s3)
+    assert {:ok, :no_database} = S3.space_needed(path, s3_opts("rotation/none"), :rekey)
+  end
 end

@@ -299,6 +299,67 @@ fn pages(
     Ok(hashes)
 }
 
+/// The bytes a rekey (`rekey`) or a release needs free beside `local_path`,
+/// margin included: the restore (the snapshot, unless the working copy is
+/// warm, plus the epoch's log), and for a rekey its copy (the snapshot plus
+/// the log it may grow by). Warm, here, is a sidecar naming the manifest's
+/// database, generation, epoch and key, beside a file of the snapshot's
+/// size (the open checks more: a copy it then refuses downloads anyway).
+pub(crate) fn space_needed(
+    remote: &super::remote::Remote,
+    manifest: &super::layout::Manifest,
+    local_path: &Path,
+    rekey: bool,
+) -> Result<u64> {
+    let log: u64 = remote
+        .list(&manifest.epoch.log_dir())?
+        .iter()
+        .map(|object| object.size)
+        .sum();
+    let warm = super::warm::read(local_path).is_some_and(|sidecar| {
+        manifest.database_id.as_deref() == Some(sidecar.database_id.as_str())
+            && manifest.generation == sidecar.generation
+            && manifest.epoch.to_string() == sidecar.epoch
+            && manifest.key.as_ref().map(|key| &key.fingerprint) == sidecar.key_fingerprint.as_ref()
+            && std::fs::metadata(local_path).is_ok_and(|meta| meta.len() == manifest.snapshot_size)
+    });
+    let restore = if warm {
+        log
+    } else {
+        manifest.snapshot_size + log
+    };
+    let copy = if rekey {
+        manifest.snapshot_size + log
+    } else {
+        0
+    };
+    Ok(super::import::with_margin(restore + copy))
+}
+
+/// Refuses a rekey or release at `local_path` before it downloads anything
+/// when [`space_needed`] is more than is free there.
+pub(crate) fn check_space(needed: u64, local_path: &Path, what: &str) -> Result<()> {
+    match super::import::free_space(local_path)? {
+        Some((dir, free)) if free < needed => Err(S3Error::Config(format!(
+            "{what} needs about {needed} bytes free in {} (the restore, the copy and a margin; \
+             see Sediment.S3.space_needed/3), only {free} are",
+            dir.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// [`space_needed`] for `Sediment.S3.space_needed/3`: the manifest read
+/// without the lease. `None`: no database.
+pub fn space_needed_at(cfg: &S3Config, local_path: &Path, rekey: bool) -> Result<Option<u64>> {
+    cfg.validate()?;
+    let remote = cfg.remote()?;
+    match super::restore::read_manifest(&remote)? {
+        Some(manifest) => space_needed(&remote, &manifest, local_path, rekey).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Removes the copy a rekey killed while running left beside `path` (a
 /// database's size). Only under the file's lock, which a running rekey of
 /// it holds, and the lease, which a rekey in another process holds.

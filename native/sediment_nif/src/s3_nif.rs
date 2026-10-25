@@ -710,6 +710,28 @@ fn s3_orphans<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
     }
 }
 
+/// The bytes a rekey (`rekey: true`) or a release at `path` needs free
+/// (see `s3::space_needed_at`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_space_needed<'a>(env: Env<'a>, path: String, opts: Term<'a>, rekey: bool) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match s3::space_needed_at(&config, Path::new(&path), rekey) {
+        Ok(Some(bytes)) => ok_tuple(env, bytes),
+        Ok(None) => ok_tuple(env, Atom::from_str(env, "no_database").unwrap()),
+        Err(err) => error_term(env, &err),
+    }
+}
+
+/// Test hook: caps the free space the space checks see (`nil`: none).
+#[rustler::nif]
+fn s3_test_free_space(bytes: Option<u64>) -> rustler::Atom {
+    s3::hook::limit_free_space(bytes);
+    crate::atoms::ok()
+}
+
 /// Which keys the database depends on (see `s3::key_census`).
 #[rustler::nif(schedule = "DirtyIo")]
 fn s3_key_census<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {

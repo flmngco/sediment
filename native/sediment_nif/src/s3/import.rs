@@ -278,23 +278,10 @@ fn check_source(source: &Path) -> Result<u64> {
 
 #[cfg(unix)]
 pub(crate) fn check_free_space(path: &Path, needed: u64) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let dir = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
-    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| S3Error::Config("database path contains a NUL byte".into()))?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: c_dir is a valid C string, stat a valid out-pointer.
-    if unsafe { libc::statvfs(c_dir.as_ptr(), &mut stat) } != 0 {
+    let Some((dir, free)) = free_space(path)? else {
         return Ok(());
-    }
-    #[allow(clippy::unnecessary_cast)]
-    let free = stat.f_bavail as u64 * stat.f_frsize as u64;
-    let wanted = needed + needed / 10 + 64 * 1024 * 1024;
+    };
+    let wanted = with_margin(needed);
     if free < wanted {
         return Err(S3Error::Config(format!(
             "import needs about {wanted} bytes free in {} for its temporary copies, only \
@@ -308,6 +295,39 @@ pub(crate) fn check_free_space(path: &Path, needed: u64) -> Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn check_free_space(_path: &Path, _needed: u64) -> Result<()> {
     Ok(())
+}
+
+/// `needed` with the margin every space check adds: a tenth, and 64 MiB.
+pub(crate) fn with_margin(needed: u64) -> u64 {
+    needed + needed / 10 + 64 * 1024 * 1024
+}
+
+/// The directory `path` is in, and the bytes free there for this user
+/// (`None` where that can't be told).
+#[cfg(unix)]
+pub(crate) fn free_space(path: &Path) -> Result<Option<(PathBuf, u64)>> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| S3Error::Config("database path contains a NUL byte".into()))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_dir is a valid C string, stat a valid out-pointer.
+    if unsafe { libc::statvfs(c_dir.as_ptr(), &mut stat) } != 0 {
+        return Ok(None);
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+    Ok(Some((dir.to_path_buf(), super::hook::free_space(free))))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn free_space(_path: &Path) -> Result<Option<(PathBuf, u64)>> {
+    Ok(None)
 }
 
 fn refuse(why: impl std::fmt::Display) -> S3Error {

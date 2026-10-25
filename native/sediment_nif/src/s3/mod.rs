@@ -42,6 +42,7 @@ pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
 pub use keys::{short_fingerprint, shown, shown_value, Key, KeyRecord, KeyRing};
+pub use rekey::space_needed_at;
 pub use rekey::{rekey, release_key, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;
@@ -479,6 +480,17 @@ fn prepare_under_lease(
                         }),
                     };
                 }
+            }
+            // A rekey or release refused for space before it writes or
+            // downloads anything (its copy is checked again after).
+            if !matches!(op, Op::Open) {
+                let what = if target.is_some() {
+                    "rekey"
+                } else {
+                    "release_key"
+                };
+                let needed = rekey::space_needed(remote, &decoded, local_path, target.is_some())?;
+                rekey::check_space(needed, local_path, what)?;
             }
             // The open goes ahead: the sidecar (and a temp file a cut-short
             // write left) goes before anything touches the local files.
