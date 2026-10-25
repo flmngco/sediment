@@ -380,6 +380,9 @@ defmodule Sediment.KeyNetTest do
   # can't be reached) and a key in each option, and in the target: no key
   # in the result, a reason, an exception re-raised, or a callback's
   # arguments (the target given back with its :encryption hidden).
+  # Each call reads the unreachable store (about half a second), the
+  # pre-check before around: once more.
+  @tag timeout: 600_000
   test "the functions over many databases never show a key" do
     dir = Temp.path!()
     File.mkdir_p!(dir)

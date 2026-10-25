@@ -416,6 +416,84 @@ defmodule Sediment.S3RotationManyTest do
     end
   end
 
+  # The pre-check: a target that needs nothing is reported without around:
+  # (which would close it for nothing), one whose ring holds other key
+  # material under a recorded id fails before it.
+  test "a re-run calls around: only for the targets that need it", %{base: base, dir: dir} do
+    targets = [t1, t2, t3] = tenants(3, base, dir)
+    test = self()
+
+    around = fn target, run ->
+      send(test, {:around, target.id})
+      run.()
+    end
+
+    assert %{rekeyed: ["t1", "t2"]} =
+             S3.rekey_many([t1, t2], encryption: ring(["r2", "r1"]), around: around)
+
+    flush_around()
+
+    assert %{current: ["t1", "t2"], rekeyed: ["t3"], failed: []} =
+             S3.rekey_many(targets, encryption: ring(["r2", "r1"]), around: around)
+
+    assert flush_around() == ["t3"]
+
+    assert %{current: ["t1", "t2", "t3"]} =
+             S3.rekey_many(targets, encryption: ring(["r2", "r1"]), around: around)
+
+    assert flush_around() == []
+
+    # Released once; a re-run needs nothing.
+    assert %{released: ["t1", "t2", "t3"]} =
+             S3.release_key_many(targets, "r1", encryption: ring(["r2", "r1"]), around: around)
+
+    assert Enum.sort(flush_around()) == ["t1", "t2", "t3"]
+
+    assert %{unchanged: ["t1", "t2", "t3"], failed: []} =
+             S3.release_key_many(targets, "r1", encryption: ring(["r2", "r1"]), around: around)
+
+    assert flush_around() == []
+  end
+
+  test "a ring with other key material under a recorded id fails before around:",
+       %{base: base, dir: dir} do
+    [t1, t2] = tenants(2, base, dir)
+    test = self()
+
+    around = fn target, run ->
+      send(test, {:around, target.id})
+      run.()
+    end
+
+    assert %{rekeyed: ["t1"]} = S3.rekey_many([t1], encryption: ring(["r2", "r1"]))
+
+    # Under r2 already, the ring's r2 isn't the recorded one; under r1, the
+    # ring's r1 isn't.
+    other = String.duplicate("33", 32)
+    wrong_r2 = [keys: [{"r2", other}, {"r1", @k1}], cipher: "aegis256"]
+    wrong_r1 = [keys: [{"r2", @k2}, {"r1", other}], cipher: "aegis256"]
+
+    for {target, ring, id} <- [{t1, wrong_r2, "r2"}, {t2, wrong_r1, "r1"}] do
+      assert %{failed: [{_, message}]} =
+               S3.rekey_many([target], encryption: ring, around: around, backoff: 0)
+
+      assert message =~ "the ring's key #{id} (fingerprint "
+      assert message =~ "is not the key the database records under #{id}"
+      refute message =~ other
+    end
+
+    assert flush_around() == []
+    assert rows(t2, ["r1"]) == ["t2"]
+  end
+
+  defp flush_around do
+    receive do
+      {:around, id} -> [id | flush_around()]
+    after
+      0 -> []
+    end
+  end
+
   # A wrong prefix (an unset environment variable, say) reads every target
   # absent, with nothing failed: the key the real databases need is never
   # reported removable.

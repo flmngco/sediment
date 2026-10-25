@@ -32,6 +32,15 @@
   target. `Sediment.S3.check_ring(census, ring)` checks that a ring holds
   the recorded key material under each id (`:ok`, or `{:error, [{id,
   :missing | :mismatch}]}`), without opening: a boot-time check.
+* `rekey_many/2` and `release_key_many/3` read each target's manifest
+  before `:around` (without the lease): a database under the target key
+  already, with the ring's key under that id the recorded one, is
+  reported `current` without calling `:around`, so a re-run pauses only
+  the databases that need it; a release with no epoch under the key and
+  nothing left is reported `unchanged` likewise. A ring holding other key
+  material under a recorded id fails the target before `:around`, with a
+  message naming the id and both fingerprints. The encryption function is
+  called once per target, before `:around`.
 * `Sediment.S3.orphans(s3_opts)` lists, without the lease, the objects a
   writer's garbage collection would delete (`objects`, `bytes`, `by_key`),
   with the collection's own rule: never a live writer's next snapshot or

@@ -879,6 +879,17 @@ defmodule Sediment.S3 do
       result followed by a refusal may still have switched);
     * `skipped` - not started, after `:stop_on` stopped the run.
 
+  **Pre-check.** Before `:around`, each target's manifest is read (as
+  `key_census/1` does, without the lease): a database under the target
+  key already, with the ring's key under that id the recorded one (by
+  fingerprint), is reported `current` without calling `:around`, so a
+  re-run pauses no database that is done. One whose ring holds other key
+  material under its current id, or under the target id where the
+  manifest records it, fails before `:around`, not retried: `"s3 config:
+  the ring's key r2 (fingerprint ...) is not the key the database records
+  under r2 (fingerprint ...) ..."`. Anything else goes to the rekey, which
+  decides under the lease (the check only reads).
+
   A re-run finds the rekeyed ones `current`, so running it again until
   `failed` is empty finishes the rotation (see "Only `{:ok, _}` is an
   outcome" in `rekey/3`: keep both keys in every ring until then). **The
@@ -990,7 +1001,10 @@ defmodule Sediment.S3 do
 
   Returns `%{released: [id], unchanged: [id], absent: [id], failed: [{id,
   reason}], skipped: [id]}`: `released` dropped epochs under the key,
-  `unchanged` had none. The key can leave the rings once `failed` is empty,
+  `unchanged` had none. As for `rekey_many/2`, a pre-check reads each
+  manifest before `:around`: a database with no epoch under the key and
+  no object left (see `orphans/1`) is reported `unchanged` without calling
+  `:around`. The key can leave the rings once `failed` is empty,
   `absent` holds only databases you know don't exist, and a fresh
   `key_census_many/2` of every database says so:
 

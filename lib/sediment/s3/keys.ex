@@ -226,6 +226,19 @@ defmodule Sediment.S3.Keys do
     if fingerprint(key) == fingerprint, do: wrong, else: [{id, :mismatch} | wrong]
   end
 
+  @doc false
+  # The fingerprint (16 hex digits) of the ring's key `id`, asking key_for
+  # for it if needed; nil without one. With the ring, the key added.
+  @spec fingerprint(ring(), String.t()) :: {ring(), String.t() | nil}
+  def fingerprint(ring, id) do
+    ring = if ring.key_for, do: with_key(ring, id), else: ring
+
+    case List.keyfind(ring.keys, id, 0) do
+      {^id, _cipher, key} -> {ring, fingerprint(key)}
+      nil -> {ring, nil}
+    end
+  end
+
   defp fingerprint(hex) do
     case Base.decode16(hex, case: :mixed) do
       {:ok, key} ->
