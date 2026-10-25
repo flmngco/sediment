@@ -628,17 +628,13 @@ defmodule Sediment.Connection do
           String.starts_with?(message, "internal turso error:") ->
         {:disconnect, error, state}
 
-      # disconnect/2 closed the handle (the client timed out): the error may
-      # be the interrupt, or, when the close came first, a statement
-      # finalized with the connection. Either way the statement was stopped
-      # by the disconnect: "interrupted", as the docs promise.
+      # The handle is closed. When disconnect/2 closed it (the client timed
+      # out), the error may be the interrupt or, when the close came first,
+      # a statement finalized with the connection: either way the
+      # disconnect stopped it, "interrupted", as the docs promise. Closed
+      # otherwise, a statement finalized with it is "connection_closed".
       closed?(state) ->
-        message =
-          if message in ["invalid_statement", "connection_closed"],
-            do: "interrupted",
-            else: message
-
-        {:disconnect, %{error | message: message}, state}
+        {:disconnect, %{error | message: closed_message(message, state)}, state}
 
       true ->
         {:error, error, state}
@@ -648,6 +644,11 @@ defmodule Sediment.Connection do
   defp disconnect_if_fenced(result), do: result
 
   defp closed?(state), do: match?({:error, _}, Engine.transaction_status(state.db))
+
+  defp closed_message(message, state) when message in ["invalid_statement", "connection_closed"],
+    do: if(Native.closing(state.db), do: "interrupted", else: "connection_closed")
+
+  defp closed_message(message, _state), do: message
 
   @begin_statements %{
     deferred: "BEGIN TRANSACTION",

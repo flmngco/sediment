@@ -871,6 +871,13 @@ fn close(res: ResourceArc<ConnRes>) -> Atom {
     atoms::ok()
 }
 
+/// Whether `start_closing/1` was called: a pool discarded the connection
+/// (a disconnect), so what failed on it was stopped, not misused.
+#[rustler::nif]
+fn closing(res: ResourceArc<ConnRes>) -> bool {
+    res.closing.load(Ordering::SeqCst)
+}
+
 /// A pool discards the connection: the running operation stops, and every
 /// later one gives up at once; `close/1` follows. On a normal scheduler.
 #[rustler::nif]

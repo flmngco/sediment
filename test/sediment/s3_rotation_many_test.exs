@@ -348,13 +348,18 @@ defmodule Sediment.S3RotationManyTest do
     at_once = most_at_once()
     querier = slowest_query(dir)
 
+    # The helper exits during the rekey; around: returns once it is gone
+    # (its exit signal delivered, whatever the load).
     around = fn _target, rekey ->
-      spawn_link(fn ->
-        Process.sleep(5)
-        exit(:tenant_worker_failed)
-      end)
+      helper =
+        spawn_link(fn ->
+          Process.sleep(5)
+          exit(:tenant_worker_failed)
+        end)
 
-      rekey.()
+      result = rekey.()
+      wait_dead(helper)
+      result
     end
 
     report =
@@ -408,6 +413,10 @@ defmodule Sediment.S3RotationManyTest do
     assert %{failed: []} = S3.rekey_many(targets, encryption: ring(["r2", "r1"]))
   end
 
+  defp wait_dead(pid) do
+    if Process.alive?(pid), do: Process.sleep(1) && wait_dead(pid)
+  end
+
   defp eventually(fun, tries \\ 100) do
     cond do
       fun.() -> true
@@ -420,7 +429,7 @@ defmodule Sediment.S3RotationManyTest do
   # (which would close it for nothing), one whose ring holds other key
   # material under a recorded id fails before it.
   test "a re-run calls around: only for the targets that need it", %{base: base, dir: dir} do
-    targets = [t1, t2, t3] = tenants(3, base, dir)
+    targets = [t1, t2, _t3] = tenants(3, base, dir)
     test = self()
 
     around = fn target, run ->

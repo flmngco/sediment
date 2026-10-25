@@ -337,10 +337,14 @@ defmodule Sediment.S3KeysTest do
     assert {:error, %Sediment.Error{message: "Sediment.Connection.connect/1: the options " <> _}} =
              Sediment.Connection.connect(%{database: Temp.path!()})
 
-    # A function clause, a KeyError or a MatchError raised meanwhile holds
+    # A restore target of the wrong form: named, never shown.
+    assert {:error, "Sediment.S3.restore/3: :at must be a DateTime"} =
+             S3.restore(Temp.path!(), s3(), at: @k1, encryption: ring())
+
+    # A function clause, a KeyError or a BadMapError raised meanwhile holds
     # the value it failed on: only its type is shown.
-    assert_raise ArgumentError, ~r"^FunctionClauseError \(details withheld", fn ->
-      S3.restore(Temp.path!(), s3(), at: @k1, encryption: ring())
+    assert_raise ArgumentError, ~r"^BadMapError \(details withheld", fn ->
+      S3.check_ring(%{fingerprints: @k1}, ring())
     end
   end
 

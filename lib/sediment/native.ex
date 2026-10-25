@@ -48,6 +48,9 @@ defmodule Sediment.Native do
   @spec start_closing(db()) :: :ok
   def start_closing(_conn), do: :erlang.nif_error(:not_loaded)
 
+  @spec closing(db()) :: boolean()
+  def closing(_conn), do: :erlang.nif_error(:not_loaded)
+
   @spec interrupt(db()) :: :ok | {:error, reason()}
   def interrupt(_conn), do: :erlang.nif_error(:not_loaded)
 
