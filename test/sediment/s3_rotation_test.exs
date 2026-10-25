@@ -526,4 +526,88 @@ defmodule Sediment.S3RotationTest do
     assert {:error, message} = S3.rekey(Path.join(dir, "r.db"), s3, encryption: ring(["r1"]))
     assert message =~ "is unencrypted"
   end
+
+  # A release whose delete fails committed: it reports the objects left
+  # (orphans/1 lists them), a re-run deletes them, and only then is ok.
+  test "a release whose delete fails reports :leftover; a re-run sweeps it", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    both = ring(["r2", "r1"])
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: both)
+    assert {:ok, %{objects: 0}} = S3.orphans(s3)
+
+    :armed = Native.s3_test_hook(s3, "sweep", :store_fail)
+
+    assert {:error, {:leftover, %{epochs: [_ | _] = epochs, objects: n, message: message}}} =
+             S3.release_key(path, s3, "r1", encryption: both)
+
+    assert n > 0
+    assert message =~ "released epochs #{Enum.join(epochs, ", ")}; #{n} objects are left"
+    assert message =~ "run release_key again"
+    assert {:ok, %{current: "r2", retained: retained}} = S3.key_census(s3)
+    refute Map.has_key?(retained, "r1")
+    assert {:ok, %{objects: ^n, bytes: bytes, by_key: %{nil => ^n}}} = S3.orphans(s3)
+    assert bytes > 0
+
+    :armed = Native.s3_test_hook(s3, "sweep", :store_fail)
+
+    assert {:error, {:leftover, %{epochs: [], objects: ^n}}} =
+             S3.release_key(path, s3, "r1", encryption: both)
+
+    assert {:ok, %{epochs: []}} = S3.release_key(path, s3, "r1", encryption: both)
+    assert {:ok, %{objects: 0, bytes: 0, by_key: by_key}} = S3.orphans(s3)
+    assert by_key == %{}
+    assert {:ok, :no_database} = S3.orphans(s3_opts("rotation/none-#{System.os_time()}"))
+  end
+
+  # Released over many: the retried run (its objects deleted) reports the
+  # database released, not unchanged.
+  test "release_key_many retries a leftover and reports it released", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    both = ring(["r2", "r1"])
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: both)
+    :armed = Native.s3_test_hook(s3, "sweep", :store_fail)
+
+    assert %{released: ["t"], failed: []} =
+             S3.release_key_many([%{id: "t", path: path, s3: s3}], "r1",
+               encryption: both,
+               backoff: 0
+             )
+
+    assert {:ok, %{objects: 0}} = S3.orphans(s3)
+  end
+
+  test "the census lists fingerprints; check_ring tells the right key material without opening",
+       %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: ring(["r2", "r1"]))
+    assert {:ok, census} = S3.key_census(s3)
+    assert %{"r1" => fp1, "r2" => fp2} = census.fingerprints
+    assert fp1 =~ ~r/\A[0-9a-f]{16}\z/ and fp2 =~ ~r/\A[0-9a-f]{16}\z/
+    refute fp1 == fp2
+
+    assert :ok = S3.check_ring(census, ring(["r2", "r1"]))
+    assert :ok = S3.check_ring({:ok, census}, ring(["r1", "r2"]))
+    assert {:error, [{"r1", :missing}]} = S3.check_ring(census, ring(["r2"]))
+
+    swapped = [keys: [{"r2", @k2}, {"r1", @k3}], cipher: "aegis256"]
+    assert {:error, [{"r1", :mismatch}]} = S3.check_ring(census, swapped)
+
+    asked = [
+      key_for: fn "r1" -> @k1 end,
+      keys: [{"r2", @k2}],
+      active: "r2",
+      cipher: "aegis256"
+    ]
+
+    assert :ok = S3.check_ring(census, asked)
+    assert :ok = S3.check_ring({:ok, :no_database}, false)
+
+    many = S3.key_census_many([%{id: "t", s3: s3}])
+    assert %{"t" => %{"r1" => ^fp1, "r2" => ^fp2}} = many.fingerprints
+    assert :ok = S3.check_ring(many, ring(["r2", "r1"]))
+    assert {:error, [{"r1", :mismatch}]} = S3.check_ring(many, swapped)
+  end
 end

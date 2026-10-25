@@ -160,6 +160,22 @@ pub fn error_term<'a>(env: Env<'a>, err: &S3Error) -> Term<'a> {
             ),
         )
             .encode(env),
+        S3Error::Leftover { epochs, objects } => {
+            let pairs = [
+                ("epochs", epochs.encode(env)),
+                ("objects", objects.encode(env)),
+                ("message", err.to_string().encode(env)),
+            ]
+            .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v));
+            match Term::map_from_pairs(env, &pairs) {
+                Ok(map) => (
+                    crate::atoms::error(),
+                    (Atom::from_str(env, "leftover").unwrap(), map),
+                )
+                    .encode(env),
+                Err(_) => error_tuple(env, describe(err)),
+            }
+        }
         other => error_tuple(env, describe(other)),
     }
 }
@@ -649,6 +665,51 @@ fn s3_release_key<'a>(
     }
 }
 
+fn string_map<'a>(env: Env<'a>, map: &std::collections::BTreeMap<String, String>) -> Term<'a> {
+    let pairs: Vec<(Term<'a>, Term<'a>)> = map
+        .iter()
+        .map(|(k, v)| (k.encode(env), v.encode(env)))
+        .collect();
+    Term::map_from_pairs(env, &pairs).unwrap_or_else(|_| Term::map_new(env))
+}
+
+/// The objects a writer's garbage collection would delete (see
+/// `s3::orphans`): counted, by key where known.
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_orphans<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match s3::orphans(&config) {
+        Ok(None) => ok_tuple(env, Atom::from_str(env, "no_database").unwrap()),
+        Ok(Some(orphans)) => {
+            let by_key: Vec<(Term<'a>, Term<'a>)> = orphans
+                .by_key
+                .iter()
+                .map(|(id, n)| (id.encode(env), n.encode(env)))
+                .collect();
+            let by_key = Term::map_from_pairs(env, &by_key);
+            let map = by_key.and_then(|by_key| {
+                Term::map_from_pairs(
+                    env,
+                    &[
+                        ("objects", orphans.objects.encode(env)),
+                        ("bytes", orphans.bytes.encode(env)),
+                        ("by_key", by_key),
+                    ]
+                    .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v)),
+                )
+            });
+            match map {
+                Ok(map) => ok_tuple(env, map),
+                Err(_) => error_tuple(env, "could not build result"),
+            }
+        }
+        Err(err) => error_term(env, &err),
+    }
+}
+
 /// Which keys the database depends on (see `s3::key_census`).
 #[rustler::nif(schedule = "DirtyIo")]
 fn s3_key_census<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
@@ -680,6 +741,10 @@ fn s3_key_census<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
                     (
                         Atom::from_str(env, "retained").unwrap().encode(env),
                         retained,
+                    ),
+                    (
+                        Atom::from_str(env, "fingerprints").unwrap().encode(env),
+                        string_map(env, &census.fingerprints),
                     ),
                 ],
             );

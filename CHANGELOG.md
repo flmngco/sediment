@@ -10,6 +10,13 @@
   2^64 - 1 or an epoch as results show it. Each returns `{:error, reason}`
   and restores nothing. The native restore refuses any target other than
   the latest state, a time or an epoch, where it restored the latest state.
+* `Sediment.S3.release_key/4` returns `{:error, {:leftover, %{epochs:
+  [...], objects: n, message: ...}}}` when deleting the released epochs'
+  objects fails, where it returned `{:ok, _}`. The release did happen (the
+  manifest no longer retains the epochs), but their objects, encrypted
+  under the key, were left in the store with only a log warning. A re-run
+  for the key deletes what is left and returns `{:ok, _}` only once none
+  is; `release_key_many/3` retries it, and reports the database released.
 
 ### Added
 
@@ -20,6 +27,15 @@
   The docs say plainly what `epoch: n` restores: the whole epoch, which is
   the state as the next epoch began (or the live state, for the current
   epoch).
+* `key_census/1` returns `fingerprints: %{id => fingerprint}` (16 hex
+  digits) for every key it lists, and `key_census_many/2` keeps them by
+  target. `Sediment.S3.check_ring(census, ring)` checks that a ring holds
+  the recorded key material under each id (`:ok`, or `{:error, [{id,
+  :missing | :mismatch}]}`), without opening: a boot-time check.
+* `Sediment.S3.orphans(s3_opts)` lists, without the lease, the objects a
+  writer's garbage collection would delete (`objects`, `bytes`, `by_key`),
+  with the collection's own rule: never a live writer's next snapshot or
+  log, nor a delta's base snapshots.
 
 ### Fixed
 

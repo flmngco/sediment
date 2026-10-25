@@ -87,10 +87,15 @@ pub fn release_key(cfg: &S3Config, local_path: &Path, key: &str, force: bool) ->
         Fresh::Opened {
             storage, released, ..
         } => {
+            // Under the lease: the released epochs' objects (and any earlier
+            // leftovers) go now, or the release reports what is left.
+            let left = storage.sweep(&cfg.place());
             close(storage, cfg);
-            Ok(Released {
-                epochs: released.iter().map(Epoch::to_string).collect(),
-            })
+            let epochs = released.iter().map(Epoch::to_string).collect();
+            match left? {
+                0 => Ok(Released { epochs }),
+                objects => Err(S3Error::Leftover { epochs, objects }),
+            }
         }
     }
 }

@@ -33,7 +33,7 @@ defmodule Sediment.S3.Many do
     pass = Keyword.take(opts, [:to, :force, :allow_reuse])
     rekey = fn target, ring -> S3.rekey(target.path, target.s3, [encryption: ring] ++ pass) end
 
-    run(targets, opts, rekey, &rekey_outcome/1, [:rekeyed, :current, :absent])
+    run(targets, opts, rekey, &rekey_outcome/2, [:rekeyed, :current, :absent])
   end
 
   @spec release_key_many(Enumerable.t(), String.t(), keyword()) :: map()
@@ -54,7 +54,7 @@ defmodule Sediment.S3.Many do
       S3.release_key(target.path, target.s3, key_id, [encryption: ring] ++ pass)
     end
 
-    run(targets, opts, release, &release_outcome/1, [:released, :unchanged, :absent])
+    run(targets, opts, release, &release_outcome/2, [:released, :unchanged, :absent])
   end
 
   @spec key_census_many(Enumerable.t(), keyword()) :: map()
@@ -79,7 +79,14 @@ defmodule Sediment.S3.Many do
     read = MapSet.new(results, fn {target, _} -> target.index end)
     results = results ++ for(t <- targets, t.index not in read, do: {t, {:error, :skipped}})
 
-    acc = %{keys: %{}, absent: [], unencrypted: [], unreadable: [], targets: ids(targets)}
+    acc = %{
+      keys: %{},
+      absent: [],
+      unencrypted: [],
+      unreadable: [],
+      targets: ids(targets),
+      fingerprints: %{}
+    }
 
     results
     |> Enum.sort_by(fn {target, _} -> target.index end)
@@ -134,13 +141,21 @@ defmodule Sediment.S3.Many do
 
   ## Outcomes
 
-  defp rekey_outcome({:ok, :current}), do: :current
-  defp rekey_outcome({:ok, %{to: _}}), do: :rekeyed
-  defp rekey_outcome(result), do: absent_or_failed(result)
+  # The last result, and the attempts before it.
+  defp rekey_outcome({:ok, :current}, _earlier), do: :current
+  defp rekey_outcome({:ok, %{to: _}}, _earlier), do: :rekeyed
+  defp rekey_outcome(result, _earlier), do: absent_or_failed(result)
 
-  defp release_outcome({:ok, %{epochs: []}}), do: :unchanged
-  defp release_outcome({:ok, %{epochs: _}}), do: :released
-  defp release_outcome(result), do: absent_or_failed(result)
+  # A release that left objects behind released its epochs: the re-run
+  # that deleted them has none left to release.
+  defp release_outcome({:ok, %{epochs: []}}, earlier) do
+    if Enum.any?(earlier, &match?({:error, {:leftover, %{epochs: [_ | _]}}}, &1)),
+      do: :released,
+      else: :unchanged
+  end
+
+  defp release_outcome({:ok, %{epochs: _}}, _earlier), do: :released
+  defp release_outcome(result, _earlier), do: absent_or_failed(result)
 
   defp absent_or_failed({:error, "s3 config: no database at " <> _}), do: :absent
   defp absent_or_failed(_result), do: :failed
@@ -154,6 +169,8 @@ defmodule Sediment.S3.Many do
   defp retry?({:error, "s3 store: " <> _}), do: true
   defp retry?({:error, "s3 conflict: " <> _}), do: true
   defp retry?({:error, "s3 writer fenced: " <> _}), do: true
+  # Released, its objects not all deleted: a re-run deletes them.
+  defp retry?({:error, {:leftover, _}}), do: true
   defp retry?(_result), do: false
 
   defp tally(acc, id, {:ok, :no_database}), do: Map.update!(acc, :absent, &[id | &1])
@@ -161,7 +178,16 @@ defmodule Sediment.S3.Many do
   defp tally(acc, id, {:ok, %{current: nil, retained: retained}}) when retained == %{},
     do: Map.update!(acc, :unencrypted, &[id | &1])
 
-  defp tally(acc, id, {:ok, %{current: current, retained: retained}}) do
+  defp tally(acc, id, {:ok, %{current: current, retained: retained} = census}) do
+    acc =
+      case census do
+        %{fingerprints: fingerprints} when fingerprints != %{} ->
+          put_in(acc, [:fingerprints, id], fingerprints)
+
+        _ ->
+          acc
+      end
+
     acc =
       if current,
         do: add(acc, current, :current, id),
@@ -201,7 +227,7 @@ defmodule Sediment.S3.Many do
       results
       |> Enum.sort_by(fn {target, _} -> target.index end)
       |> Enum.reduce(acc, fn {target, result}, acc ->
-        case outcome.(result) do
+        case outcome.(result, target.earlier) do
           :failed -> Map.update!(acc, :failed, &[{target.id, failure(target, result)} | &1])
           kind -> Map.update!(acc, kind, &[target.id | &1])
         end

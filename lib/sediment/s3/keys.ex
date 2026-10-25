@@ -197,6 +197,48 @@ defmodule Sediment.S3.Keys do
   end
 
   @doc false
+  # Checks `needed` ({id, 16-hex fingerprint}) against the ring (see
+  # Sediment.S3.check_ring/2). A key's fingerprint as the native code
+  # computes it: the first 16 bytes of HMAC-SHA256(key, context), shown by
+  # its first 16 hex digits.
+  @spec check_ring([{String.t(), String.t()}], ring() | false | nil) ::
+          :ok | {:error, [{String.t(), :missing | :mismatch}]}
+  def check_ring(needed, ring) do
+    ring = ring || %{keys: [], key_for: nil}
+
+    needed
+    |> Enum.sort()
+    |> Enum.reduce({ring, []}, fn {id, fingerprint}, {ring, wrong} ->
+      ring = if ring.key_for, do: with_key(ring, id), else: ring
+
+      case List.keyfind(ring.keys, id, 0) do
+        nil -> {ring, [{id, :missing} | wrong]}
+        {^id, _cipher, key} -> {ring, mismatch(id, key, fingerprint, wrong)}
+      end
+    end)
+    |> case do
+      {_ring, []} -> :ok
+      {_ring, wrong} -> {:error, Enum.reverse(wrong)}
+    end
+  end
+
+  defp mismatch(id, key, fingerprint, wrong) do
+    if fingerprint(key) == fingerprint, do: wrong, else: [{id, :mismatch} | wrong]
+  end
+
+  defp fingerprint(hex) do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, key} ->
+        :crypto.mac(:hmac, :sha256, key, "sediment/key-fingerprint/v1")
+        |> binary_part(0, 8)
+        |> Base.encode16(case: :lower)
+
+      :error ->
+        nil
+    end
+  end
+
+  @doc false
   # The ring with the key `id` added through key_for, unless it has it.
   @spec with_key(ring(), String.t()) :: ring()
   def with_key(ring, id) do

@@ -9,7 +9,7 @@ use super::{config, key_as, manifest, open_encrypted, ring, segments, Db, TempDi
 use crate::s3::hook::{self, Action, State};
 use crate::s3::layout::MANIFEST_KEY;
 use crate::s3::remote::Remote;
-use crate::s3::{key_census, rekey, release_key, Rekeyed, S3Config, S3Error, Target};
+use crate::s3::{key_census, orphans, rekey, release_key, Rekeyed, S3Config, S3Error, Target};
 
 /// A writer config with the ring `keys` (`(id, key byte)`, the first active).
 fn keyed(store: &Arc<FaultyStore>, owner: &str, keys: &[(&str, &str)]) -> S3Config {
@@ -847,4 +847,78 @@ fn a_stale_rekey_copy_is_removed_by_the_next_open_release_or_restore() {
     let copy = plant("r.db");
     crate::s3::restore_to(&cfg, &dir.db("r.db"), Target::Latest).unwrap();
     assert!(!copy.exists());
+}
+
+/// A release whose delete fails committed all the same: it reports the
+/// objects left; a re-run deletes them, and returns ok only once none are.
+/// The listing applies the same rule, so it finds what is left.
+#[test]
+fn a_release_whose_delete_fails_reports_the_leftover_and_a_rerun_sweeps_it() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    seeded(&store, &dir, &["a"]);
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    let path = dir.db("r.db");
+    rekey(&both, &path, None, false, false).unwrap();
+    assert_eq!(orphans(&both).unwrap().unwrap().objects, 0);
+
+    store.inject(Op::Delete, "", Fault::Fail, usize::MAX);
+    let (epochs, objects) = match release_key(&both, &path, "r1", false) {
+        Err(S3Error::Leftover { epochs, objects }) => (epochs, objects),
+        other => panic!("{other:?}"),
+    };
+    assert!(!epochs.is_empty() && objects > 0, "{epochs:?} {objects}");
+    let message = S3Error::Leftover {
+        epochs: epochs.clone(),
+        objects,
+    }
+    .to_string();
+    assert!(message.contains("run release_key again"), "{message}");
+    // Released: the manifest no longer retains them.
+    assert!(!census(&both).1.iter().any(|(id, _)| id == "r1"));
+    let listed = orphans(&both).unwrap().unwrap();
+    assert_eq!(listed.objects, objects);
+    // Released epochs' key isn't recorded anywhere any more.
+    assert_eq!(listed.by_key.get(&None), Some(&objects), "{listed:?}");
+
+    // Still failing: the re-run reports what is left, no epoch released.
+    match release_key(&both, &path, "r1", false) {
+        Err(S3Error::Leftover { epochs, objects: n }) => {
+            assert!(epochs.is_empty());
+            assert_eq!(n, objects);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    store.clear_faults();
+    assert!(release_key(&both, &path, "r1", false)
+        .unwrap()
+        .epochs
+        .is_empty());
+    assert_eq!(orphans(&both).unwrap().unwrap().objects, 0);
+    // And a re-run with nothing left is done at once.
+    assert!(release_key(&both, &path, "r1", false).is_ok());
+}
+
+/// An orphan a failed delete left is listed until a writer's collection
+/// deletes it.
+#[test]
+fn a_writers_collection_sweeps_what_orphans_lists() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    seeded(&store, &dir, &["a"]);
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    let path = dir.db("r.db");
+    rekey(&both, &path, None, false, false).unwrap();
+    store.inject(Op::Delete, "", Fault::Fail, usize::MAX);
+    assert!(matches!(
+        release_key(&both, &path, "r1", false),
+        Err(S3Error::Leftover { .. })
+    ));
+    assert!(orphans(&both).unwrap().unwrap().objects > 0);
+    store.clear_faults();
+
+    let db = open_encrypted(&both, &path).unwrap();
+    drop(db);
+    assert_eq!(orphans(&both).unwrap().unwrap().objects, 0);
 }

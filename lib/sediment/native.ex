@@ -212,6 +212,9 @@ defmodule Sediment.Native do
   @spec s3_key_census(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
   def s3_key_census(_opts), do: :erlang.nif_error(:not_loaded)
 
+  @spec s3_orphans(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
+  def s3_orphans(_opts), do: :erlang.nif_error(:not_loaded)
+
   @doc false
   # Test hook at a point of a rekey or key release (see the native s3::hook).
   @spec s3_test_hook(keyword() | map(), String.t(), atom()) :: atom() | {:error, reason()}

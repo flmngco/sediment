@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, Weak};
 use turso_core::mvcc::persistent_storage::Storage;
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
-pub use census::{key_census, Census};
+pub use census::{key_census, orphans, Census, Orphans};
 pub use config::S3Config;
 pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
@@ -469,7 +469,15 @@ fn prepare_under_lease(
             if let Op::Release { key: id, .. } = op {
                 released = released_epochs(&decoded, id)?;
                 if released.is_empty() {
-                    return Ok(Fresh::Unchanged);
+                    // An earlier run's objects a failed delete left: swept
+                    // now, by the collection's rule, before it reports done.
+                    return match storage::sweep(remote, &decoded, lease, &cfg.place())? {
+                        0 => Ok(Fresh::Unchanged),
+                        objects => Err(S3Error::Leftover {
+                            epochs: Vec::new(),
+                            objects,
+                        }),
+                    };
                 }
             }
             // The open goes ahead: the sidecar (and a temp file a cut-short
@@ -624,7 +632,10 @@ fn prepare_under_lease(
             .then_some((published.key, published.digests)),
         key,
     ));
-    storage.collect_garbage_now();
+    // A release sweeps itself, reporting what it couldn't delete.
+    if !matches!(op, Op::Release { .. }) {
+        storage.collect_garbage_now();
+    }
     storage.start_uploader();
     Ok(Fresh::Opened {
         storage,

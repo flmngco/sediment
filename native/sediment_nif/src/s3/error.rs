@@ -38,6 +38,10 @@ pub enum S3Error {
     /// A manifest PUT whose outcome is unknown: it failed, and the manifest
     /// couldn't be read back to tell whether it landed.
     Indeterminate(String),
+    /// A release committed (it dropped `epochs` from the manifest, none if
+    /// an earlier run did), but deleting the objects of epochs no longer
+    /// retained failed: `objects` are left. A re-run deletes them.
+    Leftover { epochs: Vec<String>, objects: usize },
 }
 
 pub type Result<T> = std::result::Result<T, S3Error>;
@@ -78,6 +82,17 @@ impl fmt::Display for S3Error {
             S3Error::Lost(msg) => write!(f, "{msg}"),
             S3Error::Overtaken { message, .. } => write!(f, "s3 writer fenced: {message}"),
             S3Error::Indeterminate(msg) => write!(f, "s3 indeterminate: {msg}"),
+            S3Error::Leftover { epochs, objects } if epochs.is_empty() => write!(
+                f,
+                "s3 leftover: {objects} objects of epochs no longer retained are left \
+                 (a delete failed): run release_key again"
+            ),
+            S3Error::Leftover { epochs, objects } => write!(
+                f,
+                "s3 leftover: released epochs {}; {objects} objects are left (a delete \
+                 failed): run release_key again",
+                epochs.join(", ")
+            ),
             S3Error::KeyNeeded(id) => {
                 write!(
                     f,

@@ -703,6 +703,15 @@ defmodule Sediment.S3 do
   after an error the release may still happen, so run it again; keep the
   key in the rings until a run returns `{:ok, _}` and the census no longer
   lists it.
+
+  When deleting the objects fails, the release still happened (the manifest
+  no longer retains the epochs), but their objects, encrypted under the
+  key, are left in the store: it returns `{:error, {:leftover, %{epochs:
+  [epoch], objects: n, message: "s3 leftover: released epochs ...; n
+  objects are left (a delete failed): run release_key again"}}}`. A re-run
+  for the key deletes what is left, with the rule a writer's garbage
+  collection uses (see `orphans/1`), and returns `{:ok, _}` only once none
+  is (`epochs: []` then, as they were released before).
   """
   @spec release_key(Path.t(), keyword() | map(), String.t(), keyword()) ::
           {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
@@ -756,20 +765,93 @@ defmodule Sediment.S3 do
   neither current nor retained. It reads `manifest.json` only: no lease,
   no writes.
 
-  Returns `{:ok, %{current: id | nil, retained: %{id => [epoch]}}}`
-  (`current: nil` for an unencrypted database), `{:ok, :no_database}`
-  when the location holds none (also after `destroy/2`), or
-  `{:error, reason}`.
+  Returns `{:ok, %{current: id | nil, retained: %{id => [epoch]},
+  fingerprints: %{id => fingerprint}}}` (`current: nil` for an unencrypted
+  database), `{:ok, :no_database}` when the location holds none (also after
+  `destroy/2`), or `{:error, reason}`. `fingerprints` has every key listed,
+  by its fingerprint's first 16 hex digits (see "Encryption"): with
+  `check_ring/2`, whether a ring holds the right key material, without
+  opening.
 
   It is an observation, not a resolution: a rekey or release that returned
   an error may still switch the manifest after the census read it. Only a
   re-run of the operation resolves that.
   """
   @spec key_census(keyword() | map()) ::
-          {:ok, %{current: String.t() | nil, retained: %{String.t() => [String.t()]}}}
+          {:ok,
+           %{
+             current: String.t() | nil,
+             retained: %{String.t() => [String.t()]},
+             fingerprints: %{String.t() => String.t()}
+           }}
           | {:ok, :no_database}
           | {:error, term()}
   def key_census(s3_opts), do: Keys.scrubbed(fn -> Native.s3_key_census(s3_opts) end)
+
+  @doc """
+  Whether the ring `encryption` holds the key material a database (or a
+  fleet) needs: for every key a `key_census/1` result lists (current and
+  retained), the ring's key under that id must have the recorded
+  fingerprint. The boot-time check for "the right key under the right id",
+  without opening anything. A ring with `key_for` is asked for the ids it
+  lacks.
+
+  `census` is a `key_census/1` result (`{:ok, census}` or the map) or a
+  `key_census_many/2` result. Returns `:ok`, or `{:error, [{id, :missing |
+  :mismatch}]}`: the ids the ring lacks, or holds other key material under.
+  The census of an unencrypted database, or of none, needs no key.
+  """
+  @spec check_ring({:ok, map()} | map(), keyword()) ::
+          :ok | {:error, [{String.t(), :missing | :mismatch}]}
+  def check_ring({:ok, census}, encryption), do: check_ring(census, encryption)
+
+  def check_ring(census, encryption) do
+    Keys.scrubbed(fn ->
+      ring = Keys.normalize(encryption)
+      Keys.check_ring(census_fingerprints(census), ring)
+    end)
+  end
+
+  # Every (id, fingerprint) a census needs.
+  defp census_fingerprints(:no_database), do: []
+
+  defp census_fingerprints(%{fingerprints: fingerprints, targets: _}),
+    do: fingerprints |> Map.values() |> Enum.flat_map(&Map.to_list/1) |> Enum.uniq()
+
+  defp census_fingerprints(%{fingerprints: fingerprints}), do: Map.to_list(fingerprints)
+
+  defp census_fingerprints(_other),
+    do:
+      raise(
+        ArgumentError,
+        "Sediment.S3.check_ring/2 expects a key_census/1 or key_census_many/2 result"
+      )
+
+  @doc """
+  The objects of the database at the S3 location in `s3_opts` that its
+  manifest no longer references: what a writer's garbage collection would
+  delete, by the same rule, read without the lease. Informational: a
+  writer's collection (at each open, after each new epoch) deletes them,
+  and a re-run of `release_key/4` does for a release that left some (see
+  its `:leftover` error).
+
+  Returns `{:ok, %{objects: n, bytes: b, by_key: %{id | nil => n}}}`,
+  `{:ok, :no_database}` or `{:error, reason}`. An object's key is known
+  only in some cases (objects don't record it, and the manifest forgets a
+  released epoch): `nil` counts the others.
+
+  The rule: an object of an epoch older than the current one, of a lease
+  generation at most the manifest's, that no retained record names and, for
+  a snapshot, in no retained snapshot chain. So never a live writer's next
+  snapshot or log (uploaded before its manifest names them), nor the base
+  snapshots of a delta.
+  """
+  @spec orphans(keyword() | map()) ::
+          {:ok,
+           %{objects: non_neg_integer(), bytes: non_neg_integer(), by_key: map()}
+           | :no_database}
+          | {:error, term()}
+  def orphans(s3_opts), do: Keys.scrubbed(fn -> Native.s3_orphans(s3_opts) end)
 
   @doc """
   Runs `rekey/3` over many databases, a few at a time, and reports on every
@@ -808,7 +890,8 @@ defmodule Sediment.S3 do
   rings.
 
   **Retries.** A result that may still change (`{:error, {:fenced, _}}`,
-  `{:error, {:indeterminate, _}}`, an S3 store error) is retried up to
+  `{:error, {:indeterminate, _}}`, an S3 store error, a release's
+  `{:error, {:leftover, _}}`) is retried up to
   `:attempts` times, waiting `:backoff` ms, then twice that, and so on. A
   refusal (the database open in this VM, the lease held, a retired or
   missing key, a corrupt database) is reported at once: retrying it changes
@@ -936,14 +1019,17 @@ defmodule Sediment.S3 do
         absent: [id],
         unencrypted: [id],
         unreadable: [{id, reason}],
-        targets: [id]
+        targets: [id],
+        fingerprints: %{id => %{key_id => fingerprint}}
       }
 
   `absent` lists the targets with no database at their location: expected
   for a database that doesn't exist yet, and the sign of a wrong bucket or
   prefix otherwise (see `removable?/3`). `unreadable` lists a target not
   read after a reader's process was killed with reason `:skipped`.
-  `targets` lists every target.
+  `targets` lists every target. `fingerprints` has, by target, the
+  fingerprints `key_census/1` returned: `check_ring/2` checks a ring
+  against the whole fleet.
 
   ## Options
 
@@ -956,7 +1042,8 @@ defmodule Sediment.S3 do
           absent: [term()],
           unencrypted: [term()],
           unreadable: [{term(), term()}],
-          targets: [term()]
+          targets: [term()],
+          fingerprints: %{term() => %{String.t() => String.t()}}
         }
   def key_census_many(targets, opts \\ []), do: Sediment.S3.Many.key_census_many(targets, opts)
 

@@ -13,6 +13,10 @@ use super::lease::Lease;
 /// copy is done and the new snapshot uploaded.
 pub const PUBLISH: &str = "publish";
 
+/// Right before a release deletes the objects of epochs no longer retained
+/// (`:store_fail` there fails the delete).
+pub const SWEEP: &str = "sweep";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Pause,

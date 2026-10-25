@@ -943,44 +943,19 @@ impl S3DurableStorage {
     }
 
     /// Deletes epochs and snapshots older than the manifest's that it no
-    /// longer retains. A stale writer's late PUT may recreate a key there,
-    /// but can't be acknowledged: its ownership confirm sees this manifest.
+    /// longer retains (see [`garbage`]). A stale writer's late PUT may
+    /// recreate a key there, but can't be acknowledged: its ownership
+    /// confirm sees this manifest.
     fn collect_garbage(&self, manifest: &Manifest) -> Result<()> {
-        let current = manifest.epoch;
-        let retained: Vec<Epoch> = manifest.retained().map(|r| r.epoch).collect();
-        // Never an epoch of a newer lease generation: a writer that took the
-        // lease after this one wrote it (a takeover, or a new database after
-        // a destroy), and a stale writer collecting it would delete another
-        // database's data.
-        let generation = self.lease.generation();
-        let doomed = |epoch: Epoch| {
-            epoch.seq < current.seq && epoch.generation <= generation && !retained.contains(&epoch)
-        };
-        let mut keys: Vec<String> = self
-            .remote
-            .list(LOG_DIR)?
-            .into_iter()
-            .filter(|o| parse_segment_key(&o.key).is_some_and(|(epoch, _)| doomed(epoch)))
-            .map(|o| o.key)
-            .collect();
-        // A retained epoch's snapshot may be a delta on older snapshots.
-        let referenced: std::collections::HashSet<String> = manifest
-            .retained()
-            .flat_map(|record| record.chain())
-            .map(|link| link.key)
-            .collect();
-        keys.extend(
-            self.remote
-                .list(SNAPSHOT_DIR)?
-                .into_iter()
-                .filter(|o| {
-                    parse_snapshot_key(&o.key).is_some_and(|epoch| {
-                        epoch.seq < current.seq && epoch.generation <= generation
-                    }) && !referenced.contains(&o.key)
-                })
-                .map(|o| o.key),
-        );
-        self.remote.delete_many(keys)
+        let doomed = garbage(&self.remote, manifest, self.lease.generation())?;
+        self.remote
+            .delete_many(doomed.into_iter().map(|object| object.key).collect())
+    }
+
+    /// [`sweep`] with this writer's manifest and lease.
+    pub(crate) fn sweep(&self, place: &str) -> Result<usize> {
+        let manifest = self.state.lock().unwrap().manifest.clone();
+        sweep(&self.remote, &manifest, &self.lease, place)
     }
 
     /// Closes `epoch` with a create-only seal at its end offset, so a restore
@@ -1147,6 +1122,91 @@ pub(crate) fn snapshot_image_prefix(db_path: &std::path::Path) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     format!(".{name}.s3-snapshot-")
+}
+
+/// An object [`garbage`] selects, and its epoch.
+#[derive(Debug, Clone)]
+pub(crate) struct Garbage {
+    pub key: String,
+    pub size: u64,
+    pub epoch: Epoch,
+}
+
+/// The objects garbage collection deletes, the one rule for every caller
+/// (a writer's collection, a release's sweep, `Sediment.S3.orphans/1`'s
+/// listing). An object goes only when all of these hold:
+///
+/// * its epoch's seq is below the manifest's current one (never a live
+///   writer's next snapshot, `seq + 1`, nor its log, before it publishes
+///   them);
+/// * its generation is at most `generation`: never an epoch of a newer
+///   lease generation, a writer that took the lease after (a takeover, or
+///   a new database after a destroy), whose data a stale writer collecting
+///   would delete. A writer passes its lease's generation; a listing
+///   without the lease the manifest's, which is conservative;
+/// * the manifest retains no record of its epoch (the current one or the
+///   history);
+/// * a snapshot is in no retained record's chain (a retained epoch's
+///   snapshot may be a delta on older snapshots).
+pub(crate) fn garbage(
+    remote: &Remote,
+    manifest: &Manifest,
+    generation: u64,
+) -> Result<Vec<Garbage>> {
+    let current = manifest.epoch;
+    let retained: Vec<Epoch> = manifest.retained().map(|r| r.epoch).collect();
+    let old = |epoch: Epoch| epoch.seq < current.seq && epoch.generation <= generation;
+    let mut doomed: Vec<Garbage> = remote
+        .list(LOG_DIR)?
+        .into_iter()
+        .filter_map(|o| {
+            let (epoch, _) = parse_segment_key(&o.key)?;
+            (old(epoch) && !retained.contains(&epoch)).then_some(Garbage {
+                key: o.key,
+                size: o.size,
+                epoch,
+            })
+        })
+        .collect();
+    let referenced: std::collections::HashSet<String> = manifest
+        .retained()
+        .flat_map(|record| record.chain())
+        .map(|link| link.key)
+        .collect();
+    doomed.extend(remote.list(SNAPSHOT_DIR)?.into_iter().filter_map(|o| {
+        let epoch = parse_snapshot_key(&o.key)?;
+        (old(epoch) && !retained.contains(&epoch) && !referenced.contains(&o.key)).then_some(
+            Garbage {
+                key: o.key,
+                size: o.size,
+                epoch,
+            },
+        )
+    }));
+    Ok(doomed)
+}
+
+/// Deletes [`garbage`] under `lease`, returning how many objects are left:
+/// none, or after a failed delete those a new listing still finds (all it
+/// tried, if that listing fails too).
+pub(crate) fn sweep(
+    remote: &Remote,
+    manifest: &Manifest,
+    lease: &Lease,
+    place: &str,
+) -> Result<usize> {
+    let generation = lease.generation();
+    let doomed = garbage(remote, manifest, generation)?;
+    let tried = doomed.len();
+    let keys = doomed.into_iter().map(|object| object.key).collect();
+    match super::hook::at(super::hook::SWEEP, place, lease).and_then(|()| remote.delete_many(keys))
+    {
+        Ok(()) => Ok(0),
+        Err(err) => {
+            tracing::warn!("s3 garbage collection failed: {err}");
+            Ok(garbage(remote, manifest, generation).map_or(tried, |left| left.len()))
+        }
+    }
 }
 
 /// Commits a writer acknowledged (`durability: async`) that never reached
