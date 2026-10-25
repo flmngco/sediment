@@ -784,11 +784,12 @@ defmodule Sediment.S3 do
   no writes.
 
   Returns `{:ok, %{current: id | nil, retained: %{id => [epoch]},
-  fingerprints: %{id => fingerprint}}}` (`current: nil` for an unencrypted
-  database), `{:ok, :no_database}` when the location holds none (also after
-  `destroy/2`), or `{:error, reason}`. `fingerprints` has every key listed,
-  by its fingerprint's first 16 hex digits (see "Encryption"): with
-  `check_ring/2`, whether a ring holds the right key material, without
+  fingerprints: %{id => fingerprint}, ciphers: %{id => cipher}}}`
+  (`current: nil` for an unencrypted database), `{:ok, :no_database}` when
+  the location holds none (also after `destroy/2`), or `{:error, reason}`.
+  `fingerprints` and `ciphers` have every key listed, by its fingerprint's
+  first 16 hex digits (see "Encryption") and the cipher recorded with it:
+  with `check_ring/2`, whether a ring holds the right keys, without
   opening.
 
   It is an observation, not a resolution: a rekey or release that returned
@@ -810,7 +811,8 @@ defmodule Sediment.S3 do
   Whether the ring `encryption` holds the key material a database (or a
   fleet) needs: for every key a `key_census/1` result lists (current and
   retained), the ring's key under that id must have the recorded
-  fingerprint. The boot-time check for "the right key under the right id",
+  fingerprint and cipher (an alias of the cipher, `"aegis-256"`, is the
+  same), and the ring must hold by the rules every open applies. The boot-time check for "the right key under the right id",
   without opening anything. A ring with `key_for` is asked for the ids it
   lacks.
 
@@ -833,10 +835,19 @@ defmodule Sediment.S3 do
   # Every (id, fingerprint) a census needs.
   defp census_fingerprints(:no_database), do: []
 
-  defp census_fingerprints(%{fingerprints: fingerprints, targets: _}),
-    do: fingerprints |> Map.values() |> Enum.flat_map(&Map.to_list/1) |> Enum.uniq()
+  defp census_fingerprints(%{fingerprints: fingerprints, targets: _} = census) do
+    ciphers = Map.get(census, :ciphers, %{})
 
-  defp census_fingerprints(%{fingerprints: fingerprints}), do: Map.to_list(fingerprints)
+    Enum.flat_map(fingerprints, fn {target, by_key} ->
+      census_fingerprints(%{fingerprints: by_key, ciphers: Map.get(ciphers, target, %{})})
+    end)
+    |> Enum.uniq()
+  end
+
+  defp census_fingerprints(%{fingerprints: fingerprints} = census) do
+    ciphers = Map.get(census, :ciphers, %{})
+    for {id, fp} <- fingerprints, do: {id, fp, Map.get(ciphers, id)}
+  end
 
   defp census_fingerprints(_other),
     do:
@@ -934,13 +945,16 @@ defmodule Sediment.S3 do
   **Pre-check.** Before `:around`, each target's manifest is read (as
   `key_census/1` does, without the lease): a database under the target
   key already, with the ring's key under that id the recorded one (by
-  fingerprint), is reported `current` without calling `:around`, so a
-  re-run pauses no database that is done. One whose ring holds other key
-  material under its current id, or under the target id where the
-  manifest records it, fails before `:around`, not retried: `"s3 config:
-  the ring's key r2 (fingerprint ...) is not the key the database records
-  under r2 (fingerprint ...) ..."`. Anything else goes to the rekey, which
-  decides under the lease (the check only reads).
+  fingerprint and cipher), is reported `current` without calling
+  `:around`, so a re-run pauses no database that is done. One whose ring
+  can't open it fails before `:around`, not retried: a ring an open would
+  refuse (`"s3 config: the ring can't open this database: ..."`), or one
+  holding, under its current id or under the target id where the manifest
+  records it, a key of another cipher (`"... the ring's key r2 is for
+  aes256gcm, but the database records r2 under aegis256"`) or other key
+  material (`"... the ring's key r2 (fingerprint ...) is not the key the
+  database records under r2 (fingerprint ...) ..."`). Anything else goes
+  to the rekey, which decides under the lease (the check only reads).
 
   A re-run finds the rekeyed ones `current`, so running it again until
   `failed` is empty finishes the rotation (see "Only `{:ok, _}` is an
@@ -1089,15 +1103,16 @@ defmodule Sediment.S3 do
         unencrypted: [id],
         unreadable: [{id, reason}],
         targets: [id],
-        fingerprints: %{id => %{key_id => fingerprint}}
+        fingerprints: %{id => %{key_id => fingerprint}},
+        ciphers: %{id => %{key_id => cipher}}
       }
 
   `absent` lists the targets with no database at their location: expected
   for a database that doesn't exist yet, and the sign of a wrong bucket or
   prefix otherwise (see `removable?/3`). `unreadable` lists a target not
   read after a reader's process was killed with reason `:skipped`.
-  `targets` lists every target. `fingerprints` has, by target, the
-  fingerprints `key_census/1` returned: `check_ring/2` checks a ring
+  `targets` lists every target. `fingerprints` and `ciphers` have, by
+  target, those `key_census/1` returned: `check_ring/2` checks a ring
   against the whole fleet.
 
   ## Options
@@ -1112,7 +1127,8 @@ defmodule Sediment.S3 do
           unencrypted: [term()],
           unreadable: [{term(), term()}],
           targets: [term()],
-          fingerprints: %{term() => %{String.t() => String.t()}}
+          fingerprints: %{term() => %{String.t() => String.t()}},
+          ciphers: %{term() => %{String.t() => String.t()}}
         }
   def key_census_many(targets, opts \\ []), do: Sediment.S3.Many.key_census_many(targets, opts)
 

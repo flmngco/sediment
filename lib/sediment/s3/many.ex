@@ -87,7 +87,8 @@ defmodule Sediment.S3.Many do
       unencrypted: [],
       unreadable: [],
       targets: ids(targets),
-      fingerprints: %{}
+      fingerprints: %{},
+      ciphers: %{}
     }
 
     results
@@ -184,7 +185,9 @@ defmodule Sediment.S3.Many do
     acc =
       case census do
         %{fingerprints: fingerprints} when fingerprints != %{} ->
-          put_in(acc, [:fingerprints, id], fingerprints)
+          acc
+          |> put_in([:fingerprints, id], fingerprints)
+          |> put_in([:ciphers, id], Map.get(census, :ciphers, %{}))
 
         _ ->
           acc
@@ -328,13 +331,15 @@ defmodule Sediment.S3.Many do
 
   # Before around: (which may close the database), the manifest read as a
   # census reads it, without the lease: a target that needs nothing is
-  # reported without around:, and one whose ring holds other key material
-  # under a recorded id fails before it. Advisory: anything else, or a read
+  # reported without around:, and one whose ring can't open it (invalid by
+  # the native rules, or another cipher or key material under a recorded
+  # id) fails before it, not retried. Advisory: anything else, or a read
   # that fails, goes to the operation, which decides under the lease. A
   # stale read is safe: a key never becomes current again without
   # `allow_reuse` (A3), so a manifest naming the target key means the
   # rekey landed and no later state undoes it; and a release only removes
   # epochs, so a key no epoch is under stays so.
+  #
   # An id given as an atom, as the operation takes it; anything else goes
   # to the operation, which refuses it (by type, never by value).
   defp precheck(target, ring, {kind, id}) when is_atom(id) and id not in [nil, true, false],
@@ -343,27 +348,15 @@ defmodule Sediment.S3.Many do
   defp precheck(_target, _ring, {_kind, id}) when not is_binary(id) and id != nil,
     do: :proceed
 
-  defp precheck(target, ring, {:rekey, to}) do
-    with {:ok, %{current: current, fingerprints: recorded}} when is_binary(current) <-
+  defp precheck(target, ring, {kind, id}) when kind in [:rekey, :release] do
+    with {:ok, %{current: current} = census} when is_binary(current) <-
            S3.key_census(target.s3),
          %{} = ring <- Keys.normalize(ring) do
-      # As the native code: the ring's active key, else its first.
-      to = to || ring.active || with({id, _, _} <- List.first(ring.keys), do: id)
-      {ring, current_fp} = Keys.fingerprint(ring, current)
-      {_ring, to_fp} = if to == current, do: {ring, current_fp}, else: Keys.fingerprint(ring, to)
-      verdict({current, current_fp}, {to, to_fp}, recorded)
-    else
-      _ -> :proceed
-    end
-  rescue
-    _ -> :proceed
-  end
-
-  defp precheck(target, _ring, {:release, key_id}) do
-    with {:ok, %{current: current, retained: retained}} <- S3.key_census(target.s3),
-         true <- current != key_id and not is_map_key(retained, key_id),
-         {:ok, %{objects: 0}} <- S3.orphans(target.s3) do
-      {:done, {:ok, %{key: Keys.shown(key_id), epochs: []}}}
+      # A rekey's target as the native code picks it: the ring's active
+      # key, else its first.
+      to = if kind == :rekey, do: id || ring.active || first_id(ring), else: current
+      {ring, keys} = ring_keys(ring, Enum.uniq([current, to]))
+      refusal(ring, keys, census) || verdict(kind, id, {current, to, keys}, census, target)
     else
       _ -> :proceed
     end
@@ -373,27 +366,66 @@ defmodule Sediment.S3.Many do
 
   defp precheck(_target, _ring, nil), do: :proceed
 
-  # The ring's fingerprints of the current and target ids against the
-  # manifest's (`recorded`); nil where the ring lacks the key.
-  defp verdict({current, current_fp}, {to, to_fp}, recorded) do
-    cond do
-      other?(current_fp, recorded[current]) ->
-        {:done, other_material(current, current_fp, recorded[current])}
+  defp first_id(ring), do: with({id, _, _} <- List.first(ring.keys), do: id)
 
-      to != current and other?(to_fp, recorded[to]) ->
-        {:done, other_material(to, to_fp, recorded[to])}
+  # The ring's fingerprints under each of `ids` it holds (key_for asked
+  # for those it lacks), and the ring with them.
+  defp ring_keys(ring, ids) do
+    Enum.reduce(ids, {ring, %{}}, fn id, {ring, keys} ->
+      case Keys.fingerprint(ring, id) do
+        {ring, nil} -> {ring, keys}
+        {ring, fp} -> {ring, Map.put(keys, id, fp)}
+      end
+    end)
+  end
 
-      to == current and current_fp != nil ->
-        {:done, {:ok, :current}}
+  # The ring invalid by the rules every open applies, or holding, under an
+  # id the manifest records, a key of another cipher (as manifests name
+  # ciphers) or other material.
+  defp refusal(ring, keys, census) do
+    case Keys.validate(ring) do
+      {:error, reason} ->
+        {:done, {:error, "s3 config: the ring can't open this database: #{reason}"}}
 
-      true ->
-        :proceed
+      {:ok, ciphers} ->
+        Enum.find_value(keys, fn {id, fp} -> other_key({id, {fp, ciphers[id]}}, census) end)
     end
   end
 
-  # The ring has a key under an id the manifest records, but another one.
-  defp other?(ring_fp, recorded_fp),
-    do: ring_fp != nil and recorded_fp != nil and ring_fp != recorded_fp
+  defp other_key({id, {fp, cipher}}, census) do
+    recorded_cipher = census |> Map.get(:ciphers, %{}) |> Map.get(id)
+    recorded_fp = census.fingerprints[id]
+
+    cond do
+      other?(cipher, recorded_cipher) -> {:done, other_cipher(id, cipher, recorded_cipher)}
+      other?(fp, recorded_fp) -> {:done, other_material(id, fp, recorded_fp)}
+      true -> nil
+    end
+  end
+
+  # Under the target key, with the ring's key the recorded one: done.
+  defp verdict(:rekey, _id, {current, to, keys}, _census, _target) do
+    if to == current and is_map_key(keys, current), do: {:done, {:ok, :current}}, else: :proceed
+  end
+
+  # No epoch under the key, and nothing left: done.
+  defp verdict(:release, key_id, {current, _to, _keys}, census, target) do
+    with true <- current != key_id and not is_map_key(census.retained, key_id),
+         {:ok, %{objects: 0}} <- S3.orphans(target.s3) do
+      {:done, {:ok, %{key: Keys.shown(key_id), epochs: []}}}
+    else
+      _ -> :proceed
+    end
+  end
+
+  # The ring's value and the manifest's for an id, both known, differ.
+  defp other?(ring, recorded), do: ring != nil and recorded != nil and ring != recorded
+
+  defp other_cipher(id, ring_cipher, recorded_cipher),
+    do:
+      {:error,
+       "s3 config: the ring's key #{Keys.shown(id)} is for #{Keys.shown(ring_cipher)}, but " <>
+         "the database records #{Keys.shown(id)} under #{Keys.shown(recorded_cipher)}"}
 
   defp other_material(id, ring_fp, recorded_fp),
     do:

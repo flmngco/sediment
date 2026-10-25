@@ -495,6 +495,51 @@ defmodule Sediment.S3RotationManyTest do
     assert rows(t2, ["r1"]) == ["t2"]
   end
 
+  # A ring that can't open the database never reads as done: the right
+  # bytes under the right id with another cipher, or a ring an open would
+  # refuse, fail before around:, not retried.
+  test "a ring of another cipher, or an invalid one, fails before around:", %{
+    base: base,
+    dir: dir
+  } do
+    [t1] = tenants(1, base, dir)
+    test = self()
+
+    around = fn target, run ->
+      send(test, {:around, target.id})
+      run.()
+    end
+
+    assert %{rekeyed: ["t1"]} = S3.rekey_many([t1], encryption: ring(["r2", "r1"]))
+
+    other_cipher = [keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aes256gcm"]
+    invalid = [keys: [{"r2", @k2}, {"r1", "abcd"}], cipher: "aegis256"]
+    unknown = [keys: [{"r2", @k2}], cipher: "nope"]
+
+    for {ring, expected} <- [
+          {other_cipher,
+           "the ring's key r2 is for aes256gcm, but the database records r2 under aegis256"},
+          {invalid, "the ring can't open this database: encryption: ring entry 2"},
+          {unknown, "the ring can't open this database: encryption:"}
+        ] do
+      assert %{failed: [{"t1", message}], current: [], rekeyed: []} =
+               S3.rekey_many([t1], encryption: ring, around: around, backoff: 0)
+
+      assert message =~ expected
+      refute message =~ @k2
+
+      assert %{failed: [{"t1", _}], unchanged: []} =
+               S3.release_key_many([t1], "r9", encryption: ring, around: around, backoff: 0)
+    end
+
+    assert flush_around() == []
+
+    # A cipher alias is the same cipher.
+    alias_ring = [keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aegis-256"]
+    assert %{current: ["t1"]} = S3.rekey_many([t1], encryption: alias_ring, around: around)
+    assert flush_around() == []
+  end
+
   defp flush_around do
     receive do
       {:around, id} -> [id | flush_around()]

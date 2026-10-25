@@ -16,6 +16,8 @@ pub struct Census {
     pub retained: BTreeMap<String, Vec<String>>,
     /// Key id -> its fingerprint (16 hex digits), for every key listed.
     pub fingerprints: BTreeMap<String, String>,
+    /// Key id -> the cipher recorded with it, for every key listed.
+    pub ciphers: BTreeMap<String, String>,
 }
 
 /// Reads the manifest (no lease, no writes). `None`: no database (none yet,
@@ -27,11 +29,13 @@ pub fn key_census(cfg: &S3Config) -> Result<Option<Census>> {
     };
     let mut retained: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut fingerprints = BTreeMap::new();
+    let mut ciphers = BTreeMap::new();
     for key in manifest.key.iter() {
         fingerprints.insert(
             key.id.clone(),
             short_fingerprint(&key.fingerprint).to_string(),
         );
+        ciphers.insert(key.id.clone(), key.cipher.clone());
     }
     for record in &manifest.history {
         if let Some(key) = &record.key {
@@ -42,12 +46,16 @@ pub fn key_census(cfg: &S3Config) -> Result<Option<Census>> {
             fingerprints
                 .entry(key.id.clone())
                 .or_insert_with(|| short_fingerprint(&key.fingerprint).to_string());
+            ciphers
+                .entry(key.id.clone())
+                .or_insert_with(|| key.cipher.clone());
         }
     }
     Ok(Some(Census {
         current: manifest.key.map(|key| key.id),
         retained,
         fingerprints,
+        ciphers,
     }))
 }
 

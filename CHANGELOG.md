@@ -28,18 +28,21 @@
   the state as the next epoch began (or the live state, for the current
   epoch).
 * `key_census/1` returns `fingerprints: %{id => fingerprint}` (16 hex
-  digits) for every key it lists, and `key_census_many/2` keeps them by
-  target. `Sediment.S3.check_ring(census, ring)` checks that a ring holds
-  the recorded key material under each id (`:ok`, or `{:error, [{id,
+  digits) and `ciphers: %{id => cipher}` for every key it lists, and
+  `key_census_many/2` keeps them by target. `Sediment.S3.check_ring(census,
+  ring)` checks that a ring holds the recorded key material and cipher
+  under each id (`:ok`, or `{:error, [{id,
   :missing | :mismatch}]}`), without opening: a boot-time check.
 * `rekey_many/2` and `release_key_many/3` read each target's manifest
   before `:around` (without the lease): a database under the target key
   already, with the ring's key under that id the recorded one, is
   reported `current` without calling `:around`, so a re-run pauses only
   the databases that need it; a release with no epoch under the key and
-  nothing left is reported `unchanged` likewise. A ring holding other key
-  material under a recorded id fails the target before `:around`, with a
-  message naming the id and both fingerprints. The encryption function is
+  nothing left is reported `unchanged` likewise. A ring that can't open
+  the database fails the target before `:around`, not retried: one an open
+  would refuse, or one holding under a recorded id a key of another cipher
+  (the message names both ciphers) or other key material (both
+  fingerprints). The encryption function is
   called once per target, before `:around`.
 * `Sediment.S3.space_needed(path, s3_opts, :rekey | :release)`: the bytes
   a rekey or release needs free beside `path` (the restore unless the

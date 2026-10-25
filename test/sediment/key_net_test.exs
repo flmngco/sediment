@@ -511,6 +511,47 @@ defmodule Sediment.KeyNetTest do
              )
   end
 
+  # The ring check the bulk pre-check runs (Keys.validate/1, its NIF):
+  # whatever the ring holds where, no key in its result.
+  test "the ring validation never shows a key" do
+    key = @key
+
+    natives =
+      for shape <- shapes(key),
+          ring <- [
+            %{keys: [{"r1", "aegis256", shape}], active: nil, resolvable: false},
+            %{keys: [{shape, "aegis256", key}], active: nil, resolvable: false},
+            %{keys: [{"r1", shape, key}], active: nil, resolvable: false},
+            %{keys: [{"r1", "aegis256", key}], active: shape, resolvable: false}
+          ],
+          do: ring
+
+    for ring <- natives do
+      text =
+        try do
+          inspect(Sediment.Native.s3_validate_ring(ring), limit: :infinity)
+        rescue
+          e -> Exception.format(:error, e, __STACKTRACE__)
+        end
+
+      refute shows?(text, key), String.slice(text, 0, 300)
+    end
+
+    for shape <- shapes(key) do
+      text =
+        try do
+          shape
+          |> Sediment.S3.Keys.normalize()
+          |> Sediment.S3.Keys.validate()
+          |> inspect(limit: :infinity)
+        rescue
+          e -> Exception.format(:error, e, __STACKTRACE__)
+        end
+
+      refute shows?(text, key), String.slice(text, 0, 300)
+    end
+  end
+
   # The callbacks' own failures, each holding `shape`; check: and around:
   # sending the target they get to `seen`.
   defp callback_cases(target, key, shape, seen) do

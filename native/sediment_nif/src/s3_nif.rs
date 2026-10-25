@@ -744,6 +744,32 @@ fn s3_test_free_space(bytes: Option<u64>) -> rustler::Atom {
     crate::atoms::ok()
 }
 
+/// Whether a key ring (as `Sediment.S3.Keys.native/1` gives it) holds by
+/// the rules every open applies (ids, ciphers, key sizes), without opening
+/// anything: `{:ok, %{id => cipher}}` with each key's cipher as manifests
+/// record it, or the error an open would return.
+#[rustler::nif]
+fn s3_validate_ring<'a>(env: Env<'a>, ring: Term<'a>) -> Term<'a> {
+    match decode_ring(ring) {
+        Ok(Some(decoded)) => {
+            let ids: Vec<(String, String, String)> = ring
+                .map_get(crate::atoms::keys())
+                .and_then(|t| t.decode())
+                .unwrap_or_default();
+            let ciphers: std::collections::BTreeMap<String, String> = ids
+                .into_iter()
+                .filter_map(|(id, _, _)| {
+                    let cipher = decoded.get(&id)?.cipher().to_string();
+                    Some((id, cipher))
+                })
+                .collect();
+            ok_tuple(env, string_map(env, &ciphers))
+        }
+        Ok(None) => ok_tuple(env, Term::map_new(env)),
+        Err(reason) => error_tuple(env, reason),
+    }
+}
+
 /// Which keys the database depends on (see `s3::key_census`).
 #[rustler::nif(schedule = "DirtyIo")]
 fn s3_key_census<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
@@ -779,6 +805,10 @@ fn s3_key_census<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
                     (
                         Atom::from_str(env, "fingerprints").unwrap().encode(env),
                         string_map(env, &census.fingerprints),
+                    ),
+                    (
+                        Atom::from_str(env, "ciphers").unwrap().encode(env),
+                        string_map(env, &census.ciphers),
                     ),
                 ],
             );

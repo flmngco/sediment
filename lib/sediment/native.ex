@@ -223,6 +223,9 @@ defmodule Sediment.Native do
   @spec s3_key_census(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
   def s3_key_census(_opts), do: :erlang.nif_error(:not_loaded)
 
+  @spec s3_validate_ring(map() | nil) :: {:ok, %{String.t() => String.t()}} | {:error, reason()}
+  def s3_validate_ring(_ring), do: :erlang.nif_error(:not_loaded)
+
   @spec s3_orphans(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
   def s3_orphans(_opts), do: :erlang.nif_error(:not_loaded)
 

@@ -595,6 +595,14 @@ defmodule Sediment.S3RotationTest do
     swapped = [keys: [{"r2", @k2}, {"r1", @k3}], cipher: "aegis256"]
     assert {:error, [{"r1", :mismatch}]} = S3.check_ring(census, swapped)
 
+    # The cipher counts too (as manifests name it: an alias is the same).
+    assert census.ciphers == %{"r1" => "aegis256", "r2" => "aegis256"}
+
+    assert {:error, [{"r1", :mismatch}, {"r2", :mismatch}]} =
+             S3.check_ring(census, keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aes256gcm")
+
+    assert :ok = S3.check_ring(census, keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aegis-256")
+
     asked = [
       key_for: fn "r1" -> @k1 end,
       keys: [{"r2", @k2}],
