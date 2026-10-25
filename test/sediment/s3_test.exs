@@ -726,6 +726,34 @@ defmodule Sediment.S3Test do
     :ok = Engine.close(b)
   end
 
+  # Checkpoint images beside a path may be a live writer's (another OS
+  # process on the same path): only an open or maintenance operation holding
+  # the lease removes them (the native tests cover rekey and release).
+  test "an open refused by the lease leaves the snapshot images beside its path",
+       %{prefix: prefix, s3: s3, dir: dir} do
+    ring = [keys: [{"r1", String.duplicate("ab", 32)}], cipher: "aegis256"]
+    s3 = Keyword.delete(s3, :encryption)
+    {:ok, db} = Engine.open(Path.join(dir, "a.db"), s3: s3, encryption: ring)
+
+    other = Path.join(dir, "other")
+    File.mkdir_p!(other)
+    path = Path.join(other, "a.db")
+    images = for n <- 1..2, do: Path.join(other, ".a.db.s3-snapshot-#{n}")
+    Enum.each(images, &File.write!(&1, "image"))
+    s3_b = s3_opts(prefix, "writer-b") |> Keyword.delete(:encryption)
+
+    assert {:error, "s3 lease held by writer-a" <> _} =
+             Engine.open(path, s3: s3_b, encryption: ring)
+
+    assert Enum.all?(images, &File.exists?/1)
+
+    # Under the lease, they go.
+    :ok = Engine.close(db)
+    {:ok, b} = Engine.open(path, s3: s3_b, encryption: ring)
+    :ok = Engine.close(b)
+    refute Enum.any?(images, &File.exists?/1)
+  end
+
   test "close releases the lease while statements are still referenced", %{
     prefix: prefix,
     s3: s3,

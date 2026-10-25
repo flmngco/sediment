@@ -403,7 +403,6 @@ fn prepare_fresh(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>, op: &Op) ->
         return Err(no_database(cfg));
     }
     require_encryption_choice(cfg, &remote)?;
-    remove_snapshot_images(local_path);
     if cfg.verify_conditional_writes {
         probe::verify(&remote, &cfg.store_identity())?;
     }
@@ -438,6 +437,10 @@ fn prepare_under_lease(
 ) -> Result<Fresh> {
     let must_exist = cfg.must_exist || !matches!(op, Op::Open);
     let generation = lease.generation();
+    // Under the lease only: before it, the images may be those of a live
+    // writer of the same path in another process, which a refused open
+    // must leave alone.
+    remove_snapshot_images(local_path);
 
     let current = match remote.get(MANIFEST_KEY)? {
         Some(object) => Some((ManifestState::decode(&object.bytes)?, object.version)),

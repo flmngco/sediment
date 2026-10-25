@@ -780,3 +780,44 @@ fn a_key_for_ring_and_a_no_op_rekey_keep_the_copy_warm() {
     let db = downloads_no_snapshot(&store, || open_encrypted(&both, &path).unwrap());
     assert_eq!(rows(&db), ["a"]);
 }
+
+/// Checkpoint images beside a path may be a live writer's in another
+/// process: an open, rekey or release refused by the lease leaves them, and
+/// only one holding the lease removes them.
+#[test]
+fn an_operation_refused_by_the_lease_leaves_the_snapshot_images() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let cfg = seeded(&store, &dir, &["a"]);
+    // A crashed rekey's lease stays held (until its TTL), as another
+    // process's would.
+    let a = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    hook::arm(&a.place(), hook::PUBLISH, Action::Crash);
+    assert!(err_text(rekey(&a, &dir.db("crashed.db"), None, false, false)).contains("crashed"));
+
+    let other = dir.db("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let path = other.join("live.db");
+    let images: Vec<_> = (1..=2)
+        .map(|n| other.join(format!(".live.db.s3-snapshot-{n}")))
+        .collect();
+    for image in &images {
+        std::fs::write(image, b"image").unwrap();
+    }
+
+    let b = keyed(&store, "b", &[("r2", "22"), ("r1", "11")]);
+    let refusals = [
+        err_text(open_encrypted(&b, &path).map(drop)),
+        err_text(rekey(&b, &path, None, false, false)),
+        err_text(release_key(&b, &path, "r1", false)),
+    ];
+    for message in refusals {
+        assert!(message.contains("lease held"), "{message}");
+    }
+    assert!(images.iter().all(|image| image.exists()));
+
+    // The crashed rekey's owner takes over at once.
+    let db = open_encrypted(&cfg, &path).unwrap();
+    drop(db);
+    assert!(!images.iter().any(|image| image.exists()));
+}

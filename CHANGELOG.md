@@ -21,6 +21,13 @@
   the state as the next epoch began (or the live state, for the current
   epoch).
 
+### Fixed
+
+* An open, rekey, release or other operation on an S3 database removes the
+  snapshot images a crashed writer left beside its path only once it holds
+  the lease. Before, one refused with "lease held" (a second process on the
+  same path) had removed the images of the live writer's pending snapshot.
+
 ## 0.2.0-beta.1 (2026-10-24)
 
 0.2 breaks 0.1: the S3 manifest is version 4 (it records each epoch's key),
