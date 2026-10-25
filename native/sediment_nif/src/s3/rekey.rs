@@ -294,6 +294,13 @@ fn pages(
     Ok(hashes)
 }
 
+/// Removes the copy a rekey killed while running left beside `path` (a
+/// database's size). Only under the file's lock, which a running rekey of
+/// it holds, and the lease, which a rekey in another process holds.
+pub(crate) fn remove_stale_copy(path: &Path) {
+    Copy(sibling(path)).remove();
+}
+
 /// `.<name>.rekey.db` next to the database.
 fn sibling(path: &Path) -> PathBuf {
     let name = path

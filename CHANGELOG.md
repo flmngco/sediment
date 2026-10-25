@@ -27,6 +27,10 @@
   snapshot images a crashed writer left beside its path only once it holds
   the lease. Before, one refused with "lease held" (a second process on the
   same path) had removed the images of the live writer's pending snapshot.
+* A rekey killed while running left its copy, `.<name>.rekey.db` (the
+  database's size), until the next rekey. The next open, rekey or release
+  of the database removes it, under the file's lock and the lease, and so
+  does a restore into that path.
 
 ## 0.2.0-beta.1 (2026-10-24)
 

@@ -437,10 +437,11 @@ fn prepare_under_lease(
 ) -> Result<Fresh> {
     let must_exist = cfg.must_exist || !matches!(op, Op::Open);
     let generation = lease.generation();
-    // Under the lease only: before it, the images may be those of a live
-    // writer of the same path in another process, which a refused open
-    // must leave alone.
+    // Under the lease only: before it, the images (and a rekey's copy) may
+    // be those of a live writer of the same path in another process, which
+    // a refused open must leave alone.
     remove_snapshot_images(local_path);
+    rekey::remove_stale_copy(local_path);
 
     let current = match remote.get(MANIFEST_KEY)? {
         Some(object) => Some((ManifestState::decode(&object.bytes)?, object.version)),
@@ -860,6 +861,9 @@ fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Res
     cfg.validate()?;
     let _log =
         crate::log_guard::claim(local_path, crate::log_guard::Use::New).map_err(S3Error::Config)?;
+    // No database is at this path (see Sediment.S3.restore/3), so no rekey
+    // of one runs: a copy beside it is a killed rekey's.
+    rekey::remove_stale_copy(local_path);
     let remote = cfg.remote()?;
     // Like a replica's refresh (see replica::stage): only a log the writer
     // still owned after it was listed.

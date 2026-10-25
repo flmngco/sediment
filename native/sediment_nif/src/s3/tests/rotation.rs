@@ -821,3 +821,30 @@ fn an_operation_refused_by_the_lease_leaves_the_snapshot_images() {
     drop(db);
     assert!(!images.iter().any(|image| image.exists()));
 }
+
+/// A rekey killed while running leaves its copy (a database's size) beside
+/// the path: the next open, release or restore there removes it.
+#[test]
+fn a_stale_rekey_copy_is_removed_by_the_next_open_release_or_restore() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let cfg = seeded(&store, &dir, &["a"]);
+    let plant = |name: &str| {
+        let copy = dir.db(&format!(".{name}.rekey.db"));
+        std::fs::write(&copy, vec![0u8; 4096]).unwrap();
+        copy
+    };
+
+    let copy = plant("w.db");
+    drop(open_encrypted(&cfg, &dir.db("w.db")).unwrap());
+    assert!(!copy.exists());
+
+    let copy = plant("w.db");
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    release_key(&both, &dir.db("w.db"), "r9", false).unwrap();
+    assert!(!copy.exists());
+
+    let copy = plant("r.db");
+    crate::s3::restore_to(&cfg, &dir.db("r.db"), Target::Latest).unwrap();
+    assert!(!copy.exists());
+}
