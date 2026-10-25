@@ -958,10 +958,29 @@ defmodule Sediment.S3 do
 
   A re-run finds the rekeyed ones `current`, so running it again until
   `failed` is empty finishes the rotation (see "Only `{:ok, _}` is an
-  outcome" in `rekey/3`: keep both keys in every ring until then). **The
-  rotation is finished only when `failed` is empty and `absent` holds only
-  databases you know don't exist**: a wrong bucket or prefix reads as
-  absent, with nothing failed. Take the targets from the application's own
+  outcome" in `rekey/3`: keep both keys in every ring until then). It
+  calls no `:around` for a target that needs nothing: a database an earlier
+  run left closed (failed with `{:around_failed, ...}` or `{:crashed,
+  ...}`) stays closed unless you reopen it, for example on every result:
+
+      S3.rekey_many(targets,
+        encryption: ring,
+        around: fn t, rekey ->
+          :ok = MyApp.close(t.id)
+
+          try do
+            rekey.()
+          after
+            :ok = MyApp.open(t.id)
+          end
+        end,
+        # whatever the result, open again (a no-op for an open database)
+        on_result: fn t, _result -> MyApp.ensure_open(t.id) end
+      )
+
+  **The rotation is finished only when `failed` is empty and `absent`
+  holds only databases you know don't exist**: a wrong bucket or prefix
+  reads as absent, with nothing failed. Take the targets from the application's own
   list of databases, and check with `key_census_many/2` and
   `removable?(census, old_id, current: new_id)` before a key leaves the
   rings.
@@ -1014,7 +1033,11 @@ defmodule Sediment.S3 do
       (a failed reopen), or raising after it, fails the target with
       `{:around_failed, reason, result}`, `result` the rekey's (it may
       have happened; the database may be left closed). Check the reopen's
-      result: in an `after` block, a returned error is discarded.
+      result: in an `after` block, a returned error is discarded. It is
+      not called for a target the pre-check finds done (see below): a
+      re-run doesn't reopen a database an earlier run left closed
+      (`{:around_failed, ...}` or `{:crashed, ...}`). Reopen those
+      yourself, from `:on_result` or after the run (see the example).
     * `:check` - `fn target -> :ok | {:error, reason} end`, run right before
       the rekey (inside `:around`): an error refuses the target, without
       retries.
@@ -1073,7 +1096,9 @@ defmodule Sediment.S3 do
   `unchanged` had none. As for `rekey_many/2`, a pre-check reads each
   manifest before `:around`: a database with no epoch under the key and
   no object left (see `orphans/1`) is reported `unchanged` without calling
-  `:around`. The key can leave the rings once `failed` is empty,
+  `:around`, so a re-run doesn't reopen a database an earlier run left
+  closed: reopen it from `:on_result`, or after the run (see the example in
+  `rekey_many/2`). The key can leave the rings once `failed` is empty,
   `absent` holds only databases you know don't exist, and a fresh
   `key_census_many/2` of every database says so:
 

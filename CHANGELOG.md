@@ -4,6 +4,12 @@
 
 ### Breaking
 
+* `rekey_many/2` and `release_key_many/3` no longer call `:around` for
+  every target: a target the pre-check finds done (see Added) is reported
+  without it. A re-run therefore doesn't reopen a database an earlier run
+  left closed (failed with `{:around_failed, ...}` or `{:crashed, ...}`):
+  reopen those from `:on_result`, or after the run.
+
 * `Sediment.S3.restore/3` refuses what it used to ignore: an option it
   doesn't know (`target: ...` restored the latest state), an `:at` that
   isn't a `DateTime`, and an `:epoch` that isn't an integer from 0 to
