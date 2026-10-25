@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0-beta.2 (Unreleased)
+
+### Breaking
+
+* `Sediment.S3.restore/3` refuses what it used to ignore: an option it
+  doesn't know (`target: ...` restored the latest state), an `:at` that
+  isn't a `DateTime`, and an `:epoch` that isn't an integer from 0 to
+  2^64 - 1 or an epoch as results show it. Each returns `{:error, reason}`
+  and restores nothing. The native restore refuses any target other than
+  the latest state, a time or an epoch, where it restored the latest state.
+
+### Added
+
+* `restore/3` takes `epoch: "SEQ-GENERATION"`, the epoch as results show
+  it (`info.epoch`): the generation must match the retained epoch's too.
+  `epoch_start: n` restores an epoch's snapshot alone, the state at its
+  start (a forced snapshot starts an epoch, so it is a restore point).
+  The docs say plainly what `epoch: n` restores: the whole epoch, which is
+  the state as the next epoch began (or the live state, for the current
+  epoch).
+
 ## 0.2.0-beta.1 (2026-10-24)
 
 0.2 breaks 0.1: the S3 manifest is version 4 (it records each epoch's key),

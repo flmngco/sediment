@@ -1126,7 +1126,7 @@ fn point_in_time_restore_over_retained_epochs() {
         [1, 2, 3, 4, 5]
     );
     assert_eq!(
-        restored_ids(&cfg, &dir, "e.db", Target::Epoch(first_epoch)),
+        restored_ids(&cfg, &dir, "e.db", Target::epoch(first_epoch)),
         [1, 2, 3]
     );
     // Restoring never touches the writer.
@@ -1168,7 +1168,7 @@ fn point_in_time_restore_needs_retention() {
     let db = open_db(&cfg, &dir.db("a.db")).unwrap();
     db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
     db.checkpoint();
-    match super::restore_to(&cfg, &dir.db("old.db"), Target::Epoch(0)) {
+    match super::restore_to(&cfg, &dir.db("old.db"), Target::epoch(0)) {
         Err(S3Error::Config(msg)) => assert!(msg.contains("retain_epochs"), "{msg}"),
         other => panic!("unexpected {other:?}"),
     }

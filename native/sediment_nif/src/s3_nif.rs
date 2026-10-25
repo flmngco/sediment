@@ -359,6 +359,40 @@ fn s3_flush_snapshot<'a>(env: Env<'a>, res: ResourceArc<ConnRes>) -> Term<'a> {
     })
 }
 
+/// A restore target, as `Sediment.S3.restore/3` passes it; `None` for any
+/// other term (never the latest state in its place: a point-in-time restore
+/// answered with the newest state is a wrong answer).
+fn restore_target(term: Term) -> Option<Target> {
+    if term.atom_to_string().ok().as_deref() == Some("latest") {
+        return Some(Target::Latest);
+    }
+    let items = rustler::types::tuple::get_tuple(term).ok()?;
+    let (tag, numbers) = items.split_first()?;
+    let numbers = numbers
+        .iter()
+        .map(|n| n.decode::<u64>().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    let epoch = |start| match numbers[..] {
+        [seq] => Some(Target::Epoch {
+            seq,
+            generation: None,
+            start,
+        }),
+        [seq, generation] => Some(Target::Epoch {
+            seq,
+            generation: Some(generation),
+            start,
+        }),
+        _ => None,
+    };
+    match (tag.atom_to_string().ok()?.as_str(), &numbers[..]) {
+        ("time", [ms]) => Some(Target::Time(*ms)),
+        ("epoch", _) => epoch(false),
+        ("epoch_start", _) => epoch(true),
+        _ => None,
+    }
+}
+
 /// Restores into a standalone local file without the lease (point-in-time
 /// restore with a `{:epoch, n}` or `{:time, unix_ms}` target).
 #[rustler::nif(schedule = "DirtyIo")]
@@ -373,13 +407,12 @@ fn s3_restore<'a>(
         Ok(config) => config,
         Err(reason) => return error_tuple(env, reason),
     };
-    let target = match target.decode::<(Atom, u64)>() {
-        Ok((tag, n)) => match tag.to_term(env).atom_to_string().as_deref() {
-            Ok("epoch") => Target::Epoch(n),
-            Ok("time") => Target::Time(n),
-            _ => return error_tuple(env, "target must be :latest, {:epoch, n} or {:time, ms}"),
-        },
-        Err(_) => Target::Latest,
+    let Some(target) = restore_target(target) else {
+        return error_tuple(
+            env,
+            "restore target must be :latest, {:time, ms}, {:epoch, seq}, {:epoch, seq, \
+             generation}, {:epoch_start, seq} or {:epoch_start, seq, generation}",
+        );
     };
     let _maintenance = crate::conn::hold(
         &path,

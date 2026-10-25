@@ -193,7 +193,9 @@ defmodule Sediment.Native do
   @spec s3_restore(
           String.t(),
           keyword() | map(),
-          :latest | {:epoch | :time, non_neg_integer()},
+          :latest
+          | {:epoch | :epoch_start | :time, non_neg_integer()}
+          | {:epoch | :epoch_start, non_neg_integer(), non_neg_integer()},
           ring()
         ) :: {:ok, map()} | {:error, reason()}
   def s3_restore(_path, _opts, _target, _encryption), do: :erlang.nif_error(:not_loaded)

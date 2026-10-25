@@ -870,8 +870,12 @@ fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Res
         let key = restore_key(cfg, point.record.key.as_ref())?;
         let remote = remote.clone().for_key(key.as_ref())?;
         let log = restore::restore_point(&remote, &point, local_path, cfg.download_concurrency)?;
-        // An epoch before the current one was sealed by whoever replaced it.
-        if point.record.epoch == manifest.epoch && !restore::usable(&manifest, &log) {
+        // An epoch before the current one was sealed by whoever replaced it
+        // (and its snapshot alone needs no seal).
+        if point.record.epoch == manifest.epoch
+            && !point.snapshot_only
+            && !restore::usable(&manifest, &log)
+        {
             return Err(restore::taking_over(&manifest));
         }
         attempts += 1;

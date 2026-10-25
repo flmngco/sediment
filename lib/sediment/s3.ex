@@ -314,15 +314,23 @@ defmodule Sediment.S3 do
   ## Options
 
     * `:at` - a `DateTime`: the state as of that moment.
-    * `:epoch` - an epoch sequence number: the state at the start of that
-      epoch plus its whole log.
+    * `:epoch` - a retained epoch, all of it: its snapshot plus its whole
+      log, which is the state as the next epoch began (or, for the current
+      epoch, the live state). Either its sequence number (an integer), or
+      the epoch as results show it (`info.epoch`, `"SEQ-GENERATION"`),
+      whose generation must match too.
+    * `:epoch_start` - a retained epoch (as for `:epoch`), its snapshot
+      alone: the state at its start (a forced snapshot, see `snapshot/1`,
+      starts an epoch: a restore point).
     * `:encryption` - the key ring of an encrypted database (as its
       `:encryption` open option, holding the key of the epoch restored), or
       `false` for an unencrypted one. Required, see "Encryption".
 
-  Without options, the latest state is restored. Returns `{:ok, info}` with
-  the epoch used, its key's id (`nil` when unencrypted) and how many log
-  frames were replayed.
+  At most one of `:at`, `:epoch` and `:epoch_start`. Without them, the
+  latest state is restored. Any other option, or a target of another form,
+  returns `{:error, reason}` and restores nothing. Returns `{:ok, info}`
+  with the epoch used, its key's id (`nil` when unencrypted) and how many
+  log frames were replayed.
 
   `path` must not exist, and neither may its WAL (`path-wal`) or MVCC log
   (`<path without extension>.db-log`): restore returns
@@ -336,21 +344,63 @@ defmodule Sediment.S3 do
       opts = Keys.options!(opts, "Sediment.S3.restore/3")
       path = to_string(path)
 
-      case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
-        nil -> do_restore(path, s3_opts, opts)
-        existing -> {:error, "restore target exists: #{existing}"}
+      with {:ok, target} <- restore_target(opts) do
+        case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
+          nil -> do_restore(path, s3_opts, opts, target)
+          existing -> {:error, "restore target exists: #{existing}"}
+        end
       end
     end)
   end
 
-  defp do_restore(path, s3_opts, opts) do
-    target =
-      cond do
-        at = opts[:at] -> {:time, DateTime.to_unix(at, :millisecond)}
-        epoch = opts[:epoch] -> {:epoch, epoch}
-        true -> :latest
-      end
+  @restore_options [:at, :epoch, :epoch_start, :encryption]
+  @max_u64 2 ** 64 - 1
 
+  # What to restore, as the NIF takes it; an option it doesn't know, or a
+  # target of the wrong form, is an error (never the latest state instead).
+  # Messages name options, never their values.
+  defp restore_target(opts) do
+    call = "Sediment.S3.restore/3"
+
+    case Enum.find(Keyword.keys(opts), &(&1 not in @restore_options)) do
+      nil ->
+        case Keyword.take(opts, [:at, :epoch, :epoch_start]) do
+          [] -> {:ok, :latest}
+          [at: %DateTime{} = at] -> {:ok, {:time, DateTime.to_unix(at, :millisecond)}}
+          [at: _] -> {:error, "#{call}: :at must be a DateTime"}
+          [{kind, epoch}] -> epoch_target(kind, epoch, call)
+          _ -> {:error, "#{call}: give one of :at, :epoch and :epoch_start"}
+        end
+
+      name ->
+        {:error, "#{call}: unknown option #{Keys.shown_value(name)}"}
+    end
+  end
+
+  defp epoch_target(kind, seq, _call) when is_integer(seq) and seq in 0..@max_u64,
+    do: {:ok, {kind, seq}}
+
+  # The epoch as results show it (`info.epoch`): its sequence number and
+  # generation, which must both match the retained epoch's.
+  defp epoch_target(kind, epoch, call) when is_binary(epoch) do
+    with [_, seq, generation] <- Regex.run(~r/\A(\d{1,20})-(\d{1,20})\z/, epoch),
+         {seq, generation} = {String.to_integer(seq), String.to_integer(generation)},
+         true <- seq <= @max_u64 and generation <= @max_u64 do
+      {:ok, {kind, seq, generation}}
+    else
+      _ -> epoch_error(kind, call)
+    end
+  end
+
+  defp epoch_target(kind, _epoch, call), do: epoch_error(kind, call)
+
+  defp epoch_error(kind, call),
+    do:
+      {:error,
+       "#{call}: #{inspect(kind)} must be an epoch: a sequence number (an integer from 0 " <>
+         "to 2^64 - 1) or an epoch as results show it (\"SEQ-GENERATION\")"}
+
+  defp do_restore(path, s3_opts, opts, target) do
     s3_opts = with_encryption_choice(s3_opts, opts[:encryption])
     ring = Keys.normalize(opts[:encryption])
 

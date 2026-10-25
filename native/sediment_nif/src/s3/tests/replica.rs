@@ -470,7 +470,7 @@ fn refresh_across_a_takeover(log_cache: bool, retain: usize) {
             "b's seal took a's upload's key"
         );
         let past = dir.db("past.db");
-        crate::s3::restore_to(&cfg, &past, crate::s3::Target::Epoch(old_epoch.seq)).unwrap();
+        crate::s3::restore_to(&cfg, &past, crate::s3::Target::epoch(old_epoch.seq)).unwrap();
         assert_eq!(ids(&past), [1], "a's epoch ends where b took over");
     }
     release.send(()).unwrap();
@@ -770,7 +770,7 @@ fn restores_finish_while_the_writer_checkpoints() {
         let (cfg, dir_path) = (cfg.clone(), dir.db("x").parent().unwrap().to_path_buf());
         std::thread::spawn(move || {
             let restored = dir_path.join("past.db");
-            let pitr = crate::s3::restore_to(&cfg, &restored, crate::s3::Target::Epoch(past.seq));
+            let pitr = crate::s3::restore_to(&cfg, &restored, crate::s3::Target::epoch(past.seq));
             let replica = dir_path.join("r.db");
             let staged = stage(&cfg, &replica).map(|s| s.install(&replica));
             (pitr.map(|_| restored), staged.map(|_| replica))

@@ -275,7 +275,7 @@ fn point_in_time_restore_crosses_a_rekey_with_each_epochs_key() {
         .unwrap()
         .epoch
         .seq;
-    let (rows, key) = restore_rows(&both, &dir.db("p4.db"), Target::Epoch(pinned)).unwrap();
+    let (rows, key) = restore_rows(&both, &dir.db("p4.db"), Target::epoch(pinned)).unwrap();
     assert_eq!((rows.len(), key.as_str()), (1, "r1"));
 }
 

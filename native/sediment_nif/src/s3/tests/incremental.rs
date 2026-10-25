@@ -145,12 +145,13 @@ fn retained_epochs_keep_their_chains_for_point_in_time_restore() {
         let point = crate::s3::restore::Point {
             record,
             cutoff_ms: None,
+            snapshot_only: false,
         };
         restore_point(&remote, &point, &path, 4).unwrap();
     }
     for record in &m.history {
         let path = dir.db(&format!("epoch{}.db", record.epoch.seq));
-        restore_to(&cfg, &path, Target::Epoch(record.epoch.seq)).unwrap();
+        restore_to(&cfg, &path, Target::epoch(record.epoch.seq)).unwrap();
         let old = super::open_plain(&path);
         let mut stmt = old.conn.query("SELECT count(*) FROM t").unwrap().unwrap();
         assert_eq!(
@@ -395,7 +396,7 @@ fn lowering_retain_epochs_collects_what_is_no_longer_retained() {
     }));
     for record in m.retained() {
         let path = dir.db(&format!("e{}.db", record.epoch.seq));
-        restore_to(&cfg, &path, Target::Epoch(record.epoch.seq)).unwrap();
+        restore_to(&cfg, &path, Target::epoch(record.epoch.seq)).unwrap();
     }
     assert_eq!(db.int("SELECT count(*) FROM t"), 64);
 }
