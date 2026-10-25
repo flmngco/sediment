@@ -52,6 +52,19 @@ pub fn rekey(
     force: bool,
     allow_reuse: bool,
 ) -> Result<Rekeyed> {
+    rekey_with(cfg, local_path, to, force, allow_reuse, true)
+}
+
+/// [`rekey`], removing the working copy once done unless
+/// `keep_working_copy` (under the lease, see [`discard`]).
+pub fn rekey_with(
+    cfg: &S3Config,
+    local_path: &Path,
+    to: Option<&str>,
+    force: bool,
+    allow_reuse: bool,
+    keep_working_copy: bool,
+) -> Result<Rekeyed> {
     if let Some(to) = to {
         check_id(to)?;
     }
@@ -59,6 +72,7 @@ pub fn rekey(
         to: to.map(str::to_string),
         force,
         allow_reuse,
+        keep_working_copy,
     };
     match maintain(cfg, local_path, &op)? {
         Fresh::Unchanged => Ok(Rekeyed::Current),
@@ -66,7 +80,9 @@ pub fn rekey(
             storage, rekeyed, ..
         } => {
             let epoch = storage.info().epoch;
+            let discarded = discard(&storage, cfg, keep_working_copy);
             close(storage, cfg);
+            discarded?;
             let (from, to) = rekeyed.expect("a rekey that opened switched keys");
             Ok(Rekeyed::Done { from, to, epoch })
         }
@@ -77,10 +93,23 @@ pub fn rekey(
 /// history (point-in-time restore no longer reaches them), so the key can
 /// leave the ring. Refuses the current key.
 pub fn release_key(cfg: &S3Config, local_path: &Path, key: &str, force: bool) -> Result<Released> {
+    release_key_with(cfg, local_path, key, force, true)
+}
+
+/// [`release_key`], removing the working copy once done unless
+/// `keep_working_copy` (under the lease, see [`discard`]).
+pub fn release_key_with(
+    cfg: &S3Config,
+    local_path: &Path,
+    key: &str,
+    force: bool,
+    keep_working_copy: bool,
+) -> Result<Released> {
     check_id(key)?;
     let op = Op::Release {
         key: key.to_string(),
         force,
+        keep_working_copy,
     };
     match maintain(cfg, local_path, &op)? {
         Fresh::Unchanged => Ok(Released { epochs: Vec::new() }),
@@ -90,10 +119,14 @@ pub fn release_key(cfg: &S3Config, local_path: &Path, key: &str, force: bool) ->
             // Under the lease: the released epochs' objects (and any earlier
             // leftovers) go now, or the release reports what is left.
             let left = storage.sweep(&cfg.place());
+            let discarded = match left {
+                Ok(0) => discard(&storage, cfg, keep_working_copy),
+                _ => Ok(()),
+            };
             close(storage, cfg);
             let epochs = released.iter().map(Epoch::to_string).collect();
             match left? {
-                0 => Ok(Released { epochs }),
+                0 => discarded.map(|()| Released { epochs }),
                 objects => Err(S3Error::Leftover { epochs, objects }),
             }
         }
@@ -117,6 +150,17 @@ fn maintain(cfg: &S3Config, local_path: &Path, op: &Op) -> Result<Fresh> {
         prepare_fresh(cfg, local_path, io, op)
     })()
     .map_err(|err| err.at(local_path))
+}
+
+/// A successful run asked not to keep the working copy removes it here,
+/// before [`close`] gives the lease up (another VM may take the lease once
+/// it is free, and open the same path), its background work done first.
+fn discard(storage: &super::S3DurableStorage, cfg: &S3Config, keep: bool) -> Result<()> {
+    if keep {
+        return Ok(());
+    }
+    storage.wait_background(cfg.close_timeout);
+    storage.discard_working_copy(&cfg.place())
 }
 
 /// A clean close: the garbage collection the open started (the old key's
@@ -363,14 +407,14 @@ pub fn space_needed_at(cfg: &S3Config, local_path: &Path, rekey: bool) -> Result
 /// Removes the working copy at `path` after a rekey or release that was
 /// asked not to keep it (`keep_working_copy: false`): the file, its WAL and
 /// log, and the warm sidecar. Only under the file's lock.
-pub fn drop_working_copy(path: &Path) -> Result<()> {
+pub(crate) fn drop_working_copy(path: &Path) -> Result<()> {
     super::warm::discard(path);
     for file in [
         restore::wal_path(path),
         restore::log_path(path),
         path.to_path_buf(),
     ] {
-        restore::remove_if_exists(&file)?;
+        restore::remove_if_exists(&file).map_err(|err| err.at(&file))?;
     }
     Ok(())
 }

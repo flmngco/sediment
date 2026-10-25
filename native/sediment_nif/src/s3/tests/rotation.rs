@@ -922,3 +922,61 @@ fn a_writers_collection_sweeps_what_orphans_lists() {
     drop(db);
     assert_eq!(orphans(&both).unwrap().unwrap().objects, 0);
 }
+
+/// `keep_working_copy: false` removes the copy while the operation still
+/// holds the lease (a switch, a no-op re-run, a release): paused at the
+/// removal, another owner is refused with "lease held", and the files are
+/// still there; once done, they are gone, with no warm sidecar.
+#[test]
+fn a_discarded_working_copy_goes_while_the_lease_is_held() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    seeded(&store, &dir, &["a"]);
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    let path = dir.db("scratch.db");
+    let sidecar = dir.db(".scratch.db.s3-warm");
+
+    type Run = Box<dyn Fn(&S3Config, &Path) -> Result<(), S3Error> + Send>;
+    let runs: Vec<(&str, Run)> = vec![
+        (
+            "rekey",
+            Box::new(|cfg, path| {
+                crate::s3::rekey_with(cfg, path, None, false, false, false).map(drop)
+            }),
+        ),
+        (
+            "current",
+            Box::new(|cfg, path| {
+                crate::s3::rekey_with(cfg, path, None, false, false, false).map(drop)
+            }),
+        ),
+        (
+            "release",
+            Box::new(|cfg, path| {
+                crate::s3::release_key_with(cfg, path, "r1", false, false).map(drop)
+            }),
+        ),
+    ];
+    for (name, run) in runs {
+        // A no-op downloads nothing: the copy a former run left warm.
+        if name == "current" {
+            std::fs::write(&path, b"copy").unwrap();
+            std::fs::write(&sidecar, b"{}").unwrap();
+        }
+        hook::arm(&both.place(), hook::DISCARD, Action::Pause);
+        let worker = {
+            let (cfg, path) = (both.clone(), path.clone());
+            std::thread::spawn(move || run(&cfg, &path))
+        };
+        while hook::state(&both.place()) != Some(State::Paused) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(path.exists(), "{name}");
+        let other = keyed(&store, "b", &[("r2", "22"), ("r1", "11")]);
+        let message = err_text(open_encrypted(&other, &dir.db("other.db")).map(drop));
+        assert!(message.contains("lease held"), "{name}: {message}");
+        hook::release(&both.place());
+        worker.join().unwrap().unwrap();
+        assert!(!path.exists() && !sidecar.exists(), "{name}");
+    }
+}

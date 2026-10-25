@@ -17,6 +17,10 @@ pub const PUBLISH: &str = "publish";
 /// (`:store_fail` there fails the delete).
 pub const SWEEP: &str = "sweep";
 
+/// Right before a rekey or release asked not to keep the working copy
+/// removes it (`keep_working_copy: false`), still holding the lease.
+pub const DISCARD: &str = "discard";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Pause,

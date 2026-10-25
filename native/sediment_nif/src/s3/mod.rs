@@ -42,8 +42,8 @@ pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
 pub use keys::{short_fingerprint, shown, shown_value, Key, KeyRecord, KeyRing};
-pub use rekey::{drop_working_copy, space_needed_at};
-pub use rekey::{rekey, release_key, Rekeyed, Released};
+pub use rekey::space_needed_at;
+pub use rekey::{rekey, rekey_with, release_key, release_key_with, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;
 pub use storage::Loss;
@@ -357,11 +357,13 @@ pub(crate) enum Op {
         to: Option<String>,
         force: bool,
         allow_reuse: bool,
+        keep_working_copy: bool,
     },
     /// `Sediment.S3.release_key/4`: drop the retained epochs under `key`.
     Release {
         key: String,
         force: bool,
+        keep_working_copy: bool,
     },
 }
 
@@ -372,6 +374,19 @@ impl Op {
         match self {
             Op::Open => None,
             Op::Rekey { force, .. } | Op::Release { force, .. } => Some(*force),
+        }
+    }
+
+    /// Whether the working copy stays once the operation is done.
+    fn keeps_copy(&self) -> bool {
+        match self {
+            Op::Open => true,
+            Op::Rekey {
+                keep_working_copy, ..
+            }
+            | Op::Release {
+                keep_working_copy, ..
+            } => *keep_working_copy,
         }
     }
 }
@@ -418,7 +433,17 @@ fn prepare_fresh(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>, op: &Op) ->
     // release it only later: give it up at once when this open ends
     // without a storage (a maintenance operation's re-run, or another
     // owner's open, need it now). A crash (test hook) gave it up already.
-    let fresh = prepare_under_lease(cfg, local_path, io, op, &remote, sidecar, owner, &lease);
+    let mut fresh = prepare_under_lease(cfg, local_path, io, op, &remote, sidecar, owner, &lease);
+    // Nothing to change, and asked not to keep the copy: it goes now, still
+    // under the lease (another VM may take it once it is released, and open
+    // this path).
+    if matches!(fresh, Ok(Fresh::Unchanged)) && !op.keeps_copy() {
+        if let Err(err) = hook::at(hook::DISCARD, &cfg.place(), &lease)
+            .and_then(|()| rekey::drop_working_copy(local_path))
+        {
+            fresh = Err(err);
+        }
+    }
     if !matches!(fresh, Ok(Fresh::Opened { .. })) {
         lease.release();
     }

@@ -667,10 +667,12 @@ defmodule Sediment.S3 do
       wait out).
     * `:allow_reuse` - allow a retired key (see above).
     * `:keep_working_copy` - `false` removes the working copy at `path`
-      (the file, its WAL and log, the warm sidecar) once the rekey
-      returned `{:ok, _}`, for a run through a scratch directory that has
-      no use for it. Default `true`: the copy stays warm under the new
-      key, for the next open at `path`.
+      (the file, its WAL and log, the warm sidecar) when the rekey
+      succeeds (`:current` too), while it still holds the lease and the
+      file, for a run through a scratch directory that has no use for it.
+      A removal that fails returns an error naming the file (a re-run
+      finds the database current and removes the copy). Default `true`:
+      the copy stays warm under the new key, for the next open at `path`.
 
   Returns `{:ok, %{from: id, to: id, epoch: epoch}}`, `{:ok, :current}` when
   the database is under that key already (nothing is written),

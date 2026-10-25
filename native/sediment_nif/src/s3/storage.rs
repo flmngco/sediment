@@ -162,6 +162,9 @@ pub struct S3DurableStorage {
     /// Set when Drop has finished (lease released, sidecar written): until
     /// then a new open of the file waits (see `super::wait_while_closing`).
     gone: Arc<AtomicBool>,
+    /// Cleared when the working copy was removed (`keep_working_copy:
+    /// false`): no warm sidecar is left for it.
+    keep_copy: AtomicBool,
     /// The key the database is under (resolved by the open from its ring):
     /// another open's ring must hold the same.
     encryption: Option<super::keys::Key>,
@@ -227,6 +230,7 @@ impl S3DurableStorage {
             place: cfg.place(),
             attached: std::sync::atomic::AtomicUsize::new(0),
             gone: Arc::default(),
+            keep_copy: AtomicBool::new(true),
             encryption: key,
             retain_epochs: cfg.retain_epochs,
             group_commit: cfg.group_commit,
@@ -952,6 +956,15 @@ impl S3DurableStorage {
             .delete_many(doomed.into_iter().map(|object| object.key).collect())
     }
 
+    /// Removes the working copy (`keep_working_copy: false`) while this
+    /// maintenance operation still holds the lease, its background work
+    /// done: no warm sidecar is left for it.
+    pub(crate) fn discard_working_copy(&self, place: &str) -> Result<()> {
+        super::hook::at(super::hook::DISCARD, place, &self.lease)?;
+        self.keep_copy.store(false, Ordering::SeqCst);
+        super::rekey::drop_working_copy(&self.db_path)
+    }
+
     /// [`sweep`] with this writer's manifest and lease.
     pub(crate) fn sweep(&self, place: &str) -> Result<usize> {
         let manifest = self.state.lock().unwrap().manifest.clone();
@@ -1399,7 +1412,7 @@ impl Drop for S3DurableStorage {
         // only a hint (the next open checks it against S3 and the files).
         let lapsed = self.lease.lapsed().is_some();
         self.lease.release();
-        if !lapsed {
+        if !lapsed && self.keep_copy.load(Ordering::SeqCst) {
             self.leave_sidecar();
         }
     }
