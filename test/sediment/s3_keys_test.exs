@@ -341,9 +341,9 @@ defmodule Sediment.S3KeysTest do
     assert {:error, "Sediment.S3.restore/3: :at must be a DateTime"} =
              S3.restore(Temp.path!(), s3(), at: @k1, encryption: ring())
 
-    # A function clause, a KeyError or a BadMapError raised meanwhile holds
-    # the value it failed on: only its type is shown.
-    assert_raise ArgumentError, ~r"^BadMapError \(details withheld", fn ->
+    # A function clause, a KeyError or a Protocol.UndefinedError raised
+    # meanwhile holds the value it failed on: only its type is shown.
+    assert_raise ArgumentError, ~r"^Protocol.UndefinedError \(details withheld", fn ->
       S3.check_ring(%{fingerprints: @k1}, ring())
     end
   end
