@@ -1025,8 +1025,11 @@ defmodule Sediment.S3 do
       function of the target (as given) returning its ring, for per-tenant
       rings or `key_for`.
     * `:to`, `:force`, `:allow_reuse`, `:keep_working_copy` - as for
-      `rekey/3`, for every target (a target the pre-check reports
-      `current` runs nothing, and keeps a copy it has).
+      `rekey/3`, for every target. A target the pre-check reports
+      `current` runs nothing, and keeps a copy it has: a re-run doesn't
+      remove a copy that an earlier run's failed removal, or a VM stopped
+      after the switch, left at `path`. Run `rekey/3` with
+      `keep_working_copy: false` for that path, or delete its files.
     * `:max_concurrency` - how many databases at once (default 1).
     * `:attempts` - runs per database for the results above (default 3);
       `:backoff` - the first wait, in ms (default 1000).
@@ -1100,7 +1103,13 @@ defmodule Sediment.S3 do
 
   Returns `%{released: [id], unchanged: [id], absent: [id], failed: [{id,
   reason}], skipped: [id]}`: `released` dropped epochs under the key,
-  `unchanged` had none. As for `rekey_many/2`, a pre-check reads each
+  `unchanged` had none. With `keep_working_copy: false`, a database the
+  pre-check reports `unchanged` runs nothing and keeps a copy it has: a
+  re-run doesn't remove a copy that an earlier run's failed removal, or a
+  VM stopped after the release, left at `path`. Run `release_key/4` with
+  `keep_working_copy: false` for that path, or delete its files.
+
+  As for `rekey_many/2`, a pre-check reads each
   manifest before `:around`: a database with no epoch under the key and
   no object left (see `orphans/1`) is reported `unchanged` without calling
   `:around`, so a re-run doesn't reopen a database an earlier run left
