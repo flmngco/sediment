@@ -26,6 +26,9 @@
   under the key, were left in the store with only a log warning. A re-run
   for the key deletes what is left and returns `{:ok, _}` only once none
   is; `release_key_many/3` retries it, and reports the database released.
+  The re-run sweeps every unreferenced object of the database, so one the
+  store won't delete (object lock, retention, a bucket policy) blocks
+  `{:ok, _}` whatever its key; `orphans/1` shows it.
 
 ### Added
 
