@@ -526,4 +526,235 @@ defmodule Sediment.S3RotationTest do
     assert {:error, message} = S3.rekey(Path.join(dir, "r.db"), s3, encryption: ring(["r1"]))
     assert message =~ "is unencrypted"
   end
+
+  # A release whose delete fails committed: it reports the objects left
+  # (orphans/1 lists them), a re-run deletes them, and only then is ok.
+  test "a release whose delete fails reports :leftover; a re-run sweeps it", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    both = ring(["r2", "r1"])
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: both)
+    assert {:ok, %{objects: 0}} = S3.orphans(s3)
+
+    :armed = Native.s3_test_hook(s3, "sweep", :store_fail)
+
+    assert {:error, {:leftover, %{epochs: [_ | _] = epochs, objects: n, message: message}}} =
+             S3.release_key(path, s3, "r1", encryption: both)
+
+    assert n > 0
+    assert message =~ "released epochs #{Enum.join(epochs, ", ")}; #{n} objects are left"
+    assert message =~ "run release_key again"
+    assert {:ok, %{current: "r2", retained: retained}} = S3.key_census(s3)
+    refute Map.has_key?(retained, "r1")
+    assert {:ok, %{objects: ^n, bytes: bytes, by_key: %{nil => ^n}}} = S3.orphans(s3)
+    assert bytes > 0
+
+    :armed = Native.s3_test_hook(s3, "sweep", :store_fail)
+
+    assert {:error, {:leftover, %{epochs: [], objects: ^n}}} =
+             S3.release_key(path, s3, "r1", encryption: both)
+
+    assert {:ok, %{epochs: []}} = S3.release_key(path, s3, "r1", encryption: both)
+    assert {:ok, %{objects: 0, bytes: 0, by_key: by_key}} = S3.orphans(s3)
+    assert by_key == %{}
+    assert {:ok, :no_database} = S3.orphans(s3_opts("rotation/none-#{System.os_time()}"))
+  end
+
+  # Released over many: the retried run (its objects deleted) reports the
+  # database released, not unchanged.
+  test "release_key_many retries a leftover and reports it released", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    both = ring(["r2", "r1"])
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: both)
+    :armed = Native.s3_test_hook(s3, "sweep", :store_fail)
+
+    assert %{released: ["t"], failed: []} =
+             S3.release_key_many([%{id: "t", path: path, s3: s3}], "r1",
+               encryption: both,
+               backoff: 0
+             )
+
+    assert {:ok, %{objects: 0}} = S3.orphans(s3)
+  end
+
+  test "the census lists fingerprints; check_ring tells the right key material without opening",
+       %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: ring(["r2", "r1"]))
+    assert {:ok, census} = S3.key_census(s3)
+    assert %{"r1" => fp1, "r2" => fp2} = census.fingerprints
+    assert fp1 =~ ~r/\A[0-9a-f]{16}\z/ and fp2 =~ ~r/\A[0-9a-f]{16}\z/
+    refute fp1 == fp2
+
+    assert :ok = S3.check_ring(census, ring(["r2", "r1"]))
+    assert :ok = S3.check_ring({:ok, census}, ring(["r1", "r2"]))
+    assert {:error, [{"r1", :missing}]} = S3.check_ring(census, ring(["r2"]))
+
+    swapped = [keys: [{"r2", @k2}, {"r1", @k3}], cipher: "aegis256"]
+    assert {:error, [{"r1", :mismatch}]} = S3.check_ring(census, swapped)
+
+    # The cipher counts too (as manifests name it: an alias is the same).
+    assert census.ciphers == %{"r1" => "aegis256", "r2" => "aegis256"}
+
+    assert {:error, [{"r1", :mismatch}, {"r2", :mismatch}]} =
+             S3.check_ring(census, keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aes256gcm")
+
+    assert :ok = S3.check_ring(census, keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aegis-256")
+
+    asked = [
+      key_for: fn "r1" -> @k1 end,
+      keys: [{"r2", @k2}],
+      active: "r2",
+      cipher: "aegis256"
+    ]
+
+    assert :ok = S3.check_ring(census, asked)
+    assert :ok = S3.check_ring({:ok, :no_database}, false)
+
+    many = S3.key_census_many([%{id: "t", s3: s3}])
+    assert %{"t" => %{"r1" => ^fp1, "r2" => ^fp2}} = many.fingerprints
+    assert :ok = S3.check_ring(many, ring(["r2", "r1"]))
+    assert {:error, [{"r1", :mismatch}]} = S3.check_ring(many, swapped)
+  end
+
+  # The space a rekey or release checks before it downloads anything is
+  # what space_needed/3 says; below it, the operation refuses, unchanged.
+  test "rekey and release check the free space space_needed/3 names, before downloading",
+       %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    path = Path.join(dir, "r.db")
+    margin = 64 * 1024 * 1024
+
+    assert {:ok, rekey} = S3.space_needed(path, s3, :rekey)
+    assert {:ok, release} = S3.space_needed(path, s3, :release)
+    assert rekey > release and release > margin
+
+    on_exit(fn -> Native.s3_test_free_space(nil) end)
+    :ok = Native.s3_test_free_space(rekey - 1)
+
+    assert {:error, message} = S3.rekey(path, s3, encryption: ring(["r2", "r1"]))
+    assert message =~ "rekey needs about #{rekey} bytes free in #{dir}"
+    assert message =~ "only #{rekey - 1} are"
+    refute File.exists?(path)
+    assert {:ok, %{current: "r1"}} = S3.key_census(s3)
+
+    :ok = Native.s3_test_free_space(nil)
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: ring(["r2", "r1"]))
+
+    # Warm now: the restore needs no snapshot.
+    assert {:ok, warm} = S3.space_needed(path, s3, :release)
+    assert {:ok, cold} = S3.space_needed(Path.join(dir, "cold.db"), s3, :release)
+    assert warm < cold
+
+    :ok = Native.s3_test_free_space(warm - 1)
+
+    assert {:error, "s3 config: release_key needs about " <> _} =
+             S3.release_key(path, s3, "r1", encryption: ring(["r2", "r1"]))
+
+    assert {:ok, %{retained: %{"r1" => _}}} = S3.key_census(s3)
+    assert {:ok, :no_database} = S3.space_needed(path, s3_opts("rotation/none"), :rekey)
+  end
+
+  test "keep_working_copy: false removes the working copy after a run", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    both = ring(["r2", "r1"])
+
+    files = fn path ->
+      [
+        path,
+        path <> "-wal",
+        Path.rootname(path) <> ".db-log",
+        Path.join(dir, ".#{Path.basename(path)}.s3-warm")
+      ]
+    end
+
+    kept = Path.join(dir, "kept.db")
+    assert {:ok, %{to: "r2"}} = S3.rekey(kept, s3, encryption: both)
+    assert File.exists?(kept) and File.exists?(Path.join(dir, ".kept.db.s3-warm"))
+
+    for {name, run} <- [
+          {"current.db", &S3.rekey(&1, s3, encryption: both, keep_working_copy: false)},
+          {"released.db",
+           &S3.release_key(&1, s3, "r1", encryption: both, keep_working_copy: false)}
+        ] do
+      path = Path.join(dir, name)
+      assert {:ok, _} = run.(path)
+      refute Enum.any?(files.(path), &File.exists?/1), name
+    end
+
+    assert %{rekeyed: [], current: ["t"]} =
+             S3.rekey_many([%{id: "t", path: kept, s3: s3}],
+               encryption: both,
+               keep_working_copy: false
+             )
+
+    assert_raise ArgumentError, ~r/:keep_working_copy must be true or false/, fn ->
+      S3.rekey(kept, s3, encryption: both, keep_working_copy: :no)
+    end
+
+    # Nothing lost: the data is in S3.
+    assert {:ok, "r2", ["a"]} = restored_rows(Path.join(dir, "check.db"), s3, ["r2"], [])
+  end
+
+  # Concurrent rekeys in one VM: each check counts what the others running
+  # reserved, so together they never pass against the same free space.
+  test "a rekey's space check counts what another one running reserved", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    other = s3_opts("rotation/other-#{System.unique_integer([:positive])}-#{System.os_time()}")
+    db = open!(Path.join(dir, "seed-other.db"), other, ["r1"])
+    :ok = Engine.execute(db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+    :ok = Engine.close(db)
+
+    {a, b} = {Path.join(dir, "a.db"), Path.join(dir, "b.db")}
+    {:ok, need_a} = S3.space_needed(a, s3, :rekey)
+    {:ok, need_b} = S3.space_needed(b, other, :rekey)
+    on_exit(fn -> Native.s3_test_free_space(nil) end)
+    :ok = Native.s3_test_free_space(need_a + need_b - 1)
+
+    task = paused_rekey(a, s3, ring(["r2", "r1"]))
+    assert {:error, message} = S3.rekey(b, other, encryption: ring(["r2", "r1"]))
+    assert message =~ "rekey needs about #{need_b} bytes free"
+    assert message =~ "and #{need_a} reserved by the others running in this VM"
+
+    Native.s3_test_hook(s3, "publish", :release)
+    assert {:ok, %{to: "r2"}} = Task.await(task, 30_000)
+    # Given back once A's restore and copy were done.
+    assert {:ok, %{to: "r2"}} = S3.rekey(b, other, encryption: ring(["r2", "r1"]))
+  end
+
+  # A download a killed VM cut short leaves its temporary files: the next
+  # open, rekey or release removes them under the lease, before the space
+  # check could count them.
+  test "temporary files of a cut-short download are removed under the lease", %{s3: s3, dir: dir} do
+    seed(s3, dir, ["a"])
+    both = ring(["r2", "r1"])
+    path = Path.join(dir, "r.db")
+
+    temps =
+      for suffix <- [".s3-restore", ".s3-chain", ".s3-chain.s3-restore", ".s3-delta"],
+          do: path <> suffix
+
+    plant = fn -> Enum.each(temps, &File.write!(&1, :binary.copy(<<0>>, 4096))) end
+
+    plant.()
+    {:ok, needed} = S3.space_needed(path, s3, :rekey)
+    on_exit(fn -> Native.s3_test_free_space(nil) end)
+    # Room for what it needs (the copy's own check after the restore
+    # measures the folded file, a few pages more than a tiny log suggests).
+    :ok = Native.s3_test_free_space(needed + 1_048_576)
+    assert {:ok, %{to: "r2"}} = S3.rekey(path, s3, encryption: both)
+    :ok = Native.s3_test_free_space(nil)
+    refute Enum.any?(temps, &File.exists?/1)
+
+    plant.()
+    assert {:ok, _} = S3.release_key(path, s3, "r1", encryption: both)
+    refute Enum.any?(temps, &File.exists?/1)
+
+    plant.()
+    db = open!(path, s3, ["r2"])
+    :ok = Engine.close(db)
+    refute Enum.any?(temps, &File.exists?/1)
+  end
 end

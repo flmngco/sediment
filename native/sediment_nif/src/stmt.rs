@@ -747,6 +747,7 @@ fn columns<'a>(
     stmt: ResourceArc<StmtRes>,
 ) -> NifResult<Term<'a>> {
     check_owner(&res, &stmt)?;
+    ConnRes::close_if_asked(&res);
     let stmt_guard = lock(&stmt.stmt);
     let Some(statement) = stmt_guard.as_ref() else {
         return Ok(error_tuple(env, atoms::invalid_statement()));

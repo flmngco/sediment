@@ -145,12 +145,13 @@ fn retained_epochs_keep_their_chains_for_point_in_time_restore() {
         let point = crate::s3::restore::Point {
             record,
             cutoff_ms: None,
+            snapshot_only: false,
         };
         restore_point(&remote, &point, &path, 4).unwrap();
     }
     for record in &m.history {
         let path = dir.db(&format!("epoch{}.db", record.epoch.seq));
-        restore_to(&cfg, &path, Target::Epoch(record.epoch.seq)).unwrap();
+        restore_to(&cfg, &path, Target::epoch(record.epoch.seq)).unwrap();
         let old = super::open_plain(&path);
         let mut stmt = old.conn.query("SELECT count(*) FROM t").unwrap().unwrap();
         assert_eq!(
@@ -395,7 +396,37 @@ fn lowering_retain_epochs_collects_what_is_no_longer_retained() {
     }));
     for record in m.retained() {
         let path = dir.db(&format!("e{}.db", record.epoch.seq));
-        restore_to(&cfg, &path, Target::Epoch(record.epoch.seq)).unwrap();
+        restore_to(&cfg, &path, Target::epoch(record.epoch.seq)).unwrap();
     }
     assert_eq!(db.int("SELECT count(*) FROM t"), 64);
+}
+
+/// `orphans/1` applies the collection's rule: never the base snapshots of
+/// the current delta (older epochs), nor a live writer's next epoch (its
+/// snapshot and log land before its manifest names them).
+#[test]
+fn orphans_never_lists_a_delta_base_nor_a_live_writers_next_epoch() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let cfg = config(&store, "a");
+    let db = big_db(&cfg, &dir);
+    db.exec("UPDATE t SET v = zeroblob(10) WHERE id = 1")
+        .unwrap();
+    db.checkpoint();
+    let m = manifest(&store);
+    assert!(m.snapshot.ends_with(".delta"), "{}", m.snapshot);
+    assert!(m.snapshot_base.iter().all(|link| link.key < m.snapshot));
+
+    let next = m.epoch.next(m.generation);
+    let remote = Remote::new(store.clone(), PREFIX);
+    remote
+        .put(&next.snapshot_key(), "pending".into(), Put::Create)
+        .unwrap();
+    remote
+        .put(&next.segment_key(0), "pending".into(), Put::Create)
+        .unwrap();
+
+    let orphans = crate::s3::orphans(&cfg).unwrap().unwrap();
+    assert_eq!((orphans.objects, orphans.bytes), (0, 0), "{orphans:?}");
+    drop(db);
 }

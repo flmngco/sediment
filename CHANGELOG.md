@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.2.0-beta.2 (Unreleased)
+
+### Breaking
+
+* `rekey_many/2` and `release_key_many/3` no longer call `:around` for
+  every target: a target the pre-check finds done (see Added) is reported
+  without it. A re-run therefore doesn't reopen a database an earlier run
+  left closed (failed with `{:around_failed, ...}` or `{:crashed, ...}`):
+  reopen those from `:on_result`, or after the run.
+
+* `Sediment.S3.restore/3` refuses what it used to ignore: an option it
+  doesn't know (`target: ...` restored the latest state), an `:at` that
+  isn't a `DateTime`, and an `:epoch` that isn't an integer from 0 to
+  2^64 - 1 or an epoch as results show it. Each returns `{:error, reason}`
+  and restores nothing. The native restore refuses any target other than
+  the latest state, a time or an epoch, where it restored the latest state.
+* `Sediment.export_sqlite/3` refuses an option it doesn't read, naming it
+  (never its value), and writes nothing: `at:` or `epoch:` exported the
+  latest state. For a point in time, restore to a file, then export it.
+* `Sediment.S3.release_key/4` returns `{:error, {:leftover, %{epochs:
+  [...], objects: n, message: ...}}}` when deleting the released epochs'
+  objects fails, where it returned `{:ok, _}`. The release did happen (the
+  manifest no longer retains the epochs), but their objects, encrypted
+  under the key, were left in the store with only a log warning. A re-run
+  for the key deletes what is left and returns `{:ok, _}` only once none
+  is; `release_key_many/3` retries it, and reports the database released.
+  The re-run sweeps every unreferenced object of the database, so one the
+  store won't delete (object lock, retention, a bucket policy) blocks
+  `{:ok, _}` whatever its key; `orphans/1` shows it.
+
+### Added
+
+* `restore/3` takes `epoch: "SEQ-GENERATION"`, the epoch as results show
+  it (`info.epoch`): the generation must match the retained epoch's too.
+  `epoch_start: n` restores an epoch's snapshot alone, the state at its
+  start (a forced snapshot starts an epoch, so it is a restore point).
+  The docs say plainly what `epoch: n` restores: the whole epoch, which is
+  the state as the next epoch began (or the live state, for the current
+  epoch).
+* `key_census/1` returns `fingerprints: %{id => fingerprint}` (16 hex
+  digits) and `ciphers: %{id => cipher}` for every key it lists, and
+  `key_census_many/2` keeps them by target. `Sediment.S3.check_ring(census,
+  ring)` checks that a ring holds the recorded key material and cipher
+  under each id (`:ok`, or `{:error, [{id,
+  :missing | :mismatch}]}`), without opening: a boot-time check.
+* `rekey_many/2` and `release_key_many/3` read each target's manifest
+  before `:around` (without the lease): a database under the target key
+  already, with the ring's key under that id the recorded one, is
+  reported `current` without calling `:around`, so a re-run pauses only
+  the databases that need it; a release with no epoch under the key and
+  nothing left is reported `unchanged` likewise. A ring that can't open
+  the database fails the target before `:around`, not retried: one an open
+  would refuse, or one holding under a recorded id a key of another cipher
+  (the message names both ciphers) or other key material (both
+  fingerprints). The encryption function is
+  called once per target, before `:around`.
+* `Sediment.S3.space_needed(path, s3_opts, :rekey | :release)`: the bytes
+  a rekey or release needs free beside `path` (the restore unless the
+  working copy is warm, the rekey's copy, a margin). Both check it before
+  they download anything and refuse with a message naming the bytes needed
+  and free, where a rekey checked only for its copy, after the download had
+  filled the volume. The check counts the rekeys and releases running in
+  the VM (each reserves its need until its restore and copy are done), and
+  the restore's peak for a chain of deltas (a rebuilt image and the staged
+  delta at once). Temporary files of a download a killed VM cut short are
+  removed under the lease first.
+* `keep_working_copy: false` for `rekey/3`, `release_key/4` and their
+  `*_many` variants removes the working copy (the file, its WAL and log,
+  the warm sidecar) after a run that returned `{:ok, _}`: an offline run
+  through a scratch directory has no use for it.
+* `Sediment.S3.orphans(s3_opts)` lists, without the lease, the objects a
+  writer's garbage collection would delete (`objects`, `bytes`, `by_key`),
+  with the collection's own rule: never a live writer's next snapshot or
+  log, nor a delta's base snapshots.
+
+### Fixed
+
+* An open, rekey, release or other operation on an S3 database removes the
+  snapshot images a crashed writer left beside its path only once it holds
+  the lease. Before, one refused with "lease held" (a second process on the
+  same path) had removed the images of the live writer's pending snapshot.
+* A query its timeout stopped sometimes failed with "connection_closed"
+  (when the disconnect closed the connection before the statement saw the
+  interrupt) instead of "interrupted", as `Sediment.Connection` documents.
+  It is "interrupted" either way. Only the call that runs the statement
+  reports it: a close after the statement or a COMMIT completed (while
+  its status or columns were read) is still "connection_closed", as the
+  write may have committed.
+* A rekey killed while running left its copy, `.<name>.rekey.db` (the
+  database's size), until the next rekey. The next open, rekey or release
+  of the database removes it, under the file's lock and the lease, and so
+  does a restore into that path.
+
 ## 0.2.0-beta.1 (2026-10-24)
 
 0.2 breaks 0.1: the S3 manifest is version 4 (it records each epoch's key),

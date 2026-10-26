@@ -36,13 +36,14 @@ use std::sync::{Arc, Mutex, Weak};
 use turso_core::mvcc::persistent_storage::Storage;
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, IO};
 
-pub use census::{key_census, Census};
+pub use census::{key_census, orphans, Census, Orphans};
 pub use config::S3Config;
 pub use destroy::{destroy, Destroyed};
 pub use error::{Result, S3Error};
 pub use import::{import, ImportOptions, Imported, Verify};
 pub use keys::{short_fingerprint, shown, shown_value, Key, KeyRecord, KeyRing};
-pub use rekey::{rekey, release_key, Rekeyed, Released};
+pub use rekey::space_needed_at;
+pub use rekey::{rekey, rekey_with, release_key, release_key_with, Rekeyed, Released};
 pub use restore::Target;
 use snapshot::Digests;
 pub use storage::Loss;
@@ -356,11 +357,13 @@ pub(crate) enum Op {
         to: Option<String>,
         force: bool,
         allow_reuse: bool,
+        keep_working_copy: bool,
     },
     /// `Sediment.S3.release_key/4`: drop the retained epochs under `key`.
     Release {
         key: String,
         force: bool,
+        keep_working_copy: bool,
     },
 }
 
@@ -371,6 +374,19 @@ impl Op {
         match self {
             Op::Open => None,
             Op::Rekey { force, .. } | Op::Release { force, .. } => Some(*force),
+        }
+    }
+
+    /// Whether the working copy stays once the operation is done.
+    fn keeps_copy(&self) -> bool {
+        match self {
+            Op::Open => true,
+            Op::Rekey {
+                keep_working_copy, ..
+            }
+            | Op::Release {
+                keep_working_copy, ..
+            } => *keep_working_copy,
         }
     }
 }
@@ -403,7 +419,6 @@ fn prepare_fresh(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>, op: &Op) ->
         return Err(no_database(cfg));
     }
     require_encryption_choice(cfg, &remote)?;
-    remove_snapshot_images(local_path);
     if cfg.verify_conditional_writes {
         probe::verify(&remote, &cfg.store_identity())?;
     }
@@ -418,7 +433,17 @@ fn prepare_fresh(cfg: &S3Config, local_path: &Path, io: Arc<dyn IO>, op: &Op) ->
     // release it only later: give it up at once when this open ends
     // without a storage (a maintenance operation's re-run, or another
     // owner's open, need it now). A crash (test hook) gave it up already.
-    let fresh = prepare_under_lease(cfg, local_path, io, op, &remote, sidecar, owner, &lease);
+    let mut fresh = prepare_under_lease(cfg, local_path, io, op, &remote, sidecar, owner, &lease);
+    // Nothing to change, and asked not to keep the copy: it goes now, still
+    // under the lease (another VM may take it once it is released, and open
+    // this path).
+    if matches!(fresh, Ok(Fresh::Unchanged)) && !op.keeps_copy() {
+        if let Err(err) = hook::at(hook::DISCARD, &cfg.place(), &lease)
+            .and_then(|()| rekey::drop_working_copy(local_path))
+        {
+            fresh = Err(err);
+        }
+    }
     if !matches!(fresh, Ok(Fresh::Opened { .. })) {
         lease.release();
     }
@@ -438,6 +463,12 @@ fn prepare_under_lease(
 ) -> Result<Fresh> {
     let must_exist = cfg.must_exist || !matches!(op, Op::Open);
     let generation = lease.generation();
+    // Under the lease only: before it, the images (and a rekey's copy) may
+    // be those of a live writer of the same path in another process, which
+    // a refused open must leave alone.
+    remove_snapshot_images(local_path);
+    rekey::remove_stale_copy(local_path);
+    remote::remove_download_temps(local_path);
 
     let current = match remote.get(MANIFEST_KEY)? {
         Some(object) => Some((ManifestState::decode(&object.bytes)?, object.version)),
@@ -465,9 +496,32 @@ fn prepare_under_lease(
             if let Op::Release { key: id, .. } = op {
                 released = released_epochs(&decoded, id)?;
                 if released.is_empty() {
-                    return Ok(Fresh::Unchanged);
+                    // An earlier run's objects a failed delete left: swept
+                    // now, by the collection's rule, before it reports done.
+                    return match storage::sweep(remote, &decoded, lease, &cfg.place())? {
+                        0 => Ok(Fresh::Unchanged),
+                        objects => Err(S3Error::Leftover {
+                            epochs: Vec::new(),
+                            objects,
+                        }),
+                    };
                 }
             }
+            // A rekey or release refused for space before it writes or
+            // downloads anything (its copy is checked again after); what it
+            // needs stays reserved in this VM until the restore and the copy
+            // are done (the end of this arm).
+            let _reserved = if matches!(op, Op::Open) {
+                None
+            } else {
+                let what = if target.is_some() {
+                    "rekey"
+                } else {
+                    "release_key"
+                };
+                let needed = rekey::space_needed(remote, &decoded, local_path, target.is_some())?;
+                Some(rekey::check_space(needed, local_path, what)?)
+            };
             // The open goes ahead: the sidecar (and a temp file a cut-short
             // write left) goes before anything touches the local files.
             let discarded = warm::discard(local_path);
@@ -620,7 +674,10 @@ fn prepare_under_lease(
             .then_some((published.key, published.digests)),
         key,
     ));
-    storage.collect_garbage_now();
+    // A release sweeps itself, reporting what it couldn't delete.
+    if !matches!(op, Op::Release { .. }) {
+        storage.collect_garbage_now();
+    }
     storage.start_uploader();
     Ok(Fresh::Opened {
         storage,
@@ -857,6 +914,9 @@ fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Res
     cfg.validate()?;
     let _log =
         crate::log_guard::claim(local_path, crate::log_guard::Use::New).map_err(S3Error::Config)?;
+    // No database is at this path (see Sediment.S3.restore/3), so no rekey
+    // of one runs: a copy beside it is a killed rekey's.
+    rekey::remove_stale_copy(local_path);
     let remote = cfg.remote()?;
     // Like a replica's refresh (see replica::stage): only a log the writer
     // still owned after it was listed.
@@ -870,8 +930,12 @@ fn restore_into(cfg: &S3Config, local_path: &Path, target: Target) -> Result<Res
         let key = restore_key(cfg, point.record.key.as_ref())?;
         let remote = remote.clone().for_key(key.as_ref())?;
         let log = restore::restore_point(&remote, &point, local_path, cfg.download_concurrency)?;
-        // An epoch before the current one was sealed by whoever replaced it.
-        if point.record.epoch == manifest.epoch && !restore::usable(&manifest, &log) {
+        // An epoch before the current one was sealed by whoever replaced it
+        // (and its snapshot alone needs no seal).
+        if point.record.epoch == manifest.epoch
+            && !point.snapshot_only
+            && !restore::usable(&manifest, &log)
+        {
             return Err(restore::taking_over(&manifest));
         }
         attempts += 1;

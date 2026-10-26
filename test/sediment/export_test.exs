@@ -48,6 +48,23 @@ defmodule Sediment.ExportTest do
     assert {:error, "export target exists: " <> _} = Sediment.export_sqlite(source, dest)
   end
 
+  # A point in time an export never reads: refused, not answered with the
+  # latest state.
+  test "an option it doesn't read is refused, writing nothing", %{dir: dir} do
+    src = source(dir)
+    dest = Path.join(dir, "out.db")
+
+    for opts <- [[at: DateTime.utc_now()], [epoch: 3], [epoch_start: 3], [target: :latest]] do
+      [{name, _}] = opts
+
+      assert {:error, "Sediment.export_sqlite/3: unknown option " <> shown} =
+               Sediment.export_sqlite(src, dest, opts)
+
+      assert shown == inspect(name)
+      refute File.exists?(dest)
+    end
+  end
+
   @tag skip: if(!@python3, do: "python3 isn't installed")
   test "python3's sqlite3 reads the export and continues its ids", %{dir: dir} do
     dest = Path.join(dir, "export.db")

@@ -27,13 +27,14 @@ defmodule Sediment.S3.Many do
 
     {targets, opts} =
       Keys.scrubbed(fn ->
-        checked!(targets, opts, call, @common ++ [:to, :force, :allow_reuse])
+        checked!(targets, opts, call, @common ++ [:to, :force, :allow_reuse, :keep_working_copy])
       end)
 
-    pass = Keyword.take(opts, [:to, :force, :allow_reuse])
+    pass = Keyword.take(opts, [:to, :force, :allow_reuse, :keep_working_copy])
     rekey = fn target, ring -> S3.rekey(target.path, target.s3, [encryption: ring] ++ pass) end
 
-    run(targets, opts, rekey, &rekey_outcome/1, [:rekeyed, :current, :absent])
+    opts = Keyword.put(opts, :precheck, {:rekey, opts[:to]})
+    run(targets, opts, rekey, &rekey_outcome/2, [:rekeyed, :current, :absent])
   end
 
   @spec release_key_many(Enumerable.t(), String.t(), keyword()) :: map()
@@ -45,16 +46,17 @@ defmodule Sediment.S3.Many do
         unless (is_binary(key_id) or is_atom(key_id)) and key_id not in [nil, true, false],
           do: raise(ArgumentError, "#{call}: the key id must be a string")
 
-        checked!(targets, opts, call, @common ++ [:force])
+        checked!(targets, opts, call, @common ++ [:force, :keep_working_copy])
       end)
 
-    pass = Keyword.take(opts, [:force])
+    pass = Keyword.take(opts, [:force, :keep_working_copy])
 
     release = fn target, ring ->
       S3.release_key(target.path, target.s3, key_id, [encryption: ring] ++ pass)
     end
 
-    run(targets, opts, release, &release_outcome/1, [:released, :unchanged, :absent])
+    opts = Keyword.put(opts, :precheck, {:release, key_id})
+    run(targets, opts, release, &release_outcome/2, [:released, :unchanged, :absent])
   end
 
   @spec key_census_many(Enumerable.t(), keyword()) :: map()
@@ -79,7 +81,15 @@ defmodule Sediment.S3.Many do
     read = MapSet.new(results, fn {target, _} -> target.index end)
     results = results ++ for(t <- targets, t.index not in read, do: {t, {:error, :skipped}})
 
-    acc = %{keys: %{}, absent: [], unencrypted: [], unreadable: [], targets: ids(targets)}
+    acc = %{
+      keys: %{},
+      absent: [],
+      unencrypted: [],
+      unreadable: [],
+      targets: ids(targets),
+      fingerprints: %{},
+      ciphers: %{}
+    }
 
     results
     |> Enum.sort_by(fn {target, _} -> target.index end)
@@ -134,13 +144,21 @@ defmodule Sediment.S3.Many do
 
   ## Outcomes
 
-  defp rekey_outcome({:ok, :current}), do: :current
-  defp rekey_outcome({:ok, %{to: _}}), do: :rekeyed
-  defp rekey_outcome(result), do: absent_or_failed(result)
+  # The last result, and the attempts before it.
+  defp rekey_outcome({:ok, :current}, _earlier), do: :current
+  defp rekey_outcome({:ok, %{to: _}}, _earlier), do: :rekeyed
+  defp rekey_outcome(result, _earlier), do: absent_or_failed(result)
 
-  defp release_outcome({:ok, %{epochs: []}}), do: :unchanged
-  defp release_outcome({:ok, %{epochs: _}}), do: :released
-  defp release_outcome(result), do: absent_or_failed(result)
+  # A release that left objects behind released its epochs: the re-run
+  # that deleted them has none left to release.
+  defp release_outcome({:ok, %{epochs: []}}, earlier) do
+    if Enum.any?(earlier, &match?({:error, {:leftover, %{epochs: [_ | _]}}}, &1)),
+      do: :released,
+      else: :unchanged
+  end
+
+  defp release_outcome({:ok, %{epochs: _}}, _earlier), do: :released
+  defp release_outcome(result, _earlier), do: absent_or_failed(result)
 
   defp absent_or_failed({:error, "s3 config: no database at " <> _}), do: :absent
   defp absent_or_failed(_result), do: :failed
@@ -154,6 +172,8 @@ defmodule Sediment.S3.Many do
   defp retry?({:error, "s3 store: " <> _}), do: true
   defp retry?({:error, "s3 conflict: " <> _}), do: true
   defp retry?({:error, "s3 writer fenced: " <> _}), do: true
+  # Released, its objects not all deleted: a re-run deletes them.
+  defp retry?({:error, {:leftover, _}}), do: true
   defp retry?(_result), do: false
 
   defp tally(acc, id, {:ok, :no_database}), do: Map.update!(acc, :absent, &[id | &1])
@@ -161,7 +181,18 @@ defmodule Sediment.S3.Many do
   defp tally(acc, id, {:ok, %{current: nil, retained: retained}}) when retained == %{},
     do: Map.update!(acc, :unencrypted, &[id | &1])
 
-  defp tally(acc, id, {:ok, %{current: current, retained: retained}}) do
+  defp tally(acc, id, {:ok, %{current: current, retained: retained} = census}) do
+    acc =
+      case census do
+        %{fingerprints: fingerprints} when fingerprints != %{} ->
+          acc
+          |> put_in([:fingerprints, id], fingerprints)
+          |> put_in([:ciphers, id], Map.get(census, :ciphers, %{}))
+
+        _ ->
+          acc
+      end
+
     acc =
       if current,
         do: add(acc, current, :current, id),
@@ -201,7 +232,7 @@ defmodule Sediment.S3.Many do
       results
       |> Enum.sort_by(fn {target, _} -> target.index end)
       |> Enum.reduce(acc, fn {target, result}, acc ->
-        case outcome.(result) do
+        case outcome.(result, Map.get(target, :earlier, [])) do
           :failed -> Map.update!(acc, :failed, &[{target.id, failure(target, result)} | &1])
           kind -> Map.update!(acc, kind, &[target.id | &1])
         end
@@ -230,6 +261,17 @@ defmodule Sediment.S3.Many do
   # around:'s own {:error, reason} (a refusal of its own), else {:error,
   # :not_run}; with the results of the attempts before the last.
   defp attempt(target, opts, op) do
+    with {:ok, ring} <- ring(target, opts[:encryption]),
+         :proceed <- precheck(target, ring, opts[:precheck]) do
+      # The ring resolved once, before around:.
+      around(target, Keyword.put(opts, :encryption, ring), op)
+    else
+      {:done, result} -> {result, []}
+      {:error, _} = failed -> {failed, []}
+    end
+  end
+
+  defp around(target, opts, op) do
     case opts[:around] do
       nil ->
         attempts(target, opts, op)
@@ -286,6 +328,111 @@ defmodule Sediment.S3.Many do
   end
 
   defp ring(_target, ring), do: {:ok, ring}
+
+  # Before around: (which may close the database), the manifest read as a
+  # census reads it, without the lease: a target that needs nothing is
+  # reported without around:, and one whose ring can't open it (invalid by
+  # the native rules, or another cipher or key material under a recorded
+  # id) fails before it, not retried. Advisory: anything else, or a read
+  # that fails, goes to the operation, which decides under the lease. A
+  # stale read is safe: a key never becomes current again without
+  # `allow_reuse` (A3), so a manifest naming the target key means the
+  # rekey landed and no later state undoes it; and a release only removes
+  # epochs, so a key no epoch is under stays so.
+  #
+  # An id given as an atom, as the operation takes it; anything else goes
+  # to the operation, which refuses it (by type, never by value).
+  defp precheck(target, ring, {kind, id}) when is_atom(id) and id not in [nil, true, false],
+    do: precheck(target, ring, {kind, Atom.to_string(id)})
+
+  defp precheck(_target, _ring, {_kind, id}) when not is_binary(id) and id != nil,
+    do: :proceed
+
+  defp precheck(target, ring, {kind, id}) when kind in [:rekey, :release] do
+    with {:ok, %{current: current} = census} when is_binary(current) <-
+           S3.key_census(target.s3),
+         %{} = ring <- Keys.normalize(ring) do
+      # A rekey's target as the native code picks it: the ring's active
+      # key, else its first.
+      to = if kind == :rekey, do: id || ring.active || first_id(ring), else: current
+      {ring, keys} = ring_keys(ring, Enum.uniq([current, to]))
+      refusal(ring, keys, census) || verdict(kind, id, {current, to, keys}, census, target)
+    else
+      _ -> :proceed
+    end
+  rescue
+    _ -> :proceed
+  end
+
+  defp precheck(_target, _ring, nil), do: :proceed
+
+  defp first_id(ring), do: with({id, _, _} <- List.first(ring.keys), do: id)
+
+  # The ring's fingerprints under each of `ids` it holds (key_for asked
+  # for those it lacks), and the ring with them.
+  defp ring_keys(ring, ids) do
+    Enum.reduce(ids, {ring, %{}}, fn id, {ring, keys} ->
+      case Keys.fingerprint(ring, id) do
+        {ring, nil} -> {ring, keys}
+        {ring, fp} -> {ring, Map.put(keys, id, fp)}
+      end
+    end)
+  end
+
+  # The ring invalid by the rules every open applies, or holding, under an
+  # id the manifest records, a key of another cipher (as manifests name
+  # ciphers) or other material.
+  defp refusal(ring, keys, census) do
+    case Keys.validate(ring) do
+      {:error, reason} ->
+        {:done, {:error, "s3 config: the ring can't open this database: #{reason}"}}
+
+      {:ok, ciphers} ->
+        Enum.find_value(keys, fn {id, fp} -> other_key({id, {fp, ciphers[id]}}, census) end)
+    end
+  end
+
+  defp other_key({id, {fp, cipher}}, census) do
+    recorded_cipher = census |> Map.get(:ciphers, %{}) |> Map.get(id)
+    recorded_fp = census.fingerprints[id]
+
+    cond do
+      other?(cipher, recorded_cipher) -> {:done, other_cipher(id, cipher, recorded_cipher)}
+      other?(fp, recorded_fp) -> {:done, other_material(id, fp, recorded_fp)}
+      true -> nil
+    end
+  end
+
+  # Under the target key, with the ring's key the recorded one: done.
+  defp verdict(:rekey, _id, {current, to, keys}, _census, _target) do
+    if to == current and is_map_key(keys, current), do: {:done, {:ok, :current}}, else: :proceed
+  end
+
+  # No epoch under the key, and nothing left: done.
+  defp verdict(:release, key_id, {current, _to, _keys}, census, target) do
+    with true <- current != key_id and not is_map_key(census.retained, key_id),
+         {:ok, %{objects: 0}} <- S3.orphans(target.s3) do
+      {:done, {:ok, %{key: Keys.shown(key_id), epochs: []}}}
+    else
+      _ -> :proceed
+    end
+  end
+
+  # The ring's value and the manifest's for an id, both known, differ.
+  defp other?(ring, recorded), do: ring != nil and recorded != nil and ring != recorded
+
+  defp other_cipher(id, ring_cipher, recorded_cipher),
+    do:
+      {:error,
+       "s3 config: the ring's key #{Keys.shown(id)} is for #{Keys.shown(ring_cipher)}, but " <>
+         "the database records #{Keys.shown(id)} under #{Keys.shown(recorded_cipher)}"}
+
+  defp other_material(id, ring_fp, recorded_fp),
+    do:
+      {:error,
+       "s3 config: the ring's key #{Keys.shown(id)} (fingerprint #{ring_fp}) is not the key " <>
+         "the database records under #{Keys.shown(id)} (fingerprint #{recorded_fp}): the " <>
+         "ring holds other key material under that id"}
 
   # The last result, and those before it.
   defp retrying(target, ring, op, {attempts, backoff} = retries, earlier) do
@@ -417,7 +564,7 @@ defmodule Sediment.S3.Many do
     for name <- [:around, :on_result, :stop_on], do: function!(opts, name, 2, call)
     function!(opts, :check, 1, call)
 
-    for name <- [:force, :allow_reuse],
+    for name <- [:force, :allow_reuse, :keep_working_copy],
         Keyword.has_key?(opts, name),
         not is_boolean(opts[name]),
         do: raise(ArgumentError, "#{call}: #{inspect(name)} must be true or false")

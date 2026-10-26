@@ -160,6 +160,22 @@ pub fn error_term<'a>(env: Env<'a>, err: &S3Error) -> Term<'a> {
             ),
         )
             .encode(env),
+        S3Error::Leftover { epochs, objects } => {
+            let pairs = [
+                ("epochs", epochs.encode(env)),
+                ("objects", objects.encode(env)),
+                ("message", err.to_string().encode(env)),
+            ]
+            .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v));
+            match Term::map_from_pairs(env, &pairs) {
+                Ok(map) => (
+                    crate::atoms::error(),
+                    (Atom::from_str(env, "leftover").unwrap(), map),
+                )
+                    .encode(env),
+                Err(_) => error_tuple(env, describe(err)),
+            }
+        }
         other => error_tuple(env, describe(other)),
     }
 }
@@ -359,6 +375,40 @@ fn s3_flush_snapshot<'a>(env: Env<'a>, res: ResourceArc<ConnRes>) -> Term<'a> {
     })
 }
 
+/// A restore target, as `Sediment.S3.restore/3` passes it; `None` for any
+/// other term (never the latest state in its place: a point-in-time restore
+/// answered with the newest state is a wrong answer).
+fn restore_target(term: Term) -> Option<Target> {
+    if term.atom_to_string().ok().as_deref() == Some("latest") {
+        return Some(Target::Latest);
+    }
+    let items = rustler::types::tuple::get_tuple(term).ok()?;
+    let (tag, numbers) = items.split_first()?;
+    let numbers = numbers
+        .iter()
+        .map(|n| n.decode::<u64>().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    let epoch = |start| match numbers[..] {
+        [seq] => Some(Target::Epoch {
+            seq,
+            generation: None,
+            start,
+        }),
+        [seq, generation] => Some(Target::Epoch {
+            seq,
+            generation: Some(generation),
+            start,
+        }),
+        _ => None,
+    };
+    match (tag.atom_to_string().ok()?.as_str(), &numbers[..]) {
+        ("time", [ms]) => Some(Target::Time(*ms)),
+        ("epoch", _) => epoch(false),
+        ("epoch_start", _) => epoch(true),
+        _ => None,
+    }
+}
+
 /// Restores into a standalone local file without the lease (point-in-time
 /// restore with a `{:epoch, n}` or `{:time, unix_ms}` target).
 #[rustler::nif(schedule = "DirtyIo")]
@@ -373,13 +423,12 @@ fn s3_restore<'a>(
         Ok(config) => config,
         Err(reason) => return error_tuple(env, reason),
     };
-    let target = match target.decode::<(Atom, u64)>() {
-        Ok((tag, n)) => match tag.to_term(env).atom_to_string().as_deref() {
-            Ok("epoch") => Target::Epoch(n),
-            Ok("time") => Target::Time(n),
-            _ => return error_tuple(env, "target must be :latest, {:epoch, n} or {:time, ms}"),
-        },
-        Err(_) => Target::Latest,
+    let Some(target) = restore_target(target) else {
+        return error_tuple(
+            env,
+            "restore target must be :latest, {:time, ms}, {:epoch, seq}, {:epoch, seq, \
+             generation}, {:epoch_start, seq} or {:epoch_start, seq, generation}",
+        );
     };
     let _maintenance = crate::conn::hold(
         &path,
@@ -528,6 +577,7 @@ fn s3_exists<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
 
 /// Moves the database to another key of the ring (see `s3::rekey`). Opens of
 /// `path` are serialized with it, as with `open`.
+#[allow(clippy::too_many_arguments)]
 #[rustler::nif(schedule = "DirtyIo")]
 fn s3_rekey<'a>(
     env: Env<'a>,
@@ -537,6 +587,7 @@ fn s3_rekey<'a>(
     to: Option<String>,
     force: bool,
     allow_reuse: bool,
+    keep_working_copy: bool,
 ) -> Term<'a> {
     let config = match config_with_ring(opts, encryption) {
         Ok(config) => config,
@@ -546,8 +597,16 @@ fn s3_rekey<'a>(
         &path,
         crate::conn::Holder::Maintenance("a rekey of this database"),
     );
-    let rekeyed =
-        on_turso_stack(|| s3::rekey(&config, Path::new(&path), to.as_deref(), force, allow_reuse));
+    let rekeyed = on_turso_stack(|| {
+        s3::rekey_with(
+            &config,
+            Path::new(&path),
+            to.as_deref(),
+            force,
+            allow_reuse,
+            keep_working_copy,
+        )
+    });
     let rekeyed = match rekeyed {
         Ok(rekeyed) => rekeyed,
         Err(reason) => return error_tuple(env, reason),
@@ -578,6 +637,7 @@ fn s3_release_key<'a>(
     encryption: Term<'a>,
     key: String,
     force: bool,
+    keep_working_copy: bool,
 ) -> Term<'a> {
     let config = match config_with_ring(opts, encryption) {
         Ok(config) => config,
@@ -587,8 +647,9 @@ fn s3_release_key<'a>(
         &path,
         crate::conn::Holder::Maintenance("a key release of this database"),
     );
-    let released = match on_turso_stack(|| s3::release_key(&config, Path::new(&path), &key, force))
-    {
+    let released = match on_turso_stack(|| {
+        s3::release_key_with(&config, Path::new(&path), &key, force, keep_working_copy)
+    }) {
         Ok(released) => released,
         Err(reason) => return error_tuple(env, reason),
     };
@@ -613,6 +674,99 @@ fn s3_release_key<'a>(
             }
         }
         Err(err) => error_term(env, &err),
+    }
+}
+
+fn string_map<'a>(env: Env<'a>, map: &std::collections::BTreeMap<String, String>) -> Term<'a> {
+    let pairs: Vec<(Term<'a>, Term<'a>)> = map
+        .iter()
+        .map(|(k, v)| (k.encode(env), v.encode(env)))
+        .collect();
+    Term::map_from_pairs(env, &pairs).unwrap_or_else(|_| Term::map_new(env))
+}
+
+/// The objects a writer's garbage collection would delete (see
+/// `s3::orphans`): counted, by key where known.
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_orphans<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match s3::orphans(&config) {
+        Ok(None) => ok_tuple(env, Atom::from_str(env, "no_database").unwrap()),
+        Ok(Some(orphans)) => {
+            let by_key: Vec<(Term<'a>, Term<'a>)> = orphans
+                .by_key
+                .iter()
+                .map(|(id, n)| (id.encode(env), n.encode(env)))
+                .collect();
+            let by_key = Term::map_from_pairs(env, &by_key);
+            let map = by_key.and_then(|by_key| {
+                Term::map_from_pairs(
+                    env,
+                    &[
+                        ("objects", orphans.objects.encode(env)),
+                        ("bytes", orphans.bytes.encode(env)),
+                        ("by_key", by_key),
+                    ]
+                    .map(|(k, v)| (Atom::from_str(env, k).unwrap().encode(env), v)),
+                )
+            });
+            match map {
+                Ok(map) => ok_tuple(env, map),
+                Err(_) => error_tuple(env, "could not build result"),
+            }
+        }
+        Err(err) => error_term(env, &err),
+    }
+}
+
+/// The bytes a rekey (`rekey: true`) or a release at `path` needs free
+/// (see `s3::space_needed_at`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn s3_space_needed<'a>(env: Env<'a>, path: String, opts: Term<'a>, rekey: bool) -> Term<'a> {
+    let config = match decode_config(opts) {
+        Ok(config) => config,
+        Err(reason) => return error_tuple(env, reason),
+    };
+    match s3::space_needed_at(&config, Path::new(&path), rekey) {
+        Ok(Some(bytes)) => ok_tuple(env, bytes),
+        Ok(None) => ok_tuple(env, Atom::from_str(env, "no_database").unwrap()),
+        Err(err) => error_term(env, &err),
+    }
+}
+
+/// Test hook: caps the free space the space checks see (`nil`: none).
+#[rustler::nif]
+fn s3_test_free_space(bytes: Option<u64>) -> rustler::Atom {
+    s3::hook::limit_free_space(bytes);
+    crate::atoms::ok()
+}
+
+/// Whether a key ring (as `Sediment.S3.Keys.native/1` gives it) holds by
+/// the rules every open applies (ids, ciphers, key sizes), without opening
+/// anything: `{:ok, %{id => cipher}}` with each key's cipher as manifests
+/// record it, or the error an open would return.
+#[rustler::nif]
+fn s3_validate_ring<'a>(env: Env<'a>, ring: Term<'a>) -> Term<'a> {
+    match decode_ring(ring) {
+        Ok(Some(decoded)) => {
+            let ids: Vec<(String, String, String)> = ring
+                .map_get(crate::atoms::keys())
+                .and_then(|t| t.decode())
+                .unwrap_or_default();
+            let ciphers: std::collections::BTreeMap<String, String> = ids
+                .into_iter()
+                .filter_map(|(id, _, _)| {
+                    let cipher = decoded.get(&id)?.cipher().to_string();
+                    Some((id, cipher))
+                })
+                .collect();
+            ok_tuple(env, string_map(env, &ciphers))
+        }
+        Ok(None) => ok_tuple(env, Term::map_new(env)),
+        Err(reason) => error_tuple(env, reason),
     }
 }
 
@@ -647,6 +801,14 @@ fn s3_key_census<'a>(env: Env<'a>, opts: Term<'a>) -> Term<'a> {
                     (
                         Atom::from_str(env, "retained").unwrap().encode(env),
                         retained,
+                    ),
+                    (
+                        Atom::from_str(env, "fingerprints").unwrap().encode(env),
+                        string_map(env, &census.fingerprints),
+                    ),
+                    (
+                        Atom::from_str(env, "ciphers").unwrap().encode(env),
+                        string_map(env, &census.ciphers),
                     ),
                 ],
             );

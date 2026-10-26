@@ -662,6 +662,21 @@ pub struct Snapshot {
 /// `path` with `suffix` appended to its file name (`app.db` ->
 /// `app.db.s3-restore`), so databases differing only in their extension
 /// don't share scratch files.
+/// Removes the temporary files a download into `dest` cut short (a killed
+/// VM) left: a snapshot's, a chain's rebuilt image and its staged delta.
+/// Only under the lease (a running download of another process may own
+/// them).
+pub fn remove_download_temps(dest: &FsPath) {
+    for suffix in [
+        ".s3-restore",
+        ".s3-chain",
+        ".s3-chain.s3-restore",
+        ".s3-delta",
+    ] {
+        let _ = std::fs::remove_file(suffixed(dest, suffix));
+    }
+}
+
 fn suffixed(path: &FsPath, suffix: &str) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);

@@ -78,18 +78,38 @@ pub fn still_retained(remote: &Remote, epoch: Epoch) -> Result<bool> {
 pub enum Target {
     /// The current state (the manifest's epoch and all of its log).
     Latest,
-    /// The start of the given epoch (its snapshot), plus its whole log.
-    Epoch(u64),
+    /// The retained epoch `seq` (of `generation`, when given). The whole
+    /// epoch, its snapshot plus all of its log: the state as the next epoch
+    /// began, or the live state for the current epoch. With `start`, its
+    /// snapshot alone: the state at its start.
+    Epoch {
+        seq: u64,
+        generation: Option<u64>,
+        start: bool,
+    },
     /// The state as of this unix time in ms: the newest retained epoch that
     /// started by then, plus its frames that had landed by then.
     Time(u64),
 }
 
-/// A retained epoch to restore, and an optional cutoff for its log.
+impl Target {
+    /// The whole epoch `seq`.
+    pub fn epoch(seq: u64) -> Target {
+        Target::Epoch {
+            seq,
+            generation: None,
+            start: false,
+        }
+    }
+}
+
+/// A retained epoch to restore, an optional cutoff for its log, and whether
+/// to leave its log out (its snapshot alone).
 #[derive(Debug, Clone)]
 pub struct Point {
     pub record: EpochRecord,
     pub cutoff_ms: Option<u64>,
+    pub snapshot_only: bool,
 }
 
 /// The retained epoch a restore of `target` uses. A time is restored from
@@ -106,7 +126,12 @@ pub fn choose(manifest: &Manifest, target: Target) -> Result<Point> {
     };
     let (record, cutoff_ms) = match target {
         Target::Latest => (Some(manifest.current()), None),
-        Target::Epoch(seq) => (pick(&|r| r.epoch.seq == seq), None),
+        Target::Epoch {
+            seq, generation, ..
+        } => (
+            pick(&|r| r.epoch.seq == seq && generation.is_none_or(|g| r.epoch.generation == g)),
+            None,
+        ),
         Target::Time(at) => (pick(&|r| r.covers(at)), Some(at)),
     };
     let record = record.ok_or_else(|| match target {
@@ -126,12 +151,26 @@ pub fn choose(manifest: &Manifest, target: Target) -> Result<Point> {
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
-        _ => S3Error::Config(format!(
-            "{target:?} is not retained (retained epochs: {:?}); raise retain_epochs",
-            manifest.retained().map(|r| r.epoch.seq).collect::<Vec<_>>()
+        Target::Epoch {
+            seq, generation, ..
+        } => S3Error::Config(format!(
+            "epoch {} is not retained (retained epochs: [{}]); raise retain_epochs",
+            generation.map_or(seq.to_string(), |g| Epoch { seq, generation: g }
+                .to_string()),
+            manifest
+                .retained()
+                .map(|r| r.epoch.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
+        Target::Latest => S3Error::Corrupt("the manifest names no current epoch".into()),
     })?;
-    Ok(Point { record, cutoff_ms })
+    let snapshot_only = matches!(target, Target::Epoch { start: true, .. });
+    Ok(Point {
+        record,
+        cutoff_ms,
+        snapshot_only,
+    })
 }
 
 /// Downloads and verifies the segments of `epoch` past `start`. With a cutoff,
@@ -200,6 +239,7 @@ pub fn restore(
     let point = Point {
         record: manifest.current(),
         cutoff_ms: None,
+        snapshot_only: false,
     };
     restore_point(remote, &point, db_path, concurrency)
 }
@@ -227,6 +267,7 @@ pub fn restore_and_seal(
     let point = Point {
         record: manifest.current(),
         cutoff_ms: None,
+        snapshot_only: false,
     };
     for _ in 0..5 {
         let (segments, log) = fetch_log_from(
@@ -276,6 +317,7 @@ pub fn restore_from(
     let point = Point {
         record: manifest.current(),
         cutoff_ms: None,
+        snapshot_only: false,
     };
     restore_point_from(remote, &point, db_path, concurrency, start)
 }
@@ -297,13 +339,17 @@ fn restore_point_from(
     concurrency: usize,
     start: Option<(usize, &Path)>,
 ) -> Result<LogState> {
-    let (segments, state) = fetch_log_from(
-        remote,
-        point.record.epoch,
-        LogState::default(),
-        point.cutoff_ms,
-        concurrency,
-    )?;
+    let (segments, state) = if point.snapshot_only {
+        (Vec::new(), LogState::default())
+    } else {
+        fetch_log_from(
+            remote,
+            point.record.epoch,
+            LogState::default(),
+            point.cutoff_ms,
+            concurrency,
+        )?
+    };
     install(remote, point, db_path, &segments, start)?;
     Ok(state)
 }

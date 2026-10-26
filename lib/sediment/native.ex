@@ -48,6 +48,9 @@ defmodule Sediment.Native do
   @spec start_closing(db()) :: :ok
   def start_closing(_conn), do: :erlang.nif_error(:not_loaded)
 
+  @spec closing(db()) :: boolean()
+  def closing(_conn), do: :erlang.nif_error(:not_loaded)
+
   @spec interrupt(db()) :: :ok | {:error, reason()}
   def interrupt(_conn), do: :erlang.nif_error(:not_loaded)
 
@@ -193,22 +196,45 @@ defmodule Sediment.Native do
   @spec s3_restore(
           String.t(),
           keyword() | map(),
-          :latest | {:epoch | :time, non_neg_integer()},
+          :latest
+          | {:epoch | :epoch_start | :time, non_neg_integer()}
+          | {:epoch | :epoch_start, non_neg_integer(), non_neg_integer()},
           ring()
         ) :: {:ok, map()} | {:error, reason()}
   def s3_restore(_path, _opts, _target, _encryption), do: :erlang.nif_error(:not_loaded)
 
-  @spec s3_rekey(String.t(), keyword() | map(), ring(), String.t() | nil, boolean(), boolean()) ::
-          {:ok, map() | :current} | {:error, reason()}
-  def s3_rekey(_path, _opts, _encryption, _to, _force, _allow_reuse),
+  @spec s3_rekey(
+          String.t(),
+          keyword() | map(),
+          ring(),
+          String.t() | nil,
+          boolean(),
+          boolean(),
+          boolean()
+        ) :: {:ok, map() | :current} | {:error, reason()}
+  def s3_rekey(_path, _opts, _encryption, _to, _force, _allow_reuse, _keep_working_copy),
     do: :erlang.nif_error(:not_loaded)
 
-  @spec s3_release_key(String.t(), keyword() | map(), ring(), String.t(), boolean()) ::
+  @spec s3_release_key(String.t(), keyword() | map(), ring(), String.t(), boolean(), boolean()) ::
           {:ok, map()} | {:error, reason()}
-  def s3_release_key(_path, _opts, _encryption, _key, _force), do: :erlang.nif_error(:not_loaded)
+  def s3_release_key(_path, _opts, _encryption, _key, _force, _keep_working_copy),
+    do: :erlang.nif_error(:not_loaded)
 
   @spec s3_key_census(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
   def s3_key_census(_opts), do: :erlang.nif_error(:not_loaded)
+
+  @spec s3_validate_ring(map() | nil) :: {:ok, %{String.t() => String.t()}} | {:error, reason()}
+  def s3_validate_ring(_ring), do: :erlang.nif_error(:not_loaded)
+
+  @spec s3_orphans(keyword() | map()) :: {:ok, map() | :no_database} | {:error, reason()}
+  def s3_orphans(_opts), do: :erlang.nif_error(:not_loaded)
+
+  @spec s3_space_needed(String.t(), keyword() | map(), boolean()) ::
+          {:ok, non_neg_integer() | :no_database} | {:error, reason()}
+  def s3_space_needed(_path, _opts, _rekey), do: :erlang.nif_error(:not_loaded)
+
+  @spec s3_test_free_space(non_neg_integer() | nil) :: :ok
+  def s3_test_free_space(_bytes), do: :erlang.nif_error(:not_loaded)
 
   @doc false
   # Test hook at a point of a rekey or key release (see the native s3::hook).
@@ -256,4 +282,7 @@ defmodule Sediment.Native do
   # Test hook: makes the next step on `conn` panic inside the NIF's guard.
   @spec debug_panic_next_step(db()) :: :ok
   def debug_panic_next_step(_conn), do: :erlang.nif_error(:not_loaded)
+
+  @spec debug_close_before_status(db()) :: :ok
+  def debug_close_before_status(_conn), do: :erlang.nif_error(:not_loaded)
 end

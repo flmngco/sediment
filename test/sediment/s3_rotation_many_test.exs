@@ -348,13 +348,18 @@ defmodule Sediment.S3RotationManyTest do
     at_once = most_at_once()
     querier = slowest_query(dir)
 
+    # The helper exits during the rekey; around: returns once it is gone
+    # (its exit signal delivered, whatever the load).
     around = fn _target, rekey ->
-      spawn_link(fn ->
-        Process.sleep(5)
-        exit(:tenant_worker_failed)
-      end)
+      helper =
+        spawn_link(fn ->
+          Process.sleep(5)
+          exit(:tenant_worker_failed)
+        end)
 
-      rekey.()
+      result = rekey.()
+      wait_dead(helper)
+      result
     end
 
     report =
@@ -408,11 +413,138 @@ defmodule Sediment.S3RotationManyTest do
     assert %{failed: []} = S3.rekey_many(targets, encryption: ring(["r2", "r1"]))
   end
 
+  defp wait_dead(pid) do
+    if Process.alive?(pid), do: Process.sleep(1) && wait_dead(pid)
+  end
+
   defp eventually(fun, tries \\ 100) do
     cond do
       fun.() -> true
       tries == 1 -> false
       true -> Process.sleep(200) && eventually(fun, tries - 1)
+    end
+  end
+
+  # The pre-check: a target that needs nothing is reported without around:
+  # (which would close it for nothing), one whose ring holds other key
+  # material under a recorded id fails before it.
+  test "a re-run calls around: only for the targets that need it", %{base: base, dir: dir} do
+    targets = [t1, t2, _t3] = tenants(3, base, dir)
+    test = self()
+
+    around = fn target, run ->
+      send(test, {:around, target.id})
+      run.()
+    end
+
+    assert %{rekeyed: ["t1", "t2"]} =
+             S3.rekey_many([t1, t2], encryption: ring(["r2", "r1"]), around: around)
+
+    flush_around()
+
+    assert %{current: ["t1", "t2"], rekeyed: ["t3"], failed: []} =
+             S3.rekey_many(targets, encryption: ring(["r2", "r1"]), around: around)
+
+    assert flush_around() == ["t3"]
+
+    assert %{current: ["t1", "t2", "t3"]} =
+             S3.rekey_many(targets, encryption: ring(["r2", "r1"]), around: around)
+
+    assert flush_around() == []
+
+    # Released once; a re-run needs nothing.
+    assert %{released: ["t1", "t2", "t3"]} =
+             S3.release_key_many(targets, "r1", encryption: ring(["r2", "r1"]), around: around)
+
+    assert Enum.sort(flush_around()) == ["t1", "t2", "t3"]
+
+    assert %{unchanged: ["t1", "t2", "t3"], failed: []} =
+             S3.release_key_many(targets, "r1", encryption: ring(["r2", "r1"]), around: around)
+
+    assert flush_around() == []
+  end
+
+  test "a ring with other key material under a recorded id fails before around:",
+       %{base: base, dir: dir} do
+    [t1, t2] = tenants(2, base, dir)
+    test = self()
+
+    around = fn target, run ->
+      send(test, {:around, target.id})
+      run.()
+    end
+
+    assert %{rekeyed: ["t1"]} = S3.rekey_many([t1], encryption: ring(["r2", "r1"]))
+
+    # Under r2 already, the ring's r2 isn't the recorded one; under r1, the
+    # ring's r1 isn't.
+    other = String.duplicate("33", 32)
+    wrong_r2 = [keys: [{"r2", other}, {"r1", @k1}], cipher: "aegis256"]
+    wrong_r1 = [keys: [{"r2", @k2}, {"r1", other}], cipher: "aegis256"]
+
+    for {target, ring, id} <- [{t1, wrong_r2, "r2"}, {t2, wrong_r1, "r1"}] do
+      assert %{failed: [{_, message}]} =
+               S3.rekey_many([target], encryption: ring, around: around, backoff: 0)
+
+      assert message =~ "the ring's key #{id} (fingerprint "
+      assert message =~ "is not the key the database records under #{id}"
+      refute message =~ other
+    end
+
+    assert flush_around() == []
+    assert rows(t2, ["r1"]) == ["t2"]
+  end
+
+  # A ring that can't open the database never reads as done: the right
+  # bytes under the right id with another cipher, or a ring an open would
+  # refuse, fail before around:, not retried.
+  test "a ring of another cipher, or an invalid one, fails before around:", %{
+    base: base,
+    dir: dir
+  } do
+    [t1] = tenants(1, base, dir)
+    test = self()
+
+    around = fn target, run ->
+      send(test, {:around, target.id})
+      run.()
+    end
+
+    assert %{rekeyed: ["t1"]} = S3.rekey_many([t1], encryption: ring(["r2", "r1"]))
+
+    other_cipher = [keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aes256gcm"]
+    invalid = [keys: [{"r2", @k2}, {"r1", "abcd"}], cipher: "aegis256"]
+    unknown = [keys: [{"r2", @k2}], cipher: "nope"]
+
+    for {ring, expected} <- [
+          {other_cipher,
+           "the ring's key r2 is for aes256gcm, but the database records r2 under aegis256"},
+          {invalid, "the ring can't open this database: encryption: ring entry 2"},
+          {unknown, "the ring can't open this database: encryption:"}
+        ] do
+      assert %{failed: [{"t1", message}], current: [], rekeyed: []} =
+               S3.rekey_many([t1], encryption: ring, around: around, backoff: 0)
+
+      assert message =~ expected
+      refute message =~ @k2
+
+      assert %{failed: [{"t1", _}], unchanged: []} =
+               S3.release_key_many([t1], "r9", encryption: ring, around: around, backoff: 0)
+    end
+
+    assert flush_around() == []
+
+    # A cipher alias is the same cipher.
+    alias_ring = [keys: [{"r2", @k2}, {"r1", @k1}], cipher: "aegis-256"]
+    assert %{current: ["t1"]} = S3.rekey_many([t1], encryption: alias_ring, around: around)
+    assert flush_around() == []
+  end
+
+  defp flush_around do
+    receive do
+      {:around, id} -> [id | flush_around()]
+    after
+      0 -> []
     end
   end
 

@@ -628,8 +628,11 @@ defmodule Sediment.Connection do
           String.starts_with?(message, "internal turso error:") ->
         {:disconnect, error, state}
 
-      # disconnect/2 closed the handle (the client timed out): the error may
-      # be the interrupt, or a statement finalized with the connection.
+      # The handle is closed: a statement finalized with it is
+      # "connection_closed". Only the call that runs the statement reports
+      # a disconnect's close as "interrupted" (see stopped/3): an error of
+      # a call after it completed (its status, its columns, a COMMIT's
+      # status) says nothing about whether it ran.
       closed?(state) ->
         message = if message == "invalid_statement", do: "connection_closed", else: message
         {:disconnect, %{error | message: message}, state}
@@ -642,6 +645,22 @@ defmodule Sediment.Connection do
   defp disconnect_if_fenced(result), do: result
 
   defp closed?(state), do: match?({:error, _}, Engine.transaction_status(state.db))
+
+  # The error of the call that runs a statement (run_prepared, fetch_all,
+  # a cursor's step). When disconnect/2 closed the connection under it (the
+  # client timed out), it may be the interrupt or, when the close came
+  # first, the statement finalized with the connection: the disconnect
+  # stopped it either way, "interrupted", as the docs promise.
+  defp stopped(reason, statement, state) do
+    message = to_string(reason)
+
+    message =
+      if message in ["invalid_statement", "connection_closed"] and Native.closing(state.db),
+        do: "interrupted",
+        else: message
+
+    %Error{message: message, statement: statement}
+  end
 
   @begin_statements %{
     deferred: "BEGIN TRANSACTION",
@@ -865,7 +884,7 @@ defmodule Sediment.Connection do
         {:cont, %Result{rows: rows, command: :fetch, num_rows: chunk_size}, state}
 
       {:error, reason} ->
-        {:error, %Error{message: to_string(reason), statement: statement}, state}
+        {:error, stopped(reason, statement, state), state}
 
       :busy ->
         {:error, %Error{message: "Database is busy", statement: statement}, state}
@@ -1115,7 +1134,7 @@ defmodule Sediment.Connection do
         execute_stepwise(call, query, params, state)
 
       {:error, reason} ->
-        {:error, %Error{message: to_string(reason), statement: statement}, state}
+        {:error, stopped(reason, statement, state), state}
     end
   rescue
     e in ArgumentError ->
@@ -1205,7 +1224,7 @@ defmodule Sediment.Connection do
         {:ok, rows}
 
       {:error, reason} ->
-        {:error, %Error{message: to_string(reason), statement: statement}, state}
+        {:error, stopped(reason, statement, state), state}
     end
   end
 

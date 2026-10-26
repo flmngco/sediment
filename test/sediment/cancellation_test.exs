@@ -549,6 +549,36 @@ defmodule Sediment.CancellationTest do
       end)
     end
 
+    # The disconnect races the statement: it may close the handle before
+    # the statement sees the interrupt. The caller gets "interrupted"
+    # either way, never the closed handle's error.
+    @tag timeout: 120_000
+    test "a query its timeout stops reports interrupted, whichever comes first" do
+      with_file_db(fn path ->
+        {:ok, conn} = Sediment.start_link(database: path, journal_mode: :wal, pool_size: 1)
+
+        messages =
+          for i <- 1..400 do
+            try do
+              Sediment.query(conn, @long_running_select, [], timeout: 5 + rem(i, 25))
+            catch
+              :exit, _ -> :exit
+            end
+            |> case do
+              {:error, %Sediment.Error{message: message}} -> message
+              {:error, %DBConnection.ConnectionError{}} -> :checkout
+              other -> other
+            end
+          end
+
+        refute Enum.any?(messages, &(&1 in ["connection_closed", "invalid_statement"])),
+               inspect(Enum.frequencies(messages))
+
+        assert "interrupted" in messages
+        GenServer.stop(conn, :normal, 5_000)
+      end)
+    end
+
     @tag timeout: 30_000
     test "pool recovers when query is stuck in busy handler" do
       with_file_db(fn path ->

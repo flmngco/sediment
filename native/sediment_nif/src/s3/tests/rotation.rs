@@ -9,7 +9,7 @@ use super::{config, key_as, manifest, open_encrypted, ring, segments, Db, TempDi
 use crate::s3::hook::{self, Action, State};
 use crate::s3::layout::MANIFEST_KEY;
 use crate::s3::remote::Remote;
-use crate::s3::{key_census, rekey, release_key, Rekeyed, S3Config, S3Error, Target};
+use crate::s3::{key_census, orphans, rekey, release_key, Rekeyed, S3Config, S3Error, Target};
 
 /// A writer config with the ring `keys` (`(id, key byte)`, the first active).
 fn keyed(store: &Arc<FaultyStore>, owner: &str, keys: &[(&str, &str)]) -> S3Config {
@@ -275,7 +275,7 @@ fn point_in_time_restore_crosses_a_rekey_with_each_epochs_key() {
         .unwrap()
         .epoch
         .seq;
-    let (rows, key) = restore_rows(&both, &dir.db("p4.db"), Target::Epoch(pinned)).unwrap();
+    let (rows, key) = restore_rows(&both, &dir.db("p4.db"), Target::epoch(pinned)).unwrap();
     assert_eq!((rows.len(), key.as_str()), (1, "r1"));
 }
 
@@ -779,4 +779,204 @@ fn a_key_for_ring_and_a_no_op_rekey_keep_the_copy_warm() {
     assert!(matches!(rekeyed, Ok(Rekeyed::Done { .. })), "{rekeyed:?}");
     let db = downloads_no_snapshot(&store, || open_encrypted(&both, &path).unwrap());
     assert_eq!(rows(&db), ["a"]);
+}
+
+/// Checkpoint images beside a path may be a live writer's in another
+/// process: an open, rekey or release refused by the lease leaves them, and
+/// only one holding the lease removes them.
+#[test]
+fn an_operation_refused_by_the_lease_leaves_the_snapshot_images() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let cfg = seeded(&store, &dir, &["a"]);
+    // A crashed rekey's lease stays held (until its TTL), as another
+    // process's would.
+    let a = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    hook::arm(&a.place(), hook::PUBLISH, Action::Crash);
+    assert!(err_text(rekey(&a, &dir.db("crashed.db"), None, false, false)).contains("crashed"));
+
+    let other = dir.db("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let path = other.join("live.db");
+    let images: Vec<_> = (1..=2)
+        .map(|n| other.join(format!(".live.db.s3-snapshot-{n}")))
+        .collect();
+    for image in &images {
+        std::fs::write(image, b"image").unwrap();
+    }
+
+    let b = keyed(&store, "b", &[("r2", "22"), ("r1", "11")]);
+    let refusals = [
+        err_text(open_encrypted(&b, &path).map(drop)),
+        err_text(rekey(&b, &path, None, false, false)),
+        err_text(release_key(&b, &path, "r1", false)),
+    ];
+    for message in refusals {
+        assert!(message.contains("lease held"), "{message}");
+    }
+    assert!(images.iter().all(|image| image.exists()));
+
+    // The crashed rekey's owner takes over at once.
+    let db = open_encrypted(&cfg, &path).unwrap();
+    drop(db);
+    assert!(!images.iter().any(|image| image.exists()));
+}
+
+/// A rekey killed while running leaves its copy (a database's size) beside
+/// the path: the next open, release or restore there removes it.
+#[test]
+fn a_stale_rekey_copy_is_removed_by_the_next_open_release_or_restore() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    let cfg = seeded(&store, &dir, &["a"]);
+    let plant = |name: &str| {
+        let copy = dir.db(&format!(".{name}.rekey.db"));
+        std::fs::write(&copy, vec![0u8; 4096]).unwrap();
+        copy
+    };
+
+    let copy = plant("w.db");
+    drop(open_encrypted(&cfg, &dir.db("w.db")).unwrap());
+    assert!(!copy.exists());
+
+    let copy = plant("w.db");
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    release_key(&both, &dir.db("w.db"), "r9", false).unwrap();
+    assert!(!copy.exists());
+
+    let copy = plant("r.db");
+    crate::s3::restore_to(&cfg, &dir.db("r.db"), Target::Latest).unwrap();
+    assert!(!copy.exists());
+}
+
+/// A release whose delete fails committed all the same: it reports the
+/// objects left; a re-run deletes them, and returns ok only once none are.
+/// The listing applies the same rule, so it finds what is left.
+#[test]
+fn a_release_whose_delete_fails_reports_the_leftover_and_a_rerun_sweeps_it() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    seeded(&store, &dir, &["a"]);
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    let path = dir.db("r.db");
+    rekey(&both, &path, None, false, false).unwrap();
+    assert_eq!(orphans(&both).unwrap().unwrap().objects, 0);
+
+    store.inject(Op::Delete, "", Fault::Fail, usize::MAX);
+    let (epochs, objects) = match release_key(&both, &path, "r1", false) {
+        Err(S3Error::Leftover { epochs, objects }) => (epochs, objects),
+        other => panic!("{other:?}"),
+    };
+    assert!(!epochs.is_empty() && objects > 0, "{epochs:?} {objects}");
+    let message = S3Error::Leftover {
+        epochs: epochs.clone(),
+        objects,
+    }
+    .to_string();
+    assert!(message.contains("run release_key again"), "{message}");
+    // Released: the manifest no longer retains them.
+    assert!(!census(&both).1.iter().any(|(id, _)| id == "r1"));
+    let listed = orphans(&both).unwrap().unwrap();
+    assert_eq!(listed.objects, objects);
+    // Released epochs' key isn't recorded anywhere any more.
+    assert_eq!(listed.by_key.get(&None), Some(&objects), "{listed:?}");
+
+    // Still failing: the re-run reports what is left, no epoch released.
+    match release_key(&both, &path, "r1", false) {
+        Err(S3Error::Leftover { epochs, objects: n }) => {
+            assert!(epochs.is_empty());
+            assert_eq!(n, objects);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    store.clear_faults();
+    assert!(release_key(&both, &path, "r1", false)
+        .unwrap()
+        .epochs
+        .is_empty());
+    assert_eq!(orphans(&both).unwrap().unwrap().objects, 0);
+    // And a re-run with nothing left is done at once.
+    assert!(release_key(&both, &path, "r1", false).is_ok());
+}
+
+/// An orphan a failed delete left is listed until a writer's collection
+/// deletes it.
+#[test]
+fn a_writers_collection_sweeps_what_orphans_lists() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    seeded(&store, &dir, &["a"]);
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    let path = dir.db("r.db");
+    rekey(&both, &path, None, false, false).unwrap();
+    store.inject(Op::Delete, "", Fault::Fail, usize::MAX);
+    assert!(matches!(
+        release_key(&both, &path, "r1", false),
+        Err(S3Error::Leftover { .. })
+    ));
+    assert!(orphans(&both).unwrap().unwrap().objects > 0);
+    store.clear_faults();
+
+    let db = open_encrypted(&both, &path).unwrap();
+    drop(db);
+    assert_eq!(orphans(&both).unwrap().unwrap().objects, 0);
+}
+
+/// `keep_working_copy: false` removes the copy while the operation still
+/// holds the lease (a switch, a no-op re-run, a release): paused at the
+/// removal, another owner is refused with "lease held", and the files are
+/// still there; once done, they are gone, with no warm sidecar.
+#[test]
+fn a_discarded_working_copy_goes_while_the_lease_is_held() {
+    let store = FaultyStore::new();
+    let dir = TempDir::new();
+    seeded(&store, &dir, &["a"]);
+    let both = keyed(&store, "a", &[("r2", "22"), ("r1", "11")]);
+    let path = dir.db("scratch.db");
+    let sidecar = dir.db(".scratch.db.s3-warm");
+
+    type Run = Box<dyn Fn(&S3Config, &Path) -> Result<(), S3Error> + Send>;
+    let runs: Vec<(&str, Run)> = vec![
+        (
+            "rekey",
+            Box::new(|cfg, path| {
+                crate::s3::rekey_with(cfg, path, None, false, false, false).map(drop)
+            }),
+        ),
+        (
+            "current",
+            Box::new(|cfg, path| {
+                crate::s3::rekey_with(cfg, path, None, false, false, false).map(drop)
+            }),
+        ),
+        (
+            "release",
+            Box::new(|cfg, path| {
+                crate::s3::release_key_with(cfg, path, "r1", false, false).map(drop)
+            }),
+        ),
+    ];
+    for (name, run) in runs {
+        // A no-op downloads nothing: the copy a former run left warm.
+        if name == "current" {
+            std::fs::write(&path, b"copy").unwrap();
+            std::fs::write(&sidecar, b"{}").unwrap();
+        }
+        hook::arm(&both.place(), hook::DISCARD, Action::Pause);
+        let worker = {
+            let (cfg, path) = (both.clone(), path.clone());
+            std::thread::spawn(move || run(&cfg, &path))
+        };
+        while hook::state(&both.place()) != Some(State::Paused) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(path.exists(), "{name}");
+        let other = keyed(&store, "b", &[("r2", "22"), ("r1", "11")]);
+        let message = err_text(open_encrypted(&other, &dir.db("other.db")).map(drop));
+        assert!(message.contains("lease held"), "{name}: {message}");
+        hook::release(&both.place());
+        worker.join().unwrap().unwrap();
+        assert!(!path.exists() && !sidecar.exists(), "{name}");
+    }
 }

@@ -380,6 +380,9 @@ defmodule Sediment.KeyNetTest do
   # can't be reached) and a key in each option, and in the target: no key
   # in the result, a reason, an exception re-raised, or a callback's
   # arguments (the target given back with its :encryption hidden).
+  # Each call reads the unreachable store (about half a second), the
+  # pre-check before around: once more.
+  @tag timeout: 600_000
   test "the functions over many databases never show a key" do
     dir = Temp.path!()
     File.mkdir_p!(dir)
@@ -506,6 +509,47 @@ defmodule Sediment.KeyNetTest do
                encryption: ring(@key),
                check: fn _ -> {:error, {%Held{ring: ring(@key)}, :refused}} end
              )
+  end
+
+  # The ring check the bulk pre-check runs (Keys.validate/1, its NIF):
+  # whatever the ring holds where, no key in its result.
+  test "the ring validation never shows a key" do
+    key = @key
+
+    natives =
+      for shape <- shapes(key),
+          ring <- [
+            %{keys: [{"r1", "aegis256", shape}], active: nil, resolvable: false},
+            %{keys: [{shape, "aegis256", key}], active: nil, resolvable: false},
+            %{keys: [{"r1", shape, key}], active: nil, resolvable: false},
+            %{keys: [{"r1", "aegis256", key}], active: shape, resolvable: false}
+          ],
+          do: ring
+
+    for ring <- natives do
+      text =
+        try do
+          inspect(Sediment.Native.s3_validate_ring(ring), limit: :infinity)
+        rescue
+          e -> Exception.format(:error, e, __STACKTRACE__)
+        end
+
+      refute shows?(text, key), String.slice(text, 0, 300)
+    end
+
+    for shape <- shapes(key) do
+      text =
+        try do
+          shape
+          |> Sediment.S3.Keys.normalize()
+          |> Sediment.S3.Keys.validate()
+          |> inspect(limit: :infinity)
+        rescue
+          e -> Exception.format(:error, e, __STACKTRACE__)
+        end
+
+      refute shows?(text, key), String.slice(text, 0, 300)
+    end
   end
 
   # The callbacks' own failures, each holding `shape`; check: and around:

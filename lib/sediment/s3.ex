@@ -314,15 +314,23 @@ defmodule Sediment.S3 do
   ## Options
 
     * `:at` - a `DateTime`: the state as of that moment.
-    * `:epoch` - an epoch sequence number: the state at the start of that
-      epoch plus its whole log.
+    * `:epoch` - a retained epoch, all of it: its snapshot plus its whole
+      log, which is the state as the next epoch began (or, for the current
+      epoch, the live state). Either its sequence number (an integer), or
+      the epoch as results show it (`info.epoch`, `"SEQ-GENERATION"`),
+      whose generation must match too.
+    * `:epoch_start` - a retained epoch (as for `:epoch`), its snapshot
+      alone: the state at its start (a forced snapshot, see `snapshot/1`,
+      starts an epoch: a restore point).
     * `:encryption` - the key ring of an encrypted database (as its
       `:encryption` open option, holding the key of the epoch restored), or
       `false` for an unencrypted one. Required, see "Encryption".
 
-  Without options, the latest state is restored. Returns `{:ok, info}` with
-  the epoch used, its key's id (`nil` when unencrypted) and how many log
-  frames were replayed.
+  At most one of `:at`, `:epoch` and `:epoch_start`. Without them, the
+  latest state is restored. Any other option, or a target of another form,
+  returns `{:error, reason}` and restores nothing. Returns `{:ok, info}`
+  with the epoch used, its key's id (`nil` when unencrypted) and how many
+  log frames were replayed.
 
   `path` must not exist, and neither may its WAL (`path-wal`) or MVCC log
   (`<path without extension>.db-log`): restore returns
@@ -336,21 +344,68 @@ defmodule Sediment.S3 do
       opts = Keys.options!(opts, "Sediment.S3.restore/3")
       path = to_string(path)
 
-      case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
-        nil -> do_restore(path, s3_opts, opts)
-        existing -> {:error, "restore target exists: #{existing}"}
+      with {:ok, target} <- restore_target(opts),
+           :ok <- restore_path_free(path) do
+        do_restore(path, s3_opts, opts, target)
       end
     end)
   end
 
-  defp do_restore(path, s3_opts, opts) do
-    target =
-      cond do
-        at = opts[:at] -> {:time, DateTime.to_unix(at, :millisecond)}
-        epoch = opts[:epoch] -> {:epoch, epoch}
-        true -> :latest
-      end
+  defp restore_path_free(path) do
+    case Enum.find([path, path <> "-wal", Path.rootname(path) <> ".db-log"], &File.exists?/1) do
+      nil -> :ok
+      existing -> {:error, "restore target exists: #{existing}"}
+    end
+  end
 
+  @restore_options [:at, :epoch, :epoch_start, :encryption]
+  @max_u64 2 ** 64 - 1
+
+  # What to restore, as the NIF takes it; an option it doesn't know, or a
+  # target of the wrong form, is an error (never the latest state instead).
+  # Messages name options, never their values.
+  defp restore_target(opts) do
+    call = "Sediment.S3.restore/3"
+
+    case Enum.find(Keyword.keys(opts), &(&1 not in @restore_options)) do
+      nil ->
+        case Keyword.take(opts, [:at, :epoch, :epoch_start]) do
+          [] -> {:ok, :latest}
+          [at: %DateTime{} = at] -> {:ok, {:time, DateTime.to_unix(at, :millisecond)}}
+          [at: _] -> {:error, "#{call}: :at must be a DateTime"}
+          [{kind, epoch}] -> epoch_target(kind, epoch, call)
+          _ -> {:error, "#{call}: give one of :at, :epoch and :epoch_start"}
+        end
+
+      name ->
+        {:error, "#{call}: unknown option #{Keys.shown_value(name)}"}
+    end
+  end
+
+  defp epoch_target(kind, seq, _call) when is_integer(seq) and seq in 0..@max_u64,
+    do: {:ok, {kind, seq}}
+
+  # The epoch as results show it (`info.epoch`): its sequence number and
+  # generation, which must both match the retained epoch's.
+  defp epoch_target(kind, epoch, call) when is_binary(epoch) do
+    with [_, seq, generation] <- Regex.run(~r/\A(\d{1,20})-(\d{1,20})\z/, epoch),
+         {seq, generation} = {String.to_integer(seq), String.to_integer(generation)},
+         true <- seq <= @max_u64 and generation <= @max_u64 do
+      {:ok, {kind, seq, generation}}
+    else
+      _ -> epoch_error(kind, call)
+    end
+  end
+
+  defp epoch_target(kind, _epoch, call), do: epoch_error(kind, call)
+
+  defp epoch_error(kind, call),
+    do:
+      {:error,
+       "#{call}: #{inspect(kind)} must be an epoch: a sequence number (an integer from 0 " <>
+         "to 2^64 - 1) or an epoch as results show it (\"SEQ-GENERATION\")"}
+
+  defp do_restore(path, s3_opts, opts, target) do
     s3_opts = with_encryption_choice(s3_opts, opts[:encryption])
     ring = Keys.normalize(opts[:encryption])
 
@@ -591,8 +646,11 @@ defmodule Sediment.S3 do
   upload of a full snapshot, all proportional to its size. Opens meanwhile
   get `"s3 lease held ..."` and retry; the rekey renews its lease
   throughout. It needs about twice the database's size free next to `path`
-  (the copy beside it; it refuses to start without), and about 32 bytes of
-  memory per page plus what `integrity_check` takes.
+  (the restore and the copy beside it), and about 32 bytes of memory per
+  page plus what `integrity_check` takes. Before it downloads anything it
+  refuses when less is free than `space_needed/3` says (`"s3 config: rekey
+  needs about N bytes free in DIR ..., only F are"`); `release_key/4` too,
+  for its restore.
 
   ## Options
 
@@ -608,6 +666,13 @@ defmodule Sediment.S3 do
       for a holder known to be gone (a crashed run whose lease you can't
       wait out).
     * `:allow_reuse` - allow a retired key (see above).
+    * `:keep_working_copy` - `false` removes the working copy at `path`
+      (the file, its WAL and log, the warm sidecar) when the rekey
+      succeeds (`:current` too), while it still holds the lease and the
+      file, for a run through a scratch directory that has no use for it.
+      A removal that fails returns an error naming the file (a re-run
+      finds the database current and removes the copy). Default `true`:
+      the copy stays warm under the new key, for the next open at `path`.
 
   Returns `{:ok, %{from: id, to: id, epoch: epoch}}`, `{:ok, :current}` when
   the database is under that key already (nothing is written),
@@ -625,10 +690,11 @@ defmodule Sediment.S3 do
       to = opts[:to] && key_id!(opts[:to], ":to", "rekey/3")
       force = boolean!(opts, :force, "rekey/3")
       allow_reuse = boolean!(opts, :allow_reuse, "rekey/3")
+      keep = boolean!(opts, :keep_working_copy, "rekey/3", true)
       ring = required_ring(opts[:encryption], "rekey/3")
 
       Telemetry.span([:s3, :rekey], %{path: path}, fn ->
-        Keys.run(ring, &Native.s3_rekey(path, s3_opts, &1, to, force, allow_reuse))
+        Keys.run(ring, &Native.s3_rekey(path, s3_opts, &1, to, force, allow_reuse, keep))
       end)
     end)
   end
@@ -640,7 +706,8 @@ defmodule Sediment.S3 do
   `key_census/1` no longer lists the key, and it can leave the ring.
 
   It refuses the current key (rekey first). It is a writer open with a
-  clean close at `path`, with the same lease rules as `rekey/3` (`:force`),
+  clean close at `path`, with the same lease rules as `rekey/3` (`:force`)
+  and its `:keep_working_copy`,
   and needs the `:encryption` ring holding the current key.
 
   This removes what the manifest references. A bucket with versioning
@@ -653,6 +720,22 @@ defmodule Sediment.S3 do
   after an error the release may still happen, so run it again; keep the
   key in the rings until a run returns `{:ok, _}` and the census no longer
   lists it.
+
+  When deleting the objects fails, the release still happened (the manifest
+  no longer retains the epochs), but their objects, encrypted under the
+  key, are left in the store: it returns `{:error, {:leftover, %{epochs:
+  [epoch], objects: n, message: "s3 leftover: released epochs ...; n
+  objects are left (a delete failed): run release_key again"}}}`. A re-run
+  for the key deletes what is left, with the rule a writer's garbage
+  collection uses (see `orphans/1`), and returns `{:ok, _}` only once none
+  is (`epochs: []` then, as they were released before).
+
+  Orphans can't be told apart by key, so the sweep covers every object the
+  manifest no longer references, whatever its key: any one of them that
+  can't be deleted (an object lock or retention period, a legal hold, a
+  bucket policy denying deletes on part of the prefix) blocks `{:ok, _}`
+  for every release of that database. `orphans/1` lists them; the fix is
+  in the bucket (lift the lock, or delete them when it allows).
   """
   @spec release_key(Path.t(), keyword() | map(), String.t(), keyword()) ::
           {:ok, %{key: String.t(), epochs: [String.t()]}} | {:error, term()}
@@ -662,18 +745,19 @@ defmodule Sediment.S3 do
       path = to_string(path)
       key_id = key_id!(key_id, "the key id", "release_key/4")
       force = boolean!(opts, :force, "release_key/4")
+      keep = boolean!(opts, :keep_working_copy, "release_key/4", true)
       ring = required_ring(opts[:encryption], "release_key/4")
 
       Telemetry.span([:s3, :release_key], %{path: path}, fn ->
-        Keys.run(ring, &Native.s3_release_key(path, s3_opts, &1, key_id, force))
+        Keys.run(ring, &Native.s3_release_key(path, s3_opts, &1, key_id, force, keep))
       end)
     end)
   end
 
   # Checked here, with a fixed message: a value the NIF can't decode raises
   # a bare badarg.
-  defp boolean!(opts, name, call) do
-    case Keyword.get(opts, name, false) do
+  defp boolean!(opts, name, call, default \\ false) do
+    case Keyword.get(opts, name, default) do
       value when is_boolean(value) -> value
       _ -> raise ArgumentError, "Sediment.S3.#{call}: #{inspect(name)} must be true or false"
     end
@@ -706,20 +790,138 @@ defmodule Sediment.S3 do
   neither current nor retained. It reads `manifest.json` only: no lease,
   no writes.
 
-  Returns `{:ok, %{current: id | nil, retained: %{id => [epoch]}}}`
-  (`current: nil` for an unencrypted database), `{:ok, :no_database}`
-  when the location holds none (also after `destroy/2`), or
-  `{:error, reason}`.
+  Returns `{:ok, %{current: id | nil, retained: %{id => [epoch]},
+  fingerprints: %{id => fingerprint}, ciphers: %{id => cipher}}}`
+  (`current: nil` for an unencrypted database), `{:ok, :no_database}` when
+  the location holds none (also after `destroy/2`), or `{:error, reason}`.
+  `fingerprints` and `ciphers` have every key listed, by its fingerprint's
+  first 16 hex digits (see "Encryption") and the cipher recorded with it:
+  with `check_ring/2`, whether a ring holds the right keys, without
+  opening.
 
   It is an observation, not a resolution: a rekey or release that returned
   an error may still switch the manifest after the census read it. Only a
   re-run of the operation resolves that.
   """
   @spec key_census(keyword() | map()) ::
-          {:ok, %{current: String.t() | nil, retained: %{String.t() => [String.t()]}}}
+          {:ok,
+           %{
+             current: String.t() | nil,
+             retained: %{String.t() => [String.t()]},
+             fingerprints: %{String.t() => String.t()}
+           }}
           | {:ok, :no_database}
           | {:error, term()}
   def key_census(s3_opts), do: Keys.scrubbed(fn -> Native.s3_key_census(s3_opts) end)
+
+  @doc """
+  Whether the ring `encryption` holds the key material a database (or a
+  fleet) needs: for every key a `key_census/1` result lists (current and
+  retained), the ring's key under that id must have the recorded
+  fingerprint and cipher (an alias of the cipher, `"aegis-256"`, is the
+  same), and the ring must hold by the rules every open applies. The boot-time check for "the right key under the right id",
+  without opening anything. A ring with `key_for` is asked for the ids it
+  lacks.
+
+  `census` is a `key_census/1` result (`{:ok, census}` or the map) or a
+  `key_census_many/2` result. Returns `:ok`, or `{:error, [{id, :missing |
+  :mismatch}]}`: the ids the ring lacks, or holds other key material under.
+  The census of an unencrypted database, or of none, needs no key.
+  """
+  @spec check_ring({:ok, map()} | map(), keyword()) ::
+          :ok | {:error, [{String.t(), :missing | :mismatch}]}
+  def check_ring({:ok, census}, encryption), do: check_ring(census, encryption)
+
+  def check_ring(census, encryption) do
+    Keys.scrubbed(fn ->
+      ring = Keys.normalize(encryption)
+      Keys.check_ring(census_fingerprints(census), ring)
+    end)
+  end
+
+  # Every (id, fingerprint) a census needs.
+  defp census_fingerprints(:no_database), do: []
+
+  defp census_fingerprints(%{fingerprints: fingerprints, targets: _} = census) do
+    ciphers = Map.get(census, :ciphers, %{})
+
+    Enum.flat_map(fingerprints, fn {target, by_key} ->
+      census_fingerprints(%{fingerprints: by_key, ciphers: Map.get(ciphers, target, %{})})
+    end)
+    |> Enum.uniq()
+  end
+
+  defp census_fingerprints(%{fingerprints: fingerprints} = census) do
+    ciphers = Map.get(census, :ciphers, %{})
+    for {id, fp} <- fingerprints, do: {id, fp, Map.get(ciphers, id)}
+  end
+
+  defp census_fingerprints(_other),
+    do:
+      raise(
+        ArgumentError,
+        "Sediment.S3.check_ring/2 expects a key_census/1 or key_census_many/2 result"
+      )
+
+  @doc """
+  The bytes a `rekey/3` (`:rekey`) or `release_key/4` (`:release`) at
+  `path` needs free in its directory, as they check it before they download
+  anything (refusing with `"s3 config: rekey needs about N bytes free in
+  DIR ..., only F are"`): the restore's peak, unless the working copy at
+  `path` is warm (a full snapshot's size; for a chain of deltas, the most
+  that a rebuilt image and the delta staged beside it take at once), plus
+  the current epoch's log; for a rekey its re-encrypted copy (the snapshot
+  plus that log); and a margin (a tenth, and 64 MiB).
+
+  It is one operation's need. The check counts the rekeys and releases
+  running in this VM too: each reserves its need until its restore and
+  copy are done, and a check refuses unless the free space holds its need
+  besides theirs (`"..., and M reserved by the others running in this
+  VM"`). Operations of other VMs sharing the volume are not counted. A warm
+  copy the open then finds unusable is downloaded after all: the copy's
+  own check after the restore refuses that rekey if the space is gone.
+  Temporary files of a download a killed VM cut short are removed under
+  the lease before the check, so they never count.
+
+  It reads the manifest and lists the epoch's log: no lease, no writes.
+  Returns `{:ok, bytes}`, `{:ok, :no_database}` or `{:error, reason}`.
+  """
+  @spec space_needed(Path.t(), keyword() | map(), :rekey | :release) ::
+          {:ok, non_neg_integer() | :no_database} | {:error, term()}
+  def space_needed(path, s3_opts, operation) when operation in [:rekey, :release] do
+    Keys.scrubbed(fn ->
+      Native.s3_space_needed(to_string(path), s3_opts, operation == :rekey)
+    end)
+  end
+
+  def space_needed(_path, _s3_opts, _operation),
+    do: raise(ArgumentError, "Sediment.S3.space_needed/3: the operation is :rekey or :release")
+
+  @doc """
+  The objects of the database at the S3 location in `s3_opts` that its
+  manifest no longer references: what a writer's garbage collection would
+  delete, by the same rule, read without the lease. Informational: a
+  writer's collection (at each open, after each new epoch) deletes them,
+  and a re-run of `release_key/4` does for a release that left some (see
+  its `:leftover` error).
+
+  Returns `{:ok, %{objects: n, bytes: b, by_key: %{id | nil => n}}}`,
+  `{:ok, :no_database}` or `{:error, reason}`. An object's key is known
+  only in some cases (objects don't record it, and the manifest forgets a
+  released epoch): `nil` counts the others.
+
+  The rule: an object of an epoch older than the current one, of a lease
+  generation at most the manifest's, that no retained record names and, for
+  a snapshot, in no retained snapshot chain. So never a live writer's next
+  snapshot or log (uploaded before its manifest names them), nor the base
+  snapshots of a delta.
+  """
+  @spec orphans(keyword() | map()) ::
+          {:ok,
+           %{objects: non_neg_integer(), bytes: non_neg_integer(), by_key: map()}
+           | :no_database}
+          | {:error, term()}
+  def orphans(s3_opts), do: Keys.scrubbed(fn -> Native.s3_orphans(s3_opts) end)
 
   @doc """
   Runs `rekey/3` over many databases, a few at a time, and reports on every
@@ -747,18 +949,52 @@ defmodule Sediment.S3 do
       result followed by a refusal may still have switched);
     * `skipped` - not started, after `:stop_on` stopped the run.
 
+  **Pre-check.** Before `:around`, each target's manifest is read (as
+  `key_census/1` does, without the lease): a database under the target
+  key already, with the ring's key under that id the recorded one (by
+  fingerprint and cipher), is reported `current` without calling
+  `:around`, so a re-run pauses no database that is done. One whose ring
+  can't open it fails before `:around`, not retried: a ring an open would
+  refuse (`"s3 config: the ring can't open this database: ..."`), or one
+  holding, under its current id or under the target id where the manifest
+  records it, a key of another cipher (`"... the ring's key r2 is for
+  aes256gcm, but the database records r2 under aegis256"`) or other key
+  material (`"... the ring's key r2 (fingerprint ...) is not the key the
+  database records under r2 (fingerprint ...) ..."`). Anything else goes
+  to the rekey, which decides under the lease (the check only reads).
+
   A re-run finds the rekeyed ones `current`, so running it again until
   `failed` is empty finishes the rotation (see "Only `{:ok, _}` is an
-  outcome" in `rekey/3`: keep both keys in every ring until then). **The
-  rotation is finished only when `failed` is empty and `absent` holds only
-  databases you know don't exist**: a wrong bucket or prefix reads as
-  absent, with nothing failed. Take the targets from the application's own
+  outcome" in `rekey/3`: keep both keys in every ring until then). It
+  calls no `:around` for a target that needs nothing: a database an earlier
+  run left closed (failed with `{:around_failed, ...}` or `{:crashed,
+  ...}`) stays closed unless you reopen it, for example on every result:
+
+      S3.rekey_many(targets,
+        encryption: ring,
+        around: fn t, rekey ->
+          :ok = MyApp.close(t.id)
+
+          try do
+            rekey.()
+          after
+            :ok = MyApp.open(t.id)
+          end
+        end,
+        # whatever the result, open again (a no-op for an open database)
+        on_result: fn t, _result -> MyApp.ensure_open(t.id) end
+      )
+
+  **The rotation is finished only when `failed` is empty and `absent`
+  holds only databases you know don't exist**: a wrong bucket or prefix
+  reads as absent, with nothing failed. Take the targets from the application's own
   list of databases, and check with `key_census_many/2` and
   `removable?(census, old_id, current: new_id)` before a key leaves the
   rings.
 
   **Retries.** A result that may still change (`{:error, {:fenced, _}}`,
-  `{:error, {:indeterminate, _}}`, an S3 store error) is retried up to
+  `{:error, {:indeterminate, _}}`, an S3 store error, a release's
+  `{:error, {:leftover, _}}`) is retried up to
   `:attempts` times, waiting `:backoff` ms, then twice that, and so on. A
   refusal (the database open in this VM, the lease held, a retired or
   missing key, a corrupt database) is reported at once: retrying it changes
@@ -769,9 +1005,10 @@ defmodule Sediment.S3 do
   stopped).
 
   **Cost.** Each rekey downloads the database (nothing for a warm copy at
-  `path`), needs about twice its size free next to `path`, and uploads a
-  full snapshot under the new key: with `max_concurrency: n`, n times that
-  disk at once, and the egress and S3 requests (one snapshot upload, its
+  `path`), needs about twice its size free next to `path` (see
+  `space_needed/3`, which each rekey checks before downloading, counting
+  those running in this VM), and uploads a full snapshot under the new
+  key: with `max_concurrency: n`, n times that disk at once, and the egress and S3 requests (one snapshot upload, its
   multipart parts, a few manifest and lease requests per database) of the
   whole fleet. The database is unavailable to writers meanwhile.
 
@@ -787,7 +1024,12 @@ defmodule Sediment.S3 do
     * `:encryption` (required) - the key ring for every target, or a
       function of the target (as given) returning its ring, for per-tenant
       rings or `key_for`.
-    * `:to`, `:force`, `:allow_reuse` - as for `rekey/3`, for every target.
+    * `:to`, `:force`, `:allow_reuse`, `:keep_working_copy` - as for
+      `rekey/3`, for every target. A target the pre-check reports
+      `current` runs nothing, and keeps a copy it has: a re-run doesn't
+      remove a copy that an earlier run's failed removal, or a VM stopped
+      after the switch, left at `path`. Run `rekey/3` with
+      `keep_working_copy: false` for that path, or delete its files.
     * `:max_concurrency` - how many databases at once (default 1).
     * `:attempts` - runs per database for the results above (default 3);
       `:backoff` - the first wait, in ms (default 1000).
@@ -801,7 +1043,11 @@ defmodule Sediment.S3 do
       (a failed reopen), or raising after it, fails the target with
       `{:around_failed, reason, result}`, `result` the rekey's (it may
       have happened; the database may be left closed). Check the reopen's
-      result: in an `after` block, a returned error is discarded.
+      result: in an `after` block, a returned error is discarded. It is
+      not called for a target the pre-check finds done (see below): a
+      re-run doesn't reopen a database an earlier run left closed
+      (`{:around_failed, ...}` or `{:crashed, ...}`). Reopen those
+      yourself, from `:on_result` or after the run (see the example).
     * `:check` - `fn target -> :ok | {:error, reason} end`, run right before
       the rekey (inside `:around`): an error refuses the target, without
       retries.
@@ -857,7 +1103,19 @@ defmodule Sediment.S3 do
 
   Returns `%{released: [id], unchanged: [id], absent: [id], failed: [{id,
   reason}], skipped: [id]}`: `released` dropped epochs under the key,
-  `unchanged` had none. The key can leave the rings once `failed` is empty,
+  `unchanged` had none. With `keep_working_copy: false`, a database the
+  pre-check reports `unchanged` runs nothing and keeps a copy it has: a
+  re-run doesn't remove a copy that an earlier run's failed removal, or a
+  VM stopped after the release, left at `path`. Run `release_key/4` with
+  `keep_working_copy: false` for that path, or delete its files.
+
+  As for `rekey_many/2`, a pre-check reads each
+  manifest before `:around`: a database with no epoch under the key and
+  no object left (see `orphans/1`) is reported `unchanged` without calling
+  `:around`, so a re-run doesn't reopen a database an earlier run left
+  closed: reopen it from `:on_result`, or after the run (see the example in
+  `rekey_many/2`). A database with an object the store won't delete stays
+  in `failed` with `{:leftover, _}` (see `release_key/4`). The key can leave the rings once `failed` is empty,
   `absent` holds only databases you know don't exist, and a fresh
   `key_census_many/2` of every database says so:
 
@@ -886,14 +1144,18 @@ defmodule Sediment.S3 do
         absent: [id],
         unencrypted: [id],
         unreadable: [{id, reason}],
-        targets: [id]
+        targets: [id],
+        fingerprints: %{id => %{key_id => fingerprint}},
+        ciphers: %{id => %{key_id => cipher}}
       }
 
   `absent` lists the targets with no database at their location: expected
   for a database that doesn't exist yet, and the sign of a wrong bucket or
   prefix otherwise (see `removable?/3`). `unreadable` lists a target not
   read after a reader's process was killed with reason `:skipped`.
-  `targets` lists every target.
+  `targets` lists every target. `fingerprints` and `ciphers` have, by
+  target, those `key_census/1` returned: `check_ring/2` checks a ring
+  against the whole fleet.
 
   ## Options
 
@@ -906,7 +1168,9 @@ defmodule Sediment.S3 do
           absent: [term()],
           unencrypted: [term()],
           unreadable: [{term(), term()}],
-          targets: [term()]
+          targets: [term()],
+          fingerprints: %{term() => %{String.t() => String.t()}},
+          ciphers: %{term() => %{String.t() => String.t()}}
         }
   def key_census_many(targets, opts \\ []), do: Sediment.S3.Many.key_census_many(targets, opts)
 
